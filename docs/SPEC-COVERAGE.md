@@ -74,7 +74,7 @@ numbers are the specification's.
 | 116 | Disconnected participants warning | `src/host.rs::build_preparation` |
 | 117–119 | Active Task rule, unassigned edits | `src/host.rs::build_preparation` |
 | 120–121 | Prepare object and `--json` | `src/model.rs::CommitPreparation`, `PreparedTask` |
-| 122–124 | Semantic message, `commit create`, who may request | `src/cli.rs`, `weave-plugin/skills/weave-commit` |
+| 122–124 | Semantic message, `commit create`, who may request | `src/cli.rs`, `.agents/plugins/weave/skills/weave-commit` |
 | 125–128 | Host-only Git construction, plumbing | `src/host.rs::create_commit`, `src/gitx.rs` |
 | 129–130 | Commit descriptor, author and co-authors | `src/model.rs::CommitDescriptor`, `src/host.rs::coauthor_trailers` |
 | 131–132 | Object propagation and verification | `src/gitx.rs::pack_objects`/`unpack_objects`, `src/client.rs::apply_publication` |
@@ -86,9 +86,9 @@ numbers are the specification's.
 | 144–146 | Disk-full, missing blob, `weave recover` | `src/host.rs`, `src/blobs.rs`, `src/recover.rs` |
 | 147–150 | Participant recovery, disconnect, host absence | `src/client.rs`, `src/daemon.rs::client_connection_loop` |
 | 151–157 | CLI surface, JSON, `status`, `peers`, `doctor`, errors | `src/cli.rs`, `src/doctor.rs`, `src/error.rs` |
-| 158–160 | Codex plugin and skills, no MCP | `weave-plugin/` |
+| 158–160 | Codex plugin and skills, no MCP | `.agents/plugins/weave/`, `.agents/plugins/marketplace.json`; enforced by `tests/plugin_manifest.rs` |
 | 161–163 | `AGENTS.md` bootstrap | `src/bootstrap.rs` |
-| 164–169 | Skill contents | `weave-plugin/skills/*/SKILL.md` |
+| 164–169 | Skill contents | `.agents/plugins/weave/skills/*/SKILL.md`; the raw Git prohibition (§165) and the host-only commit rule (§169) are asserted by `tests/plugin_manifest.rs` |
 | 170 | Agent-independent design | CLI is the only integration surface |
 | 171–174 | Security model, secrets, transport, logging | `docs/SECURITY.md`, `src/session.rs`, `src/util.rs` |
 | 175–176 | Retention and snapshot equivalence | `src/store_host.rs::manifest_at` |
@@ -117,6 +117,24 @@ numbers are the specification's.
 | 195 | Crash during publication | `store_client::incomplete_publications`, `client::repair_publications` |
 | 196 | Late join converges | `tests/multi_participant.rs::start_session` |
 | 197 | Backpressure bounded | `transport::Outbound` |
+
+## Plugin packaging
+
+`tests/plugin_manifest.rs` holds the plugin to the current Codex plugin contract
+without needing Python or network access, so it runs everywhere `cargo test` does:
+
+| Checked | Why |
+| --- | --- |
+| `plugin.json` required fields, allowed-key set, strict semver, https URLs, `#RRGGBB` | the official validator rejects anything else |
+| folder name equals `plugin.json` `name` | required by the packaging rules |
+| `skills` resolves to `skills` as a **path**, not a list | a list silently ships zero skills |
+| referenced assets exist; no `[TODO:` placeholders | broken references fail at install time |
+| no `mcpServers`, no `apps`, no `.mcp.json`, no `hooks` | Weave ships no MCP server, by design |
+| `SKILL.md` frontmatter: delimiters, `name` equals folder, description says *when* to use it | the description is the trigger; the body only loads after it fires |
+| `agents/openai.yaml`, when present, carries `interface.display_name` and `short_description` | the validator checks the sidecar too |
+| marketplace entry resolves to the shipped plugin, names agree, policy enums valid | a marketplace that points nowhere installs nothing |
+| no vendor name appears in any `SKILL.md` | the skills must stay reusable by any agent |
+| the raw Git prohibition and host-only commit rule are present | these protect the repository, so they are not left to drift |
 
 ## The real remote path
 

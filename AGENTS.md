@@ -26,7 +26,8 @@ A feature that weakens one of these to support a broader use case is outside V1.
 - `src/reconcile.rs` — the three-way reconciliation matrix.
 - `src/store_host.rs`, `src/store_client.rs` — durable state.
 - `src/gitx.rs` — every call into the `git` executable.
-- `weave-plugin/` — the Codex plugin: skills only, no MCP server.
+- `.agents/plugins/weave/` — the plugin: provider-neutral skills, no MCP server.
+  `.agents/plugins/marketplace.json` makes it installable from a checkout.
 - `tests/` — end-to-end tests driving the real binary against real repositories.
 
 Both engines are synchronous single-threaded state machines on their own OS

@@ -1,0 +1,7 @@
+interface:
+  display_name: Weave conflicts
+  short_description: Reconcile a Weave conflict without losing either side.
+  brand_color: "#3B6EA5"
+  default_prompt: Show me the open Weave conflicts and resolve them.
+policy:
+  allow_implicit_invocation: true

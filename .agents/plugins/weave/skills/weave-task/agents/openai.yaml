@@ -1,0 +1,7 @@
+interface:
+  display_name: Weave Tasks
+  short_description: Describe intent with Tasks and advisory soft locks.
+  brand_color: "#3B6EA5"
+  default_prompt: Start a Weave Task for the change I am about to make.
+policy:
+  allow_implicit_invocation: true

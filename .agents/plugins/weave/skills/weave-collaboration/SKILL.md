@@ -79,6 +79,24 @@ git log
 git show
 ```
 
+## Only the host builds the canonical commit
+
+Any authenticated participant may *request* a Git publication with
+`weave commit prepare` and `weave commit create`. Your machine never constructs it,
+even when you are the one running the commands.
+
+The host coordinator alone:
+
+- builds the Git blobs, trees and commit object;
+- updates the canonical branch;
+- distributes the exact Git objects to every participant;
+- pushes to the remote.
+
+This is what removes any dependence on differing local Git configuration and
+filters, and it is why a participant running `git commit` by hand does not produce
+"the same thing faster" — it produces a divergence Weave will refuse. See the
+`weave-commit` skill for the full workflow.
+
 ## When Weave is paused or offline
 
 - `sync_state.state == "paused"` — Git state changed outside Weave. Report the

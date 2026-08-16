@@ -79,6 +79,32 @@ Two guarantees shape how you work here:
    weave conflict dismiss <id>
    ```
 
+## The raw Git rule
+
+Resolving a conflict never involves Git. While a Weave session is active, DO NOT
+run:
+
+```
+git add
+git commit
+git pull
+git push
+git merge
+git rebase
+git cherry-pick
+git reset
+git checkout
+git switch
+git stash
+```
+
+This applies to **host agents and participant agents alike**. In particular, do not
+try to "fix" a conflict with `git checkout`, `git merge` or `git reset` — Weave
+conflicts are not Git conflicts, the canonical file is not in a Git conflicted
+state, and touching Git will only pause synchronization. Read-only Git
+(`git status`, `git diff`, `git log`, `git show`) stays allowed and is useful for
+understanding the change.
+
 ## `ResolutionOutdated`
 
 The host verifies that the canonical file has not changed since your resolution was

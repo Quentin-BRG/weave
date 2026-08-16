@@ -1,0 +1,7 @@
+interface:
+  display_name: Weave Git publication
+  short_description: Publish live Weave work as an ordinary Git commit.
+  brand_color: "#3B6EA5"
+  default_prompt: Prepare and create a Weave Git publication.
+policy:
+  allow_implicit_invocation: true

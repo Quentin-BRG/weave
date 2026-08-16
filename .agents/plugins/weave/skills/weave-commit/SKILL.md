@@ -10,8 +10,28 @@ Weave revision history is *how collaboration actually unfolded*. Git history is
 the working tree sits at the latest live revision while Git HEAD sits at the latest
 published one.
 
-**Never run `git add`, `git commit` or `git push`.** Weave owns all Git-writing
-operations during a session.
+## The raw Git rule
+
+While a Weave session is active, DO NOT run:
+
+```
+git add
+git commit
+git pull
+git push
+git merge
+git rebase
+git cherry-pick
+git reset
+git checkout
+git switch
+git stash
+```
+
+This applies to **host agents and participant agents alike**. Weave owns every
+Git-writing operation during a session; publishing is what this skill is for.
+Read-only Git (`git status`, `git diff`, `git log`, `git show`) stays allowed and
+is genuinely useful when writing the commit message.
 
 ## Who does what
 

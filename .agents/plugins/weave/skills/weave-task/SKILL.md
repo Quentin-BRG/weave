@@ -71,6 +71,30 @@ cancel the Task first.
 An active Task that has contributed no accepted revisions since the last
 publication does not block anything.
 
+## The raw Git rule
+
+While a Weave session is active, DO NOT run:
+
+```
+git add
+git commit
+git pull
+git push
+git merge
+git rebase
+git cherry-pick
+git reset
+git checkout
+git switch
+git stash
+```
+
+This applies to **host agents and participant agents alike**. Completing a Task is
+not a reason to reach for Git: publication goes through `weave commit prepare` and
+`weave commit create`, and only the host coordinator builds the canonical Git
+commit. Read-only Git (`git status`, `git diff`, `git log`, `git show`) stays
+allowed.
+
 ## Line-range scopes go stale
 
 A line range is recorded against the file entry it was declared on. When the file
