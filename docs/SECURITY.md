@@ -231,6 +231,14 @@ branch, the branch ref, HEAD and the Git index; on unexpected external change it
 **pauses** and reports the expected and current state. It never attempts an
 automatic pull, merge, rebase or reset in response.
 
+The check runs every few seconds and pauses only on a problem it still sees on
+the following check. Publishing moves HEAD and then the index in two separate Git
+commands, and the host and participant engines run on separate threads against
+one repository, so a single observation can catch Weave mid-write and read it as
+an external change. A change a user really made is still there a few seconds
+later; a publication window is not. The cost is that a genuine external change is
+detected one check later than it happens.
+
 Only the host constructs Git objects and only the host pushes. Participants install
 the exact objects the host produced and verify the commit and tree OIDs before
 touching branch metadata; branch updates use compare-and-swap semantics, and a
