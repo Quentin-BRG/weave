@@ -29,12 +29,85 @@ use tokio::sync::mpsc;
 /// 512 KiB per connection regardless of how large the file is.
 pub const MAX_QUEUED_DATA_FRAMES: usize = 8;
 
+/// Data frames a connection will hold *inbound*, waiting on its engine.
+///
+/// The engines read from unbounded channels, because a synchronous state
+/// machine cannot apply backpressure by refusing input without deadlocking.
+/// This permit count is what bounds the data plane instead: the reader task
+/// waits for a slot before forwarding, so a peer that sends faster than the
+/// engine installs stalls in TCP rather than in this process's memory.
+pub const MAX_INFLIGHT_DATA_FRAMES: usize = 8;
+
 /// One outbound application message, tagged with the plane it belongs to.
 pub enum Frame {
     /// A JSON protocol envelope.
     Control(String),
     /// A blob-plane payload, framed by the blob transfer protocol.
     Data(Vec<u8>),
+}
+
+/// One received data frame, held until the engine has finished with it.
+///
+/// The permit is the point: it is released when this value is dropped, which
+/// is after the engine has written the chunk to disk, not when the reader
+/// handed it over.
+pub struct DataFrame {
+    bytes: Vec<u8>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl DataFrame {
+    pub fn new(bytes: Vec<u8>, permit: tokio::sync::OwnedSemaphorePermit) -> DataFrame {
+        DataFrame {
+            bytes,
+            _permit: permit,
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// One blob to stream to this connection's peer.
+#[derive(Debug, Clone)]
+pub struct PumpJob {
+    pub transfer_id: u64,
+    pub hash: String,
+    pub from_offset: u64,
+}
+
+/// An engine's handle on its connection's transfer pump.
+///
+/// Sending is non-blocking and the queue is unbounded, deliberately: the
+/// producer is a synchronous state machine with nowhere to wait, and each item
+/// is one small descriptor, never the bytes. The bytes are bounded one step
+/// further along, where the pump waits on the outbound data queue.
+#[derive(Clone)]
+pub struct BlobPump {
+    tx: mpsc::UnboundedSender<PumpJob>,
+}
+
+impl BlobPump {
+    /// Ask for `hash` to be streamed to the peer as transfer `transfer_id`.
+    ///
+    /// A `false` return means the connection is gone; the peer will never see
+    /// this transfer, and its own timeout or the next rescan re-requests it.
+    pub fn start(&self, transfer_id: u64, hash: String, from_offset: u64) -> bool {
+        self.tx
+            .send(PumpJob {
+                transfer_id,
+                hash,
+                from_offset,
+            })
+            .is_ok()
+    }
+}
+
+/// Create a pump handle and the queue its task drains.
+pub fn blob_pump() -> (BlobPump, mpsc::UnboundedReceiver<PumpJob>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (BlobPump { tx }, rx)
 }
 
 /// A bounded outbound queue for one peer, split into two planes.

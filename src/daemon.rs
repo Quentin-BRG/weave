@@ -22,7 +22,10 @@ use crate::secure::{
 use crate::session::*;
 use crate::store_client::ClientStore;
 use crate::store_host::HostStore;
-use crate::transport::{default_outbound, secret_matches, Frame, OutboundRx, MAX_FRAME, WS_PATH};
+use crate::transport::{
+    blob_pump, default_outbound, secret_matches, DataFrame, Frame, Outbound, OutboundRx, PumpJob,
+    MAX_FRAME, MAX_INFLIGHT_DATA_FRAMES, WS_PATH,
+};
 use crate::watch;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -250,6 +253,7 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
         host_handle,
         client_handle,
         display_name,
+        BlobStore::open(paths.blobs())?,
     ));
 
     drop(lock);
@@ -266,6 +270,7 @@ async fn host_async(
     host: HostHandle,
     client: ClientHandle,
     display_name: String,
+    blobs: BlobStore,
 ) -> Result<()> {
     // The coordinator binds to loopback, or to all interfaces in LAN mode.
     let bind = if opts.lan { "0.0.0.0:0" } else { "127.0.0.1:0" };
@@ -282,6 +287,7 @@ async fn host_async(
         host: host.clone(),
         next_conn: Arc::new(AtomicU64::new(1)),
         handshakes: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
+        blobs,
     };
     let app = Router::new()
         .route(WS_PATH, get(ws_handler))
@@ -531,7 +537,12 @@ async fn participant_async(
 
     let key = PeerKey::derive(&secret, session.session_id);
     drop(secret);
-    let connection = tokio::spawn(supervise_connection(url, key, client.clone()));
+    let connection = tokio::spawn(supervise_connection(
+        url,
+        key,
+        client.clone(),
+        BlobStore::open(paths.blobs())?,
+    ));
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => println!("\nLeaving the Weave session."),
@@ -616,6 +627,10 @@ struct WsState {
     /// an anonymous caller cannot turn the public endpoint into an unbounded
     /// memory and task sink.
     handshakes: Arc<Semaphore>,
+    /// Read by each connection's transfer pump. The store is shared by every
+    /// connection and by the engines; it is content-addressed and append-only,
+    /// so concurrent readers need no coordination.
+    blobs: BlobStore,
 }
 
 /// The upgrade itself carries no authentication.
@@ -661,13 +676,19 @@ async fn serve_socket(socket: WebSocket, state: WsState) {
     // Only now does this connection exist as far as the session is concerned.
     let conn_id = state.next_conn.fetch_add(1, Ordering::Relaxed);
     let (out, rx, queued) = default_outbound();
+    let (pump, jobs) = blob_pump();
     state.host.send(HostInput::Connected {
         conn_id,
         out: out.clone(),
+        pump,
         is_local: false,
     });
 
     let writer = tokio::spawn(encrypt_to_sink(rx, queued, sink, channel.clone()));
+    let pumping = tokio::spawn(run_pump(jobs, state.blobs.clone(), out.clone()));
+    // Inbound data is bounded here rather than in the engine's channel; see
+    // [`MAX_INFLIGHT_DATA_FRAMES`].
+    let slots = Arc::new(Semaphore::new(MAX_INFLIGHT_DATA_FRAMES));
 
     while let Some(Ok(message)) = stream.next().await {
         match message {
@@ -679,14 +700,17 @@ async fn serve_socket(socket: WebSocket, state: WsState) {
                         break;
                     }
                 }
-                // The data plane is framed and authenticated but has no
-                // consumer until the blob transfer protocol lands; a peer
-                // sending on it now is running a version this one cannot serve.
-                Ok(Some((FrameClass::Data, _))) => {
-                    tracing::warn!(
-                        "dropping a Weave connection that sent an unexpected data frame"
-                    );
-                    break;
+                // Blob traffic. Waiting for a permit here is the whole
+                // backpressure story on this side: a peer that outruns the
+                // engine's installs stalls in TCP, not in this process.
+                Ok(Some((FrameClass::Data, payload))) => {
+                    let Ok(permit) = slots.clone().acquire_owned().await else {
+                        break;
+                    };
+                    state.host.send(HostInput::Data {
+                        conn_id,
+                        frame: DataFrame::new(payload, permit),
+                    });
                 }
                 Err(e) => {
                     tracing::warn!("dropping a Weave connection: {}", e.message);
@@ -708,7 +732,85 @@ async fn serve_socket(socket: WebSocket, state: WsState) {
 
     out.close();
     writer.abort();
+    pumping.abort();
     state.host.send(HostInput::Disconnected { conn_id });
+}
+
+// ---------------------------------------------------------------------------
+// Blob transfer pump
+// ---------------------------------------------------------------------------
+
+/// Stream requested blobs to one peer, one at a time, forever.
+///
+/// Serial on purpose: interleaving transfers on one connection would not make
+/// the link any faster, and it would multiply the number of `.part` files the
+/// receiver holds open. Control frames still overtake these at every frame
+/// boundary, so a transfer in progress never makes the session look frozen.
+async fn run_pump(mut jobs: mpsc::UnboundedReceiver<PumpJob>, blobs: BlobStore, out: Outbound) {
+    while let Some(job) = jobs.recv().await {
+        if let Err(e) = stream_blob(&blobs, &out, &job).await {
+            tracing::warn!(
+                "blob transfer {} ({}) failed: {}",
+                job.transfer_id,
+                crate::util::short_oid(&job.hash),
+                e.message
+            );
+            // In-band, so it cannot overtake the chunks it cancels. The peer
+            // discards its partial write and asks again.
+            out.send_data(crate::blobwire::abort_frame(job.transfer_id))
+                .await;
+        }
+        if out.is_closed() {
+            return;
+        }
+    }
+}
+
+/// Send one blob as chunk frames followed by an end frame.
+///
+/// The file is read in `WIRE_CHUNK` slices and never held whole, at either end
+/// of the connection or in between.
+async fn stream_blob(blobs: &BlobStore, out: &Outbound, job: &PumpJob) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let path = blobs.path_of(&job.hash)?;
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| crate::error::persistence(format!("Could not read a Weave blob: {e}")))?;
+    if job.from_offset > 0 {
+        file.seek(std::io::SeekFrom::Start(job.from_offset))
+            .await
+            .map_err(|e| {
+                crate::error::persistence(format!("Could not resume a Weave blob: {e}"))
+            })?;
+    }
+
+    let mut buffer = vec![0u8; crate::blobwire::WIRE_CHUNK];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|e| crate::error::persistence(format!("Could not read a Weave blob: {e}")))?;
+        if read == 0 {
+            break;
+        }
+        if !out
+            .send_data(crate::blobwire::chunk_frame(
+                job.transfer_id,
+                &buffer[..read],
+            ))
+            .await
+        {
+            return Err(crate::error::network("The connection closed mid-transfer."));
+        }
+    }
+    if !out
+        .send_data(crate::blobwire::end_frame(job.transfer_id))
+        .await
+    {
+        return Err(crate::error::network("The connection closed mid-transfer."));
+    }
+    Ok(())
 }
 
 /// Read the initiator's message, reply, and return the established channel.
@@ -851,12 +953,20 @@ fn spawn_loopback(host: HostHandle, client: ClientHandle) {
     let conn_id = 0u64;
     let (host_out, mut host_rx, host_queued) = default_outbound();
     let (client_out, mut client_rx, client_queued) = default_outbound();
+    let (host_pump, host_jobs) = blob_pump();
+    let (client_pump, client_jobs) = blob_pump();
 
     host.send(HostInput::Connected {
         conn_id,
         out: host_out,
+        pump: host_pump,
         is_local: true,
     });
+
+    // Neither side can legitimately ask for a transfer here, so both pump
+    // queues exist only to be drained and complained about.
+    drain_loopback_pump(host_jobs, "host->client");
+    drain_loopback_pump(client_jobs, "client->host");
 
     // The host and its local client share one blob store, so every hash either
     // side needs is already on disk and the data plane is never used here. A
@@ -898,7 +1008,22 @@ fn spawn_loopback(host: HostHandle, client: ClientHandle) {
         }
     });
 
-    client.send(ClientInput::Connected(client_out));
+    client.send(ClientInput::Connected {
+        out: client_out,
+        pump: client_pump,
+    });
+}
+
+/// Report, and discard, any transfer requested over the loopback.
+fn drain_loopback_pump(mut jobs: mpsc::UnboundedReceiver<PumpJob>, direction: &'static str) {
+    tokio::spawn(async move {
+        while let Some(job) = jobs.recv().await {
+            tracing::error!(
+                "loopback requested blob {} ({direction})",
+                crate::util::short_oid(&job.hash)
+            );
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -925,12 +1050,13 @@ fn ensure_crypto_provider() {
 /// with no path back, which is exactly the failure mode local editing must
 /// survive. Restarting costs nothing and cannot lose queued work: the outbox is
 /// durable and every operation is idempotent.
-async fn supervise_connection(url: String, key: PeerKey, client: ClientHandle) {
+async fn supervise_connection(url: String, key: PeerKey, client: ClientHandle, blobs: BlobStore) {
     loop {
         let task = tokio::spawn(client_connection_loop(
             url.clone(),
             key.clone(),
             client.clone(),
+            blobs.clone(),
         ));
         match task.await {
             Ok(()) => return,
@@ -946,11 +1072,11 @@ async fn supervise_connection(url: String, key: PeerKey, client: ClientHandle) {
     }
 }
 
-async fn client_connection_loop(url: String, key: PeerKey, client: ClientHandle) {
+async fn client_connection_loop(url: String, key: PeerKey, client: ClientHandle, blobs: BlobStore) {
     ensure_crypto_provider();
     let mut backoff = 1u64;
     loop {
-        match connect_once(&url, &key, &client).await {
+        match connect_once(&url, &key, &client, &blobs).await {
             Ok(reason) => {
                 client.send(ClientInput::Disconnected(reason));
                 backoff = 1;
@@ -969,7 +1095,12 @@ async fn client_connection_loop(url: String, key: PeerKey, client: ClientHandle)
     }
 }
 
-async fn connect_once(url: &str, key: &PeerKey, client: &ClientHandle) -> Result<String> {
+async fn connect_once(
+    url: &str,
+    key: &PeerKey,
+    client: &ClientHandle,
+    blobs: &BlobStore,
+) -> Result<String> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -1037,7 +1168,14 @@ async fn connect_once(url: &str, key: &PeerKey, client: &ClientHandle) -> Result
         let _ = sink.close().await;
     });
 
-    client.send(ClientInput::Connected(out.clone()));
+    let (pump, jobs) = blob_pump();
+    let pumping = tokio::spawn(run_pump(jobs, blobs.clone(), out.clone()));
+    let slots = Arc::new(Semaphore::new(MAX_INFLIGHT_DATA_FRAMES));
+
+    client.send(ClientInput::Connected {
+        out: out.clone(),
+        pump,
+    });
 
     while let Some(message) = stream.next().await {
         let message = match message {
@@ -1045,6 +1183,7 @@ async fn connect_once(url: &str, key: &PeerKey, client: &ClientHandle) -> Result
             Err(e) => {
                 out.close();
                 writer.abort();
+                pumping.abort();
                 return Ok(format!("connection lost: {e}"));
             }
         };
@@ -1057,6 +1196,7 @@ async fn connect_once(url: &str, key: &PeerKey, client: &ClientHandle) -> Result
                             if envelope.protocol_version != PROTOCOL_VERSION {
                                 out.close();
                                 writer.abort();
+                                pumping.abort();
                                 return Ok(format!(
                                     "host speaks Weave protocol version {}",
                                     envelope.protocol_version
@@ -1067,15 +1207,18 @@ async fn connect_once(url: &str, key: &PeerKey, client: &ClientHandle) -> Result
                         Err(e) => tracing::error!("malformed host message: {e}"),
                     }
                 }
-                // See the host side: framed, authenticated, and not yet served.
-                Ok(Some((FrameClass::Data, _))) => {
-                    out.close();
-                    writer.abort();
-                    return Ok("the host sent an unexpected data frame".into());
+                // Blob traffic; see the host side for why the permit is
+                // acquired before the frame reaches the engine.
+                Ok(Some((FrameClass::Data, payload))) => {
+                    let Ok(permit) = slots.clone().acquire_owned().await else {
+                        break;
+                    };
+                    client.send(ClientInput::Data(DataFrame::new(payload, permit)));
                 }
                 Err(e) => {
                     out.close();
                     writer.abort();
+                    pumping.abort();
                     return Ok(e.message);
                 }
             },
@@ -1083,6 +1226,7 @@ async fn connect_once(url: &str, key: &PeerKey, client: &ClientHandle) -> Result
             WsMessage::Text(_) => {
                 out.close();
                 writer.abort();
+                pumping.abort();
                 return Ok("the host sent an unencrypted frame".into());
             }
             WsMessage::Close(_) => break,
@@ -1094,6 +1238,7 @@ async fn connect_once(url: &str, key: &PeerKey, client: &ClientHandle) -> Result
     }
     out.close();
     writer.abort();
+    pumping.abort();
     Ok("disconnected".into())
 }
 

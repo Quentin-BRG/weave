@@ -9,6 +9,7 @@
 //! assigned only here (specification sections 5, 6, 7, 68, 69).
 
 use crate::blobs::BlobStore;
+use crate::blobwire::{self, BlobReceiver, Delivered, TransferIds};
 use crate::error::{ErrorClass, Result, WeaveError};
 use crate::gitx;
 use crate::model::*;
@@ -17,7 +18,7 @@ use crate::proto::*;
 use crate::reconcile::{reconcile, MergeContext, Reconciled};
 use crate::session::Paths;
 use crate::store_host::{validate_base, ActorRecord, HostStore};
-use crate::transport::Outbound;
+use crate::transport::{BlobPump, DataFrame, Outbound};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -30,26 +31,26 @@ const BARRIER_TIMEOUT_MS: i64 = 20_000;
 const TICK_MS: u64 = 400;
 /// Replaying more than this many revisions is slower than sending a snapshot.
 const MAX_REPLAY: u64 = 5_000;
-/// Approximate byte budget for one `Blobs` response.
-const BLOB_BATCH_BYTES: usize = 8 * 1024 * 1024;
 /// Interval between external-Git-state checks.
 const GIT_GUARD_INTERVAL_MS: i64 = 3_000;
 
 /// One input to the coordinator state machine.
-///
-/// `Message` dominates the size of this enum because a `ClientMessage` can carry
-/// a whole file. Boxing it would trade one allocation per frame for a size the
-/// channel already handles fine, so the variance is deliberate.
 #[allow(clippy::large_enum_variant)]
 pub enum HostInput {
     Connected {
         conn_id: u64,
         out: Outbound,
+        pump: BlobPump,
         is_local: bool,
     },
     Message {
         conn_id: u64,
         message: ClientMessage,
+    },
+    /// One blob-plane frame from a participant.
+    Data {
+        conn_id: u64,
+        frame: DataFrame,
     },
     Disconnected {
         conn_id: u64,
@@ -77,6 +78,12 @@ struct Conn {
     last_applied_revision: u64,
     active_task_id: Option<Uuid>,
     last_seen_ms: i64,
+    /// Blobs arriving from this participant.
+    receiver: BlobReceiver,
+    /// Transfers offered to this participant, awaiting a `Want`: id -> hash.
+    offered: HashMap<u64, String>,
+    ids: TransferIds,
+    pump: BlobPump,
 }
 
 struct BarrierPeer {
@@ -206,6 +213,7 @@ impl HostEngine {
             HostInput::Connected {
                 conn_id,
                 out,
+                pump,
                 is_local,
             } => {
                 self.conns.insert(
@@ -218,10 +226,15 @@ impl HostEngine {
                         last_applied_revision: 0,
                         active_task_id: None,
                         last_seen_ms: crate::util::now_ms(),
+                        receiver: BlobReceiver::new(self.blobs.clone()),
+                        offered: HashMap::new(),
+                        ids: TransferIds::default(),
+                        pump,
                     },
                 );
                 Ok(())
             }
+            HostInput::Data { conn_id, frame } => self.on_data(conn_id, frame),
             HostInput::Disconnected { conn_id } => {
                 self.conns.remove(&conn_id);
                 if let Some(barrier) = &mut self.barrier {
@@ -546,12 +559,10 @@ impl HostEngine {
                 .store
                 .revisions_in_range(resume.last_applied_revision + 1, current)?;
             for revision in revisions {
-                let content = self.content_for_entry(revision.after.as_ref())?;
                 self.send(
                     conn_id,
                     HostMessage::RevisionBroadcast {
                         revision: Box::new(revision),
-                        content_b64: content,
                     },
                 );
             }
@@ -589,6 +600,7 @@ impl HostEngine {
                 self.on_submit(conn_id, actor_id, *operation)
             }
             ClientMessage::RequestBlobs { hashes } => self.on_request_blobs(conn_id, hashes),
+            ClientMessage::Blob { blob } => self.on_blob_control(conn_id, blob),
             ClientMessage::RequestManifest { reason } => {
                 tracing::info!(actor = %actor_id, "manifest resync requested: {reason}");
                 let current = self.store.current_revision()?;
@@ -620,18 +632,15 @@ impl HostEngine {
             ClientMessage::ReportConflict { report } => {
                 self.on_report_conflict(conn_id, actor_id, *report)
             }
-            ClientMessage::AttachLocalCandidate {
-                conflict_id,
-                entry,
-                content_b64,
-            } => self.on_attach_candidate(actor_id, conflict_id, entry, content_b64),
+            ClientMessage::AttachLocalCandidate { conflict_id, entry } => {
+                self.on_attach_candidate(actor_id, conflict_id, entry)
+            }
             ClientMessage::ResolveConflict {
                 request_id,
                 conflict_id,
                 operation_id,
                 expected_canonical,
                 resolved_entry,
-                content_b64,
             } => self.on_resolve_conflict(
                 conn_id,
                 actor_id,
@@ -640,7 +649,6 @@ impl HostEngine {
                 operation_id,
                 expected_canonical,
                 resolved_entry,
-                content_b64,
             ),
             ClientMessage::DismissConflict {
                 request_id,
@@ -800,7 +808,6 @@ impl HostEngine {
                     class: ErrorClass::SessionError,
                     message: format!("Host is not accepting changes: {reason}"),
                 },
-                None,
             );
             return Ok(());
         }
@@ -809,11 +816,7 @@ impl HostEngine {
         let payload_hash = op.payload_hash();
         if let Some((stored_hash, outcome)) = self.store.lookup_operation(&op.operation_id)? {
             if stored_hash == payload_hash {
-                let content = match outcome.canonical() {
-                    Some((_, entry)) => self.content_for_entry(entry.as_ref())?,
-                    None => None,
-                };
-                self.reply_operation(conn_id, op.operation_id, outcome, content);
+                self.reply_operation(conn_id, op.operation_id, outcome);
             } else {
                 self.reply_operation(
                     conn_id,
@@ -822,7 +825,6 @@ impl HostEngine {
                         class: ErrorClass::ProtocolError,
                         message: "Operation identifier reused with a different payload.".into(),
                     },
-                    None,
                 );
             }
             return Ok(());
@@ -843,7 +845,6 @@ impl HostEngine {
                                 class: e.class,
                                 message: e.message.clone(),
                             },
-                            None,
                         );
                     }
                     _ => {
@@ -860,7 +861,7 @@ impl HostEngine {
                             &payload_hash,
                             &outcome,
                         )?;
-                        self.reply_operation(conn_id, op.operation_id, outcome, None);
+                        self.reply_operation(conn_id, op.operation_id, outcome);
                     }
                 }
                 Ok(())
@@ -886,7 +887,7 @@ impl HostEngine {
                     MAX_SYNCED_FILE / (1024 * 1024)
                 )));
             }
-            self.install_content(entry, op.content_b64.as_deref())?;
+            self.require_blob(entry)?;
         }
 
         // The host validates the declared base against its own history; it
@@ -933,8 +934,7 @@ impl HostEngine {
                     payload_hash,
                     &result,
                 )?;
-                let content = self.content_for_entry(current.as_ref())?;
-                self.reply_operation(conn_id, op.operation_id, result, content);
+                self.reply_operation(conn_id, op.operation_id, result);
                 Ok(())
             }
             Reconciled::Accept { entry, merged } => {
@@ -974,8 +974,7 @@ impl HostEngine {
                         canonical_entry: entry.clone(),
                     }
                 };
-                let content = self.content_for_entry(entry.as_ref())?;
-                self.reply_operation(conn_id, op.operation_id, result, content);
+                self.reply_operation(conn_id, op.operation_id, result);
                 self.broadcast_revision(record)?;
                 Ok(())
             }
@@ -1010,8 +1009,7 @@ impl HostEngine {
                     &result,
                 )?;
                 self.store.bump_control_version()?;
-                let content = self.content_for_entry(current.as_ref())?;
-                self.reply_operation(conn_id, op.operation_id, result, content);
+                self.reply_operation(conn_id, op.operation_id, result);
                 self.broadcast_control()?;
                 Ok(())
             }
@@ -1071,40 +1069,23 @@ impl HostEngine {
         Ok(())
     }
 
-    fn install_content(&self, entry: &FileEntry, content_b64: Option<&str>) -> Result<()> {
+    /// The host accepts a mutation only once the content it names is already
+    /// durable here.
+    ///
+    /// Upload-before-submit is what keeps this a simple check. The alternative —
+    /// parking the operation until its blob arrives — would add an in-memory
+    /// pending state, a timeout, and a bound against a participant that
+    /// announces content it never sends, and would weaken "an acknowledged
+    /// operation is durable".
+    fn require_blob(&self, entry: &FileEntry) -> Result<()> {
         if self.blobs.has(&entry.blob_hash) {
             return Ok(());
         }
-        let Some(encoded) = content_b64 else {
-            return Err(crate::error::protocol(format!(
-                "Operation references blob {} without supplying its content.",
-                entry.blob_hash
-            )));
-        };
-        let bytes = crate::util::b64_decode(encoded)?;
-        if bytes.len() as u64 != entry.size {
-            return Err(crate::error::protocol(
-                "Operation content length does not match the declared entry size.",
-            ));
-        }
-        let hash = crate::util::sha256_hex(&bytes);
-        if hash != entry.blob_hash {
-            return Err(crate::error::protocol(
-                "Operation content does not hash to the declared blob.",
-            ));
-        }
-        self.blobs.put(&bytes)?;
-        Ok(())
-    }
-
-    fn content_for_entry(&self, entry: Option<&FileEntry>) -> Result<Option<String>> {
-        match entry {
-            None => Ok(None),
-            Some(entry) => {
-                let bytes = self.blobs.get(&entry.blob_hash)?;
-                Ok(Some(crate::util::b64_encode(&bytes)))
-            }
-        }
+        Err(crate::error::protocol(format!(
+            "Operation references content the host does not hold ({}).",
+            crate::util::short_oid(&entry.blob_hash)
+        ))
+        .with_detail("Upload the blob before submitting the operation."))
     }
 
     // -------------------------------------------------------------- conflicts
@@ -1115,24 +1096,28 @@ impl HostEngine {
         actor_id: Uuid,
         report: ConflictReport,
     ) -> Result<()> {
-        for blob in &report.blobs {
-            if self.blobs.has(&blob.hash) {
-                continue;
-            }
-            let bytes = crate::util::b64_decode(&blob.content_b64)?;
-            if crate::util::sha256_hex(&bytes) != blob.hash {
+        // The reporter uploads its candidates before reporting, so a missing
+        // one here means the two sides disagree about what was sent.
+        for entry in [
+            report.base_entry.as_ref(),
+            report.incoming_entry.as_ref(),
+            report.latest_local_candidate.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Err(e) = self.require_blob(entry) {
                 self.send(
                     conn_id,
                     HostMessage::Error {
                         request_id: None,
-                        class: ErrorClass::ProtocolError,
-                        message: "Reported conflict content does not match its hash.".into(),
-                        detail: None,
+                        class: e.class,
+                        message: e.message,
+                        detail: e.detail,
                     },
                 );
                 return Ok(());
             }
-            self.blobs.put(&bytes)?;
         }
         if self.store.conflict(&report.id)?.is_some() {
             return Ok(()); // idempotent retransmission
@@ -1162,13 +1147,12 @@ impl HostEngine {
         _actor_id: Uuid,
         conflict_id: Uuid,
         entry: Option<FileEntry>,
-        content_b64: Option<String>,
     ) -> Result<()> {
         let Some(mut conflict) = self.store.conflict(&conflict_id)? else {
             return Ok(());
         };
         if let Some(entry) = &entry {
-            self.install_content(entry, content_b64.as_deref())?;
+            self.require_blob(entry)?;
         }
         conflict.latest_local_candidate = entry;
         self.store.put_conflict(&conflict)?;
@@ -1186,7 +1170,6 @@ impl HostEngine {
         operation_id: Uuid,
         expected_canonical: Option<FileEntry>,
         resolved_entry: Option<FileEntry>,
-        content_b64: Option<String>,
     ) -> Result<()> {
         let Some(mut conflict) = self.store.conflict(&conflict_id)? else {
             self.send(
@@ -1239,7 +1222,7 @@ impl HostEngine {
         }
 
         if let Some(entry) = &resolved_entry {
-            if let Err(e) = self.install_content(entry, content_b64.as_deref()) {
+            if let Err(e) = self.require_blob(entry) {
                 self.send(
                     conn_id,
                     HostMessage::Error {
@@ -2100,72 +2083,208 @@ impl HostEngine {
             .get(&conn_id)
             .map(|c| c.is_local)
             .unwrap_or(false);
-        let pack = if is_local {
+        let pack_hash = if is_local {
             // The host machine already holds the objects it just created.
             None
         } else {
-            let root = self.paths.repo_root.clone();
-            let pack = gitx::pack_objects(
-                &root,
-                &publication.descriptor.commit_oid,
-                Some(&publication.descriptor.parent_commit_oid),
-            )?;
-            Some(crate::util::b64_encode(&pack))
+            Some(self.publication_pack(publication)?)
         };
         self.send(
             conn_id,
             HostMessage::Publication {
                 publication: Box::new(publication.clone()),
-                pack_b64: pack,
+                pack_hash,
             },
         );
         Ok(())
     }
 
+    /// Build the publication pack into the blob store, so it travels on the
+    /// blob plane like any other content.
+    ///
+    /// Repeated calls are cheap: the pack is deterministic for a given commit
+    /// pair, so the second participant to be served finds it already stored.
+    fn publication_pack(&self, publication: &GitPublication) -> Result<String> {
+        let root = self.paths.repo_root.clone();
+        let scratch = self.paths.scratch();
+        let tmp = scratch.join(format!("pack-{}.pack", crate::util::random_hex(8)));
+        let built = (|| -> Result<String> {
+            gitx::pack_objects_to(
+                &root,
+                &publication.descriptor.commit_oid,
+                Some(&publication.descriptor.parent_commit_oid),
+                &tmp,
+            )?;
+            let ingested = self.blobs.ingest_file(&tmp, 0)?.ok_or_else(|| {
+                crate::error::integrity("The publication pack vanished before it could be stored.")
+            })?;
+            Ok(ingested.hash)
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        built
+    }
+
     // ------------------------------------------------------------------ blobs
 
+    /// Answer a pull with an offer per hash. The bytes follow on the blob
+    /// plane once the participant answers `Want` with the offset it needs.
     fn on_request_blobs(&mut self, conn_id: u64, hashes: Vec<String>) -> Result<()> {
-        let mut batch: Vec<BlobPayload> = Vec::new();
-        let mut batch_bytes = 0usize;
         for hash in hashes {
-            let bytes = match self.blobs.get(&hash) {
-                Ok(b) => b,
+            let size = match self.blobs.size_of(&hash) {
+                Ok(size) => size,
                 Err(e) => {
                     // Never silently substitute content (specification
-                    // section 145).
+                    // section 145). The requester is told plainly rather than
+                    // left waiting for a transfer that will not come.
+                    let reason = e.message.clone();
                     self.enter_degraded(&e);
-                    self.send(
-                        conn_id,
-                        HostMessage::Error {
-                            request_id: None,
-                            class: ErrorClass::IntegrityError,
-                            message: e.message,
-                            detail: e.detail,
-                        },
-                    );
-                    return Ok(());
+                    self.send_blob(conn_id, BlobControl::Unavailable { hash, reason });
+                    continue;
                 }
             };
-            let encoded = crate::util::b64_encode(&bytes);
-            if batch_bytes + encoded.len() > BLOB_BATCH_BYTES && !batch.is_empty() {
-                self.send(
-                    conn_id,
-                    HostMessage::Blobs {
-                        blobs: std::mem::take(&mut batch),
-                    },
-                );
-                batch_bytes = 0;
-            }
-            batch_bytes += encoded.len();
-            batch.push(BlobPayload {
-                hash,
-                content_b64: encoded,
-            });
-        }
-        if !batch.is_empty() {
-            self.send(conn_id, HostMessage::Blobs { blobs: batch });
+            let Some(conn) = self.conns.get_mut(&conn_id) else {
+                return Ok(());
+            };
+            let transfer_id = conn.ids.next_id();
+            conn.offered.insert(transfer_id, hash.clone());
+            self.send_blob(
+                conn_id,
+                BlobControl::Offer {
+                    transfer_id,
+                    hash,
+                    size,
+                },
+            );
         }
         Ok(())
+    }
+
+    fn on_blob_control(&mut self, conn_id: u64, blob: BlobControl) -> Result<()> {
+        match blob {
+            // A participant wants to upload content the host may already have.
+            BlobControl::Offer {
+                transfer_id,
+                hash,
+                size,
+            } => {
+                let reply = if size > MAX_SYNCED_FILE {
+                    BlobControl::Failed {
+                        transfer_id,
+                        hash,
+                        reason: format!(
+                            "{size} bytes is above the {} MiB Weave file limit.",
+                            MAX_SYNCED_FILE / (1024 * 1024)
+                        ),
+                    }
+                } else if self.blobs.has(&hash) {
+                    BlobControl::Have { transfer_id, hash }
+                } else {
+                    let Some(conn) = self.conns.get_mut(&conn_id) else {
+                        return Ok(());
+                    };
+                    match conn.receiver.accept_offer(transfer_id, &hash, size) {
+                        Ok(from_offset) => BlobControl::Want {
+                            transfer_id,
+                            from_offset,
+                        },
+                        Err(e) => BlobControl::Failed {
+                            transfer_id,
+                            hash,
+                            reason: e.message,
+                        },
+                    }
+                };
+                self.send_blob(conn_id, reply);
+                Ok(())
+            }
+            // A participant is ready to receive something the host offered.
+            BlobControl::Want {
+                transfer_id,
+                from_offset,
+            } => {
+                let Some(conn) = self.conns.get(&conn_id) else {
+                    return Ok(());
+                };
+                let Some(hash) = conn.offered.get(&transfer_id).cloned() else {
+                    tracing::warn!(conn = conn_id, "peer wants an unoffered transfer");
+                    return Ok(());
+                };
+                conn.pump.start(transfer_id, hash, from_offset);
+                Ok(())
+            }
+            BlobControl::Have { transfer_id, .. } | BlobControl::Done { transfer_id, .. } => {
+                if let Some(conn) = self.conns.get_mut(&conn_id) {
+                    conn.offered.remove(&transfer_id);
+                }
+                Ok(())
+            }
+            BlobControl::Failed {
+                transfer_id,
+                hash,
+                reason,
+            } => {
+                // The participant will re-request on its next rescan; nothing
+                // canonical depends on this transfer having succeeded.
+                tracing::warn!(
+                    conn = conn_id,
+                    "participant could not take blob {hash}: {reason}"
+                );
+                if let Some(conn) = self.conns.get_mut(&conn_id) {
+                    conn.offered.remove(&transfer_id);
+                }
+                Ok(())
+            }
+            BlobControl::Unavailable { hash, reason } => {
+                tracing::warn!(
+                    conn = conn_id,
+                    "participant cannot supply blob {hash}: {reason}"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// One frame off the blob plane.
+    fn on_data(&mut self, conn_id: u64, frame: DataFrame) -> Result<()> {
+        let Some(conn) = self.conns.get_mut(&conn_id) else {
+            return Ok(());
+        };
+        let reply = match blobwire::decode(frame.bytes()) {
+            Ok(incoming) => match conn.receiver.accept(incoming) {
+                Delivered::More => None,
+                Delivered::Installed { transfer_id, hash } => {
+                    Some(BlobControl::Done { transfer_id, hash })
+                }
+                Delivered::Failed {
+                    transfer_id,
+                    hash,
+                    reason,
+                } => Some(BlobControl::Failed {
+                    transfer_id,
+                    hash,
+                    reason,
+                }),
+                Delivered::Stray { transfer_id } => {
+                    tracing::warn!(
+                        conn = conn_id,
+                        "ignoring a stray blob frame ({transfer_id})"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(conn = conn_id, "malformed blob frame: {}", e.message);
+                None
+            }
+        };
+        if let Some(reply) = reply {
+            self.send_blob(conn_id, reply);
+        }
+        Ok(())
+    }
+
+    fn send_blob(&mut self, conn_id: u64, blob: BlobControl) {
+        self.send(conn_id, HostMessage::Blob { blob });
     }
 
     // -------------------------------------------------------------- broadcast
@@ -2242,11 +2361,12 @@ impl HostEngine {
         self.broadcast(HostMessage::Presence { peers });
     }
 
+    /// Announce a revision to everyone. Metadata only: each participant
+    /// notices the blob it is missing and pulls it, so host memory per peer is
+    /// O(1) instead of O(file size x participants).
     fn broadcast_revision(&mut self, revision: Revision) -> Result<()> {
-        let content = self.content_for_entry(revision.after.as_ref())?;
         self.broadcast(HostMessage::RevisionBroadcast {
             revision: Box::new(revision),
-            content_b64: content,
         });
         Ok(())
     }
@@ -2285,19 +2405,17 @@ impl HostEngine {
         }
     }
 
-    fn reply_operation(
-        &mut self,
-        conn_id: u64,
-        operation_id: Uuid,
-        outcome: OperationOutcome,
-        content_b64: Option<String>,
-    ) {
+    /// Answer an operation with its outcome alone.
+    ///
+    /// A canonical entry the participant does not yet hold is pulled over the
+    /// blob plane through the path a broadcast already uses; nothing about the
+    /// content travels with the acknowledgement.
+    fn reply_operation(&mut self, conn_id: u64, operation_id: Uuid, outcome: OperationOutcome) {
         self.send(
             conn_id,
             HostMessage::OperationResult {
                 operation_id,
                 outcome: Box::new(outcome),
-                content_b64,
             },
         );
     }

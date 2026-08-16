@@ -17,20 +17,29 @@ use uuid::Uuid;
 
 /// Files larger than this are never three-way merged as text.
 pub const TEXT_MERGE_LIMIT: u64 = 1024 * 1024; // 1 MiB
-/// Files larger than this are not synchronized at all.
-pub const MAX_SYNCED_FILE: u64 = 10 * 1024 * 1024; // 10 MiB
-/// Maximum WebSocket frame accepted, generous enough for a maximal file plus
-/// base64 expansion and protocol overhead (specification section 66).
+/// Largest file a session will synchronize.
+///
+/// No longer a protocol constraint — content is streamed and nothing holds a
+/// whole file — but a resource budget: the host uploads every change to every
+/// participant over one uplink, so one modification costs `size x participants`
+/// on a single machine (`docs/BLOB-PLANE.md`). Phase 4 turns this constant into
+/// canonical session state that a session can raise.
+pub const MAX_SYNCED_FILE: u64 = 128 * 1024 * 1024; // 128 MiB
+/// Maximum application message accepted after reassembly (specification
+/// section 66). Sized for a full canonical manifest, the largest control
+/// message that exists now that no file content travels on the control plane.
 pub const MAX_PROTOCOL_MESSAGE: usize = 48 * 1024 * 1024;
 /// Backpressure bounds per remote connection (specification section 65).
 pub const MAX_QUEUED_MESSAGES: usize = 256;
 pub const MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
 /// Wire protocol version (specification section 54).
 ///
-/// Version 2 carries every remote frame inside a Noise session. There is no
-/// compatibility mode: a version 1 peer cannot take part in a version 2
-/// session, by design.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Version 2 carries every remote frame inside a Noise session. Version 3 moves
+/// file content off the control plane onto a streamed data plane, and removes
+/// `content_b64` entirely. There is no compatibility mode and no downgrade
+/// path: a version 2 peer cannot take part in a version 3 session, and is told
+/// so rather than being served a session it would misread.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // File entries (specification sections 17-19)
@@ -209,10 +218,11 @@ pub struct FileOperation {
     pub base_entry: Option<FileEntry>,
     pub path: RepoPath,
     /// `None` means deletion.
+    ///
+    /// Content is not carried here. The blob behind `desired_entry.blob_hash`
+    /// is uploaded on the data plane and confirmed durable before this
+    /// operation is sent (`docs/BLOB-PLANE.md`).
     pub desired_entry: Option<FileEntry>,
-    /// Full file content, base64 in JSON. Present for creates and updates.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_b64: Option<String>,
 }
 
 impl FileOperation {

@@ -68,7 +68,12 @@ pub enum IpcCommand {
     ConflictResolve {
         id: String,
         source: ResolveSource,
-        content_b64: Option<String>,
+        /// A file on this machine holding the resolved bytes.
+        ///
+        /// A path rather than the content: the CLI and the daemon share a
+        /// filesystem, and a resolution of a large binary has no business being
+        /// base64-encoded through a local socket.
+        content_file: Option<String>,
     },
     ConflictDismiss {
         id: String,

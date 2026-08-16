@@ -5,8 +5,12 @@
 //! Wire protocol (specification sections 52-54, 99-106, 131, 137).
 //!
 //! JSON over one long-lived WebSocket per participant. Every frame carries
-//! `protocol_version` and `message_type`. File content travels as complete
-//! bytes, base64-encoded (sections 22, 23, 53).
+//! `protocol_version` and `message_type`.
+//!
+//! No file content appears here. Messages carry `FileEntry` metadata, and the
+//! bytes behind a `blob_hash` are streamed on the data plane and referenced by
+//! hash — see [`crate::blobwire`] and `docs/BLOB-PLANE.md`. That is what makes
+//! the size of a file a resource question rather than a protocol one.
 
 use crate::error::ErrorClass;
 use crate::model::*;
@@ -33,11 +37,48 @@ pub struct ManifestEntry {
     pub entry: FileEntry,
 }
 
-/// Blob payload carried inline in JSON.
+/// The control half of a blob transfer, identical in both directions.
+///
+/// Both ends send and receive blobs — a participant uploads before submitting
+/// the operation that references its content, and downloads canonical content
+/// it does not hold — so one vocabulary serves both.
+///
+/// The exchange is: `Offer`, then `Want` or `Have` from the receiver, then the
+/// bytes on the data plane, then `Done` or `Failed`. The receiver chooses the
+/// starting offset because only it knows what it already holds, and the sender
+/// waits for `Done` before relying on the blob being present at the far end.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlobPayload {
-    pub hash: String,
-    pub content_b64: String,
+#[serde(tag = "blob_message", rename_all = "snake_case")]
+pub enum BlobControl {
+    Offer {
+        transfer_id: u64,
+        hash: String,
+        size: u64,
+    },
+    Want {
+        transfer_id: u64,
+        from_offset: u64,
+    },
+    /// The receiver already holds this content; nothing will be sent.
+    Have {
+        transfer_id: u64,
+        hash: String,
+    },
+    /// Received, verified against its hash, and durably installed.
+    Done {
+        transfer_id: u64,
+        hash: String,
+    },
+    Failed {
+        transfer_id: u64,
+        hash: String,
+        reason: String,
+    },
+    /// Answer to a request for content this side cannot produce.
+    Unavailable {
+        hash: String,
+        reason: String,
+    },
 }
 
 /// Everything a reconnecting or resuming client knows (specification
@@ -109,9 +150,6 @@ pub struct ConflictReport {
     pub latest_local_candidate: Option<FileEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incoming_task_id: Option<Uuid>,
-    /// Any blob the host may not already hold.
-    #[serde(default)]
-    pub blobs: Vec<BlobPayload>,
 }
 
 // ---------------------------------------------------------------------------
@@ -131,11 +169,17 @@ pub enum ClientMessage {
         branch: String,
         resume: ClientResumeState,
     },
+    /// Submit an operation. Every blob it references must already be durably
+    /// present at the host; the host refuses it otherwise.
     SubmitOperation {
         operation: Box<FileOperation>,
     },
     RequestBlobs {
         hashes: Vec<String>,
+    },
+    /// One step of a blob transfer in either direction.
+    Blob {
+        blob: BlobControl,
     },
     /// Ask for a fresh full canonical manifest (divergence, corruption, or a
     /// gap the client cannot close by replay).
@@ -149,8 +193,6 @@ pub enum ClientMessage {
     AttachLocalCandidate {
         conflict_id: Uuid,
         entry: Option<FileEntry>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        content_b64: Option<String>,
     },
     ResolveConflict {
         request_id: Uuid,
@@ -160,8 +202,6 @@ pub enum ClientMessage {
         /// section 87): the host refuses the resolution if canonical moved.
         expected_canonical: Option<FileEntry>,
         resolved_entry: Option<FileEntry>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        content_b64: Option<String>,
     },
     DismissConflict {
         request_id: Uuid,
@@ -249,21 +289,20 @@ pub enum HostMessage {
         manifest: Vec<ManifestEntry>,
         host_state_hash: String,
     },
+    /// Metadata only. A participant that does not hold the referenced blob
+    /// pulls it with `RequestBlobs`, through the same path a reconnecting
+    /// replica uses — which keeps that path in the nominal regime rather than
+    /// in a rarely exercised recovery branch.
     RevisionBroadcast {
         revision: Box<Revision>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        content_b64: Option<String>,
     },
     OperationResult {
         operation_id: Uuid,
         outcome: Box<OperationOutcome>,
-        /// Canonical bytes when the host produced content the client does not
-        /// already hold (clean merge results, section 79).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        content_b64: Option<String>,
     },
-    Blobs {
-        blobs: Vec<BlobPayload>,
+    /// One step of a blob transfer in either direction.
+    Blob {
+        blob: BlobControl,
     },
     Control {
         control: Box<ControlSnapshot>,
@@ -278,12 +317,16 @@ pub enum HostMessage {
     BarrierEnd {
         barrier_id: Uuid,
     },
-    /// Exact host-produced Git objects plus the publication descriptor
-    /// (specification sections 131, 192).
+    /// The publication descriptor, plus the hash of the pack holding the exact
+    /// host-produced Git objects (specification sections 131, 192).
+    ///
+    /// The pack is an ordinary blob: a pack containing a large file is exactly
+    /// as large as the file, and it sits on the critical path of
+    /// `weave commit create`, so it travels the plane built for that.
     Publication {
         publication: Box<GitPublication>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pack_b64: Option<String>,
+        pack_hash: Option<String>,
     },
     PrepareResult {
         request_id: Uuid,

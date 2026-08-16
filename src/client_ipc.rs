@@ -159,7 +159,7 @@ impl ClientEngine {
             IpcCommand::ConflictResolve {
                 id,
                 source,
-                content_b64,
+                content_file,
             } => {
                 attempt!(self.require_connection());
                 let conflict = attempt!(self.find_conflict(&id));
@@ -173,25 +173,30 @@ impl ClientEngine {
                         reply,
                     ));
                 }
-                let resolved = attempt!(self.resolution_entry(&conflict, source, content_b64));
+                let resolved = attempt!(self.resolution_entry(&conflict, source, content_file));
                 let state = attempt!(self.store.path_state(&conflict.path));
-                let content = match &resolved {
-                    Some(entry) => match self.blobs.get(&entry.blob_hash) {
-                        Ok(bytes) => Some(crate::util::b64_encode(&bytes)),
-                        Err(e) => return Err((e, reply)),
-                    },
-                    None => None,
-                };
                 let request_id = Uuid::new_v4();
                 self.requests.insert(request_id, PendingRequest { reply });
-                self.send(ClientMessage::ResolveConflict {
+                // The resolved content reaches the host before the resolution
+                // that names it, exactly as an ordinary operation does.
+                let needs: Vec<String> = resolved
+                    .iter()
+                    .map(|entry| entry.blob_hash.clone())
+                    .collect();
+                let emitted = self.traffic.send_when_uploaded(
                     request_id,
-                    conflict_id: conflict.id,
-                    operation_id: Uuid::new_v4(),
-                    expected_canonical: state.confirmed.clone(),
-                    resolved_entry: resolved,
-                    content_b64: content,
-                });
+                    needs,
+                    ClientMessage::ResolveConflict {
+                        request_id,
+                        conflict_id: conflict.id,
+                        operation_id: Uuid::new_v4(),
+                        expected_canonical: state.confirmed.clone(),
+                        resolved_entry: resolved,
+                    },
+                );
+                if let Err(e) = self.emit(emitted) {
+                    tracing::error!("conflict resolution: {}", e.message);
+                }
             }
             IpcCommand::CommitPrepare { allow_active_tasks } => {
                 attempt!(self.require_connection());
@@ -422,7 +427,7 @@ impl ClientEngine {
         &mut self,
         conflict: &Conflict,
         source: ResolveSource,
-        content_b64: Option<String>,
+        content_file: Option<String>,
     ) -> Result<Option<FileEntry>> {
         match source {
             ResolveSource::Delete => Ok(None),
@@ -440,21 +445,25 @@ impl ClientEngine {
                 Ok(entry)
             }
             ResolveSource::Supplied => {
-                let encoded = content_b64
+                let source = content_file
                     .ok_or_else(|| crate::error::usage("No resolved content was supplied."))?;
-                let bytes = crate::util::b64_decode(&encoded)?;
-                if bytes.len() as u64 > MAX_SYNCED_FILE {
+                // Streamed into the blob store: a resolution is as large as the
+                // file it resolves, and that is no longer bounded by a message.
+                let ingested = self
+                    .blobs
+                    .ingest_file(std::path::Path::new(&source), CLASSIFY_PREFIX)?
+                    .ok_or_else(|| crate::error::usage(format!("No such file: {source}")))?;
+                if ingested.size > MAX_SYNCED_FILE {
                     return Err(crate::error::unsupported(
                         "The supplied resolution is above the Weave file size limit.",
                     ));
                 }
-                self.blobs.put(&bytes)?;
                 let mode = conflict
                     .canonical_entry
                     .as_ref()
                     .map(|e| e.git_mode)
                     .unwrap_or(GitMode::Regular);
-                Ok(Some(FileEntry::from_bytes(&bytes, mode)))
+                Ok(Some(FileEntry::from_ingested(&ingested, mode)))
             }
             ResolveSource::WorkingTree => {
                 let state = self.store.path_state(&conflict.path)?;

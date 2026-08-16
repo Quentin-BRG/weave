@@ -14,6 +14,7 @@
 //! the working tree is preceded by a synchronous capture check (section 36).
 
 use crate::blobs::BlobStore;
+use crate::blobwire::{self, BlobReceiver, Delivered, TransferIds};
 use crate::error::{ErrorClass, Result, WeaveError};
 use crate::gitx;
 use crate::ipc::{IpcCommand, IpcResponse};
@@ -24,15 +25,20 @@ use crate::reconcile::{reconcile, MergeContext, Reconciled};
 use crate::scan::{self, RejectedPath};
 use crate::session::Paths;
 use crate::store_client::{ClientStore, ConflictDraft, InFlight, PendingLocal};
-use crate::transport::Outbound;
+use crate::transport::{BlobPump, DataFrame, Outbound, PumpJob};
 use crate::watch::WatchEvent;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[path = "client_ipc.rs"]
 mod ipc_commands;
+
+#[path = "client_blobs.rs"]
+mod blob_traffic;
+
+use blob_traffic::{BlobTraffic, Emitted};
 
 const TICK_MS: u64 = 400;
 const SAFETY_RESCAN_MS: i64 = 15_000;
@@ -51,7 +57,12 @@ pub struct IpcCall {
 pub enum ClientInput {
     Watch(WatchEvent),
     Host(HostMessage),
-    Connected(Outbound),
+    /// One blob-plane frame from the host.
+    Data(DataFrame),
+    Connected {
+        out: Outbound,
+        pump: BlobPump,
+    },
     Disconnected(String),
     Ipc(IpcCall),
     Tick,
@@ -94,6 +105,8 @@ pub struct ClientEngine {
     branch: String,
 
     out: Option<Outbound>,
+    pump: Option<BlobPump>,
+    traffic: BlobTraffic,
     connected: bool,
     connection_note: String,
 
@@ -103,9 +116,18 @@ pub struct ClientEngine {
     local_state: SyncState,
 
     op_index: HashMap<Uuid, RepoPath>,
-    pending_revisions: BTreeMap<u64, (Revision, Option<Vec<u8>>)>,
+    pending_revisions: BTreeMap<u64, Revision>,
     barrier: Option<BarrierLocal>,
     requests: HashMap<Uuid, PendingRequest>,
+    /// Publications whose Git pack is still travelling on the blob plane.
+    awaiting_pack: Vec<(String, GitPublication)>,
+    /// Conflicted paths whose canonical content is still travelling.
+    ///
+    /// These cannot ride on the ordinary rematerialization sweep: a path in
+    /// conflict draft mode counts as local work, so `materialize_if_safe` will
+    /// never touch it. Restoring canonical content over a conflict is a
+    /// deliberate act, and it has to be retried deliberately too.
+    awaiting_restore: Vec<RepoPath>,
 
     rejected_paths: Vec<RejectedPath>,
     notices: Vec<String>,
@@ -143,6 +165,7 @@ impl ClientEngine {
         ClientEngine {
             paths,
             store,
+            traffic: BlobTraffic::new(blobs.clone()),
             blobs,
             actor_id,
             display_name,
@@ -152,6 +175,7 @@ impl ClientEngine {
             session,
             branch,
             out: None,
+            pump: None,
             connected: false,
             connection_note: "connecting".into(),
             control: None,
@@ -162,6 +186,8 @@ impl ClientEngine {
             pending_revisions: BTreeMap::new(),
             barrier: None,
             requests: HashMap::new(),
+            awaiting_pack: Vec::new(),
+            awaiting_restore: Vec::new(),
             rejected_paths: Vec::new(),
             notices: Vec::new(),
             expected_head,
@@ -244,11 +270,20 @@ impl ClientEngine {
                 self.full_rescan()
             }
             ClientInput::Host(message) => self.on_host_message(message),
-            ClientInput::Connected(out) => self.on_connected(out),
+            ClientInput::Data(frame) => {
+                let emitted = self.traffic.on_data(&frame);
+                // The permit this frame carries is released here, once the
+                // chunk is on disk, so the sender is paced by the slower of the
+                // network and this replica's storage.
+                drop(frame);
+                self.emit(emitted)
+            }
+            ClientInput::Connected { out, pump } => self.on_connected(out, pump),
             ClientInput::Disconnected(reason) => {
                 self.connected = false;
                 self.connection_note = reason;
                 self.out = None;
+                self.pump = None;
                 // Unsent work stays in the outbox; nothing is discarded
                 // (specification sections 35, 148).
                 self.mark_all_unsent()
@@ -293,8 +328,9 @@ impl ClientEngine {
         Ok(())
     }
 
-    fn on_connected(&mut self, out: Outbound) -> Result<()> {
+    fn on_connected(&mut self, out: Outbound, pump: BlobPump) -> Result<()> {
         self.out = Some(out);
+        self.pump = Some(pump);
         self.connected = true;
         self.connection_note = "online".into();
         // Hello must be the first frame on the socket, so the handshake is sent
@@ -310,6 +346,9 @@ impl ClientEngine {
             branch: self.branch.clone(),
             resume,
         });
+        // Transfers do not survive the socket they were negotiated on.
+        let emitted = self.traffic.reconnected();
+        self.emit(emitted)?;
         // A full rescan on (re)connect is mandatory (specification section 32):
         // anything edited while Weave was not watching is captured here.
         self.full_rescan()?;
@@ -611,10 +650,6 @@ impl ClientEngine {
                 return Ok(());
             }
         }
-        let content_b64 = match &flight.desired {
-            Some(entry) => Some(crate::util::b64_encode(&self.blobs.get(&entry.blob_hash)?)),
-            None => None,
-        };
         let op = FileOperation {
             operation_id: flight.operation_id,
             actor_id: self.actor_id,
@@ -624,11 +659,26 @@ impl ClientEngine {
             base_entry: flight.base_entry.clone(),
             path: path.clone(),
             desired_entry: flight.desired.clone(),
-            content_b64,
         };
-        self.send(ClientMessage::SubmitOperation {
-            operation: Box::new(op),
-        });
+        // Upload before submit: the host accepts an operation only once the
+        // content it names is durable there, so the operation waits behind its
+        // own blob instead of the host parking it on arrival.
+        let needs: Vec<String> = flight
+            .desired
+            .iter()
+            .map(|entry| entry.blob_hash.clone())
+            .collect();
+        let emitted = self.traffic.send_when_uploaded(
+            flight.operation_id,
+            needs,
+            ClientMessage::SubmitOperation {
+                operation: Box::new(op),
+            },
+        );
+        self.emit(emitted)?;
+        // Marked sent even while the submission sits behind its upload: the
+        // resend timer is what recovers a transfer that never completes, and it
+        // replaces the deferred message rather than queueing a second one.
         if let Some(f) = &mut state.in_flight {
             f.sent = true;
             f.sent_at_ms = crate::util::now_ms();
@@ -753,41 +803,14 @@ impl ClientEngine {
                 self.sync_working_tree()?;
                 self.flush_outbox()
             }
-            HostMessage::RevisionBroadcast {
-                revision,
-                content_b64,
-            } => {
-                let content = match content_b64 {
-                    Some(text) => Some(crate::util::b64_decode(&text)?),
-                    None => None,
-                };
-                if let Some(bytes) = &content {
-                    self.blobs.put(bytes)?;
-                }
-                self.enqueue_revision(*revision, content)
-            }
+            HostMessage::RevisionBroadcast { revision } => self.enqueue_revision(*revision),
             HostMessage::OperationResult {
                 operation_id,
                 outcome,
-                content_b64,
-            } => {
-                if let Some(text) = &content_b64 {
-                    let bytes = crate::util::b64_decode(text)?;
-                    self.blobs.put(&bytes)?;
-                }
-                self.on_operation_result(operation_id, *outcome)
-            }
-            HostMessage::Blobs { blobs } => {
-                for blob in blobs {
-                    let bytes = crate::util::b64_decode(&blob.content_b64)?;
-                    if crate::util::sha256_hex(&bytes) != blob.hash {
-                        return Err(crate::error::integrity(
-                            "The host sent blob content that does not match its hash.",
-                        ));
-                    }
-                    self.blobs.put(&bytes)?;
-                }
-                self.sync_working_tree()
+            } => self.on_operation_result(operation_id, *outcome),
+            HostMessage::Blob { blob } => {
+                let emitted = self.traffic.on_control(blob);
+                self.emit(emitted)
             }
             HostMessage::Control { control } => self.apply_control(*control),
             HostMessage::Presence { peers } => {
@@ -804,14 +827,8 @@ impl ClientEngine {
             }
             HostMessage::Publication {
                 publication,
-                pack_b64,
-            } => {
-                let pack = match pack_b64 {
-                    Some(text) => Some(crate::util::b64_decode(&text)?),
-                    None => None,
-                };
-                self.apply_publication(*publication, pack)
-            }
+                pack_hash,
+            } => self.on_publication(*publication, pack_hash),
             HostMessage::PrepareResult {
                 request_id,
                 outcome,
@@ -941,19 +958,53 @@ impl ClientEngine {
         &mut self,
         entries: I,
     ) -> Result<()> {
-        let mut missing: Vec<String> = Vec::new();
-        for entry in entries {
-            if !self.blobs.has(&entry.blob_hash) && !missing.contains(&entry.blob_hash) {
-                missing.push(entry.blob_hash.clone());
+        let missing: Vec<String> = entries
+            .filter(|entry| !self.blobs.has(&entry.blob_hash))
+            .map(|entry| entry.blob_hash.clone())
+            .collect();
+        self.want_blobs(missing)
+    }
+
+    /// Ask the host for content the working tree needs.
+    ///
+    /// Everything funnels through here so that one queue decides how many
+    /// transfers are open at once, whatever revealed the gap.
+    fn want_blobs<I: IntoIterator<Item = String>>(&mut self, hashes: I) -> Result<()> {
+        let emitted = self.traffic.want(hashes);
+        self.emit(emitted)?;
+        if self.traffic.waiting_for_content() {
+            self.materialization_blocked = true;
+        }
+        Ok(())
+    }
+
+    /// Carry out the consequences of one blob-plane event.
+    fn emit(&mut self, emitted: Emitted) -> Result<()> {
+        if emitted.is_empty() {
+            return Ok(());
+        }
+        for message in emitted.messages {
+            self.send(message);
+        }
+        if let Some(pump) = self.pump.clone() {
+            for job in emitted.jobs {
+                pump.start(job.transfer_id, job.hash, job.from_offset);
             }
         }
-        if !missing.is_empty() {
-            self.materialization_blocked = true;
-            for chunk in missing.chunks(256) {
-                self.send(ClientMessage::RequestBlobs {
-                    hashes: chunk.to_vec(),
-                });
+        for (hash, reason) in emitted.refused {
+            self.note(format!(
+                "content {} could not be transferred: {reason}",
+                crate::util::short_oid(&hash)
+            ));
+        }
+        if !emitted.installed.is_empty() {
+            for hash in emitted.installed {
+                self.install_awaited_publications(&hash)?;
             }
+            for path in std::mem::take(&mut self.awaiting_restore) {
+                self.restore_canonical_for_conflict(&path)?;
+            }
+            self.sync_working_tree()?;
         }
         Ok(())
     }
@@ -1003,13 +1054,12 @@ impl ClientEngine {
 
     // ------------------------------------------------------------- revisions
 
-    fn enqueue_revision(&mut self, revision: Revision, content: Option<Vec<u8>>) -> Result<()> {
+    fn enqueue_revision(&mut self, revision: Revision) -> Result<()> {
         let last = self.store.last_applied_revision()?;
         if revision.revision <= last {
             return Ok(());
         }
-        self.pending_revisions
-            .insert(revision.revision, (revision, content));
+        self.pending_revisions.insert(revision.revision, revision);
         self.drain_pending_revisions()
     }
 
@@ -1019,7 +1069,7 @@ impl ClientEngine {
     fn drain_pending_revisions(&mut self) -> Result<()> {
         loop {
             let last = self.store.last_applied_revision()?;
-            let Some((revision, _)) = self.pending_revisions.remove(&(last + 1)) else {
+            let Some(revision) = self.pending_revisions.remove(&(last + 1)) else {
                 break;
             };
             self.apply_revision(revision)?;
@@ -1078,10 +1128,8 @@ impl ClientEngine {
         match &state.confirmed {
             Some(entry) => {
                 if !self.blobs.has(&entry.blob_hash) {
-                    self.materialization_blocked = true;
-                    self.send(ClientMessage::RequestBlobs {
-                        hashes: vec![entry.blob_hash.clone()],
-                    });
+                    let hash = entry.blob_hash.clone();
+                    self.want_blobs([hash])?;
                     return Ok(());
                 }
                 scan::materialize_file(
@@ -1234,12 +1282,8 @@ impl ClientEngine {
             Err(e) if e.class == ErrorClass::IntegrityError => {
                 // A blob needed for the rebase is missing locally; ask for it
                 // and retry on arrival. Nothing is discarded.
-                self.materialization_blocked = true;
-                if let Some(entry) = &canonical {
-                    self.send(ClientMessage::RequestBlobs {
-                        hashes: vec![entry.blob_hash.clone()],
-                    });
-                }
+                let missing: Vec<String> = canonical.iter().map(|e| e.blob_hash.clone()).collect();
+                self.want_blobs(missing)?;
                 return Ok(());
             }
             Err(e) => return Err(e),
@@ -1276,31 +1320,32 @@ impl ClientEngine {
                 // Preserve both sides durably before the working tree is
                 // restored to canonical (specification section 42).
                 let conflict_id = Uuid::new_v4();
-                let mut payloads = Vec::new();
-                for entry in [base.as_ref(), pending.desired.as_ref()]
+                // Both sides of the conflict have to reach the host before the
+                // report that names them, or the host would hold a conflict it
+                // cannot show anybody.
+                let needs: Vec<String> = [base.as_ref(), pending.desired.as_ref()]
                     .into_iter()
                     .flatten()
-                {
-                    if let Ok(bytes) = self.blobs.get(&entry.blob_hash) {
-                        payloads.push(BlobPayload {
-                            hash: entry.blob_hash.clone(),
-                            content_b64: crate::util::b64_encode(&bytes),
-                        });
-                    }
-                }
-                self.send(ClientMessage::ReportConflict {
-                    report: Box::new(ConflictReport {
-                        id: conflict_id,
-                        path: path.clone(),
-                        kind,
-                        base_entry: base.clone(),
-                        canonical_entry: canonical.clone(),
-                        incoming_entry: pending.desired.clone(),
-                        latest_local_candidate: pending.desired.clone(),
-                        incoming_task_id: pending.task_id,
-                        blobs: payloads,
-                    }),
-                });
+                    .filter(|entry| self.blobs.has(&entry.blob_hash))
+                    .map(|entry| entry.blob_hash.clone())
+                    .collect();
+                let emitted = self.traffic.send_when_uploaded(
+                    conflict_id,
+                    needs,
+                    ClientMessage::ReportConflict {
+                        report: Box::new(ConflictReport {
+                            id: conflict_id,
+                            path: path.clone(),
+                            kind,
+                            base_entry: base.clone(),
+                            canonical_entry: canonical.clone(),
+                            incoming_entry: pending.desired.clone(),
+                            latest_local_candidate: pending.desired.clone(),
+                            incoming_task_id: pending.task_id,
+                        }),
+                    },
+                );
+                self.emit(emitted)?;
                 state.pending_local = None;
                 state.conflict_draft = Some(ConflictDraft {
                     conflict_id,
@@ -1355,18 +1400,21 @@ impl ClientEngine {
         // anything is restored (specification section 43).
         let latest = state.pending_local.clone();
         if let Some(pending) = &latest {
-            let content = match &pending.desired {
-                Some(entry) => match self.blobs.get(&entry.blob_hash) {
-                    Ok(bytes) => Some(crate::util::b64_encode(&bytes)),
-                    Err(_) => None,
-                },
-                None => None,
-            };
-            self.send(ClientMessage::AttachLocalCandidate {
+            let needs: Vec<String> = pending
+                .desired
+                .iter()
+                .filter(|entry| self.blobs.has(&entry.blob_hash))
+                .map(|entry| entry.blob_hash.clone())
+                .collect();
+            let emitted = self.traffic.send_when_uploaded(
                 conflict_id,
-                entry: pending.desired.clone(),
-                content_b64: content,
-            });
+                needs,
+                ClientMessage::AttachLocalCandidate {
+                    conflict_id,
+                    entry: pending.desired.clone(),
+                },
+            );
+            self.emit(emitted)?;
         }
         let draft_entry = latest
             .as_ref()
@@ -1402,10 +1450,10 @@ impl ClientEngine {
         match state.confirmed.clone() {
             Some(entry) => {
                 if !self.blobs.has(&entry.blob_hash) {
-                    self.materialization_blocked = true;
-                    self.send(ClientMessage::RequestBlobs {
-                        hashes: vec![entry.blob_hash.clone()],
-                    });
+                    if !self.awaiting_restore.contains(path) {
+                        self.awaiting_restore.push(path.clone());
+                    }
+                    self.want_blobs([entry.blob_hash.clone()])?;
                     return Ok(());
                 }
                 scan::materialize_file(
@@ -1517,10 +1565,51 @@ impl ClientEngine {
 
     /// Install exact host-produced Git objects and advance local Git state,
     /// journalling each step (specification sections 131-135).
+    /// A publication whose pack has not arrived yet waits for it.
+    ///
+    /// The pack travels on the blob plane like any other content, so a
+    /// publication carrying a large file no longer inflates a control message.
+    fn on_publication(
+        &mut self,
+        publication: GitPublication,
+        pack_hash: Option<String>,
+    ) -> Result<()> {
+        match &pack_hash {
+            Some(hash) if !self.blobs.has(hash) => {
+                if !self
+                    .awaiting_pack
+                    .iter()
+                    .any(|(h, p)| h == hash && p.sequence == publication.sequence)
+                {
+                    self.awaiting_pack.push((hash.clone(), publication));
+                }
+                self.want_blobs([hash.clone()])
+            }
+            _ => self.apply_publication(publication, pack_hash),
+        }
+    }
+
+    fn install_awaited_publications(&mut self, hash: &str) -> Result<()> {
+        let mut ready = Vec::new();
+        self.awaiting_pack.retain(|(want, publication)| {
+            if want == hash {
+                ready.push(publication.clone());
+                false
+            } else {
+                true
+            }
+        });
+        ready.sort_by_key(|p| p.sequence);
+        for publication in ready {
+            self.apply_publication(publication, Some(hash.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn apply_publication(
         &mut self,
         publication: GitPublication,
-        pack: Option<Vec<u8>>,
+        pack_hash: Option<String>,
     ) -> Result<()> {
         let root = self.paths.repo_root.clone();
         let descriptor = publication.descriptor.clone();
@@ -1537,8 +1626,9 @@ impl ClientEngine {
         self.store
             .put_publication_journal(&publication, PublicationStage::Pending)?;
 
-        if let Some(pack) = pack {
+        if let Some(hash) = &pack_hash {
             if !gitx::object_exists(&root, &descriptor.commit_oid)? {
+                let pack = self.blobs.path_of(hash)?;
                 gitx::unpack_objects(&root, &pack)?;
             }
         }

@@ -124,8 +124,10 @@ fn a_full_session_runs_over_a_real_cloudflare_quick_tunnel() {
     write_file(&guest.repo, "slides/02-guest.md", "From Alice, remotely\n");
     host.wait_for_file("slides/02-guest.md", "From Alice, remotely\n", TUNNEL);
 
-    // A binary asset exercises the base64 payload path over the tunnel.
-    let blob: Vec<u8> = (0u32..40_000).map(|i| (i % 251) as u8).collect();
+    // A binary asset past the old 10 MiB ceiling exercises the blob plane over
+    // a real WAN path: thousands of data frames, Cloudflare's own framing in
+    // between, and the control plane still running alongside them.
+    let blob = blob_bytes(7, 12 * 1024 * 1024);
     std::fs::write(guest.repo.join("assets.bin"), &blob).unwrap();
     host.wait_for_bytes("assets.bin", &blob, TUNNEL);
 

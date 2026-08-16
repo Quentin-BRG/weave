@@ -15,6 +15,7 @@
 //! corruption of the ordinary Git repository.
 
 pub mod blobs;
+pub mod blobwire;
 pub mod bootstrap;
 pub mod cli;
 pub mod client;

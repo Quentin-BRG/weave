@@ -243,7 +243,7 @@ the places where `content_b64` appears.
 | --- | --- | --- | --- |
 | **0 — Local streaming** | streaming blob store, scanner hashing into it, streaming materialization, `gitx` from files | low | done |
 | **1 — Transport** | frame class, priority writer, waiting data queue | medium | done |
-| **2 — Protocol v3** | `content_b64` removed everywhere, pull-based broadcast, upload-before-submit, conflict blobs, publication pack | **high** | |
+| **2 — Protocol v3** | `content_b64` removed everywhere, pull-based broadcast, upload-before-submit, conflict blobs, publication pack | **high** | done |
 | **3 — Robustness** | offset resumption, barrier precondition, blob GC | medium | |
 | **4 — Policy** | canonical session limit and its state machine, startup refusal, disk checks, docs | low | |
 
@@ -266,14 +266,20 @@ they are what make large files bearable in practice:
 
 ## 7. Test matrix
 
-End-to-end, driving the real binary, as everything in `tests/` does:
+End-to-end, driving the real binary, as everything in `tests/` does. The
+blob-plane cases live in `tests/blob_plane.rs`; the framing and installation
+invariants they rest on are unit-tested in `src/blobwire.rs`, where a corrupt or
+truncated transfer can actually be constructed — on the wire, Noise
+authentication fails long before a hash check would.
 
-| Test | What it defends |
-| --- | --- |
-| large file created, modified and deleted, 3 participants | the invariant itself: identical logical state throughout |
-| disconnect mid-transfer | resumption from offset, no restart from zero |
-| daemon crash mid-transfer | a `.part` never installs; the blob store cannot hold a partial |
-| concurrent binary edit on a large file | conflict with three candidates written to disk by streaming |
-| publication including a large file | pack over the data plane, and the published tree equals the parent tree modified only where revisions exist |
-| small edits during a large transfer | **control-plane starvation** — the regression that turns a healthy session into an apparently frozen one |
-| file created above the session limit | preserved locally, publication blocked, both remedies, and the raise propagating as a control version |
+| Test | What it defends | |
+| --- | --- | --- |
+| large file created, modified and deleted, 3 participants | the invariant itself: identical logical state throughout | phase 2 |
+| a file past both old ceilings, in both directions | that neither the 10 MiB message limit nor the 32 MiB queue bound survives anywhere | phase 2 |
+| many concurrent transfers, three senders | transfer ids stay isolated; no blob receives another's bytes | phase 2 |
+| daemon crash mid-transfer | a `.part` never installs; the working tree never shows a partial file; the transfer completes after restart | phase 2 |
+| concurrent binary edit on a large file | conflict with both candidates preserved whole, and resolution uploading a large candidate back | phase 2 |
+| publication including a large file | pack over the data plane, and the published tree equals the parent tree modified only where revisions exist | phase 2 |
+| small edits during a large transfer | **control-plane starvation** — the regression that turns a healthy session into an apparently frozen one | phase 2 |
+| disconnect mid-transfer | resumption from offset, no restart from zero | phase 3 |
+| file created above the session limit | preserved locally, publication blocked, both remedies, and the raise propagating as a control version | phase 4 |

@@ -532,13 +532,10 @@ fn conflict(start_dir: &std::path::Path, command: ConflictCommand) -> Result<()>
             content_file,
             json,
         } => {
-            let (source, content_b64) = match content_file {
+            let (source, content_file) = match content_file {
                 Some(path) => {
-                    let bytes = std::fs::read(&path)?;
-                    (
-                        ResolveSource::Supplied,
-                        Some(crate::util::b64_encode(&bytes)),
-                    )
+                    let full = std::fs::canonicalize(&path)?;
+                    (ResolveSource::Supplied, Some(full.display().to_string()))
                 }
                 None => (
                     match source {
@@ -556,7 +553,7 @@ fn conflict(start_dir: &std::path::Path, command: ConflictCommand) -> Result<()>
                 IpcCommand::ConflictResolve {
                     id,
                     source,
-                    content_b64,
+                    content_file,
                 },
             )?;
             emit(json, value, |v| {

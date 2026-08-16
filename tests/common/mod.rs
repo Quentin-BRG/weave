@@ -125,6 +125,35 @@ pub fn write_file(dir: &Path, rel: &str, content: &str) {
     std::fs::write(&path, content).unwrap_or_else(|e| panic!("write {rel}: {e}"));
 }
 
+pub fn write_bytes(dir: &Path, rel: &str, content: &[u8]) {
+    let path = dir.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&path, content).unwrap_or_else(|e| panic!("write {rel}: {e}"));
+}
+
+/// Deterministic incompressible-looking bytes.
+///
+/// Binary on purpose — a NUL in the first bytes is what makes Weave classify
+/// the file as binary rather than mergeable text — and seeded, so two files of
+/// the same length still have different content hashes and cannot dedupe into
+/// one blob and hide a missing transfer.
+pub fn blob_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    // Guarantee the classifier sees binary regardless of the seed.
+    out[0] = 0;
+    out
+}
+
 pub fn read_file(dir: &Path, rel: &str) -> String {
     std::fs::read_to_string(dir.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
@@ -232,6 +261,17 @@ impl Participant {
     /// Ask the daemon to stop and wait for the process to exit.
     pub fn stop_daemon(&mut self) {
         self.shutdown_daemon("stop");
+    }
+
+    /// Kill the daemon outright, as a crash or a power cut would.
+    ///
+    /// No `weave stop`, so nothing gets a chance to finish: any transfer in
+    /// flight is abandoned exactly where it was.
+    pub fn kill_daemon(&mut self) {
+        if let Some(mut child) = self.daemon.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     /// Leave the session (forgetting its local record) and wait for exit.

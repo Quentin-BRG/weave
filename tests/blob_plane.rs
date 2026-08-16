@@ -1,0 +1,424 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! End-to-end tests for the blob plane (`docs/BLOB-PLANE.md`, section 7).
+//!
+//! Everything here is about content that is far too large to have travelled in
+//! a JSON control message: file bytes now stream beside the control plane,
+//! hash-addressed, and the control plane only ever names them. The properties
+//! under test are the ones that make that safe — every participant converges on
+//! the same repository state, a transfer that is interrupted installs nothing,
+//! control traffic keeps flowing while bulk transfers run, and conflicts and
+//! Git publications go the same way.
+
+mod common;
+
+use common::*;
+use std::time::{Duration, Instant};
+
+/// Comfortably past the 10 MiB ceiling the old control plane imposed.
+const LARGE: usize = 12 * 1024 * 1024;
+
+/// Past the old 32 MiB outbound queue bound as well, so this size could not
+/// have crossed the wire under the previous design at any message limit.
+const HUGE: usize = 40 * 1024 * 1024;
+
+struct Session {
+    _sandbox: Sandbox,
+    host: Participant,
+    guests: Vec<Participant>,
+}
+
+impl Session {
+    fn everyone(&self) -> impl Iterator<Item = &Participant> {
+        std::iter::once(&self.host).chain(self.guests.iter())
+    }
+
+    fn stop(&mut self) {
+        for guest in &mut self.guests {
+            guest.stop_daemon();
+        }
+        self.host.stop_daemon();
+    }
+}
+
+/// A host plus `guests` participants, all online and holding canonical state.
+fn start_session(label: &str, guests: usize) -> Session {
+    let sandbox = Sandbox::new(label);
+    let mut host = Participant::new(&sandbox, "alpha");
+    init_repo(&host.repo, "Quentin", "quentin@example.com");
+
+    let names = ["beta", "gamma", "delta"];
+    let people = [
+        ("Alice", "alice@example.com"),
+        ("Bob", "bob@example.com"),
+        ("Carol", "carol@example.com"),
+    ];
+    let mut clones = Vec::new();
+    for index in 0..guests {
+        let guest = Participant::new(&sandbox, names[index]);
+        let out = std::process::Command::new("git")
+            .args(["clone", "-q", "-c", "core.autocrlf=false"])
+            .arg(&host.repo)
+            .arg(&guest.repo)
+            .output()
+            .expect("git clone");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        git(&guest.repo, &["config", "user.name", people[index].0]);
+        git(&guest.repo, &["config", "user.email", people[index].1]);
+        git(&guest.repo, &["config", "commit.gpgsign", "false"]);
+        clones.push(guest);
+    }
+
+    host.start_daemon(&["host", "--lan"]);
+    host.wait_online(LONG);
+
+    let invite = host.json(&["invite"]);
+    let invite_path = host.repo.parent().unwrap().join("invite.txt");
+    std::fs::write(&invite_path, invite["invite"].as_str().unwrap()).unwrap();
+
+    for guest in &mut clones {
+        guest.start_daemon(&["join", "--invite-file", invite_path.to_str().unwrap()]);
+        guest.wait_online(LONG);
+        guest.wait_for_status("the guest to receive canonical state", LONG, |v| {
+            v["file_count"].as_u64().unwrap_or(0) >= 3
+        });
+    }
+
+    Session {
+        _sandbox: sandbox,
+        host,
+        guests: clones,
+    }
+}
+
+/// Wait until every participant reports the same revision and state hash.
+///
+/// This is the invariant the whole redesign exists to protect: one logical
+/// repository state, for everybody, whatever the file sizes involved.
+fn wait_for_agreement(session: &Session, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let states: Vec<serde_json::Value> = session
+            .everyone()
+            .map(|p| p.json_allow_failure(&["status"]).unwrap_or_default())
+            .collect();
+        let settled = states.iter().all(|v| {
+            v["outbox_pending"] == 0
+                && v["state"].as_str().is_some()
+                && v["state"] == states[0]["state"]
+                && v["live_revision"] == states[0]["live_revision"]
+        });
+        if settled {
+            return states[0]["state"].as_str().unwrap().to_string();
+        }
+        if Instant::now() >= deadline {
+            let dump: Vec<String> = states
+                .iter()
+                .map(|v| format!("{} @ r{}", v["state"], v["live_revision"]))
+                .collect();
+            for participant in session.everyone() {
+                participant.assert_daemon_healthy();
+            }
+            panic!(
+                "participants never agreed on one state: {}\nhost log:\n{}",
+                dump.join(" | "),
+                session.host.daemon_output()
+            );
+        }
+        for participant in session.everyone() {
+            participant.assert_daemon_healthy();
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1. Create, modify, delete a large file with three participants
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_large_binary_file_is_created_modified_and_deleted_for_everyone() {
+    let mut session = start_session("blob-lifecycle", 2);
+
+    // Created by the host.
+    let first = blob_bytes(1, LARGE);
+    write_bytes(&session.host.repo, "assets/deck.pdf", &first);
+    for guest in &session.guests {
+        guest.wait_for_bytes("assets/deck.pdf", &first, LONG);
+    }
+    wait_for_agreement(&session, LONG);
+
+    // Modified by a participant: the new content travels the other way, and
+    // being a different hash it cannot be satisfied by the copy already held.
+    let second = blob_bytes(2, LARGE + 4096);
+    write_bytes(&session.guests[0].repo, "assets/deck.pdf", &second);
+    session
+        .host
+        .wait_for_bytes("assets/deck.pdf", &second, LONG);
+    session.guests[1].wait_for_bytes("assets/deck.pdf", &second, LONG);
+    wait_for_agreement(&session, LONG);
+
+    // Deleted by the other participant.
+    std::fs::remove_file(session.guests[1].repo.join("assets/deck.pdf")).unwrap();
+    session.host.wait_for_missing("assets/deck.pdf", LONG);
+    session.guests[0].wait_for_missing("assets/deck.pdf", LONG);
+    wait_for_agreement(&session, LONG);
+
+    session.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 2. Sizes the old design could not carry at all
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_file_far_above_the_old_limits_travels_in_both_directions() {
+    let mut session = start_session("blob-huge", 1);
+
+    let down = blob_bytes(11, HUGE);
+    write_bytes(&session.host.repo, "video/keynote.mov", &down);
+    session.guests[0].wait_for_bytes("video/keynote.mov", &down, LONG);
+
+    let up = blob_bytes(12, HUGE);
+    write_bytes(&session.guests[0].repo, "video/reply.mov", &up);
+    session.host.wait_for_bytes("video/reply.mov", &up, LONG);
+
+    wait_for_agreement(&session, LONG);
+    session.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 3. Control priority: the session stays live during a bulk transfer
+// ---------------------------------------------------------------------------
+
+#[test]
+fn control_traffic_keeps_flowing_during_a_large_transfer() {
+    let mut session = start_session("blob-priority", 1);
+
+    // Start a transfer that will still be running for the next few seconds.
+    let bulk = blob_bytes(21, HUGE);
+    write_bytes(&session.host.repo, "video/bulk.mov", &bulk);
+
+    // While it runs, ordinary control traffic must keep its latency. Each of
+    // these is a full round trip: the guest captures, submits, the host accepts
+    // and broadcasts, and the guest sees the host's copy appear.
+    for round in 0..3 {
+        let text = format!("note {round}\n");
+        let name = format!("notes/{round}.md");
+        let started = Instant::now();
+        write_bytes(&session.guests[0].repo, &name, text.as_bytes());
+        session.host.wait_for_file(&name, &text, SHORT);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "a small edit took {elapsed:?} while a bulk transfer was running"
+        );
+
+        // And the daemon answers its control socket throughout.
+        let status = session.guests[0].status();
+        assert_eq!(
+            status["connection"].as_str(),
+            Some("online"),
+            "the guest dropped offline during a transfer: {status}"
+        );
+    }
+
+    // The bulk transfer still completes correctly afterwards.
+    session.guests[0].wait_for_bytes("video/bulk.mov", &bulk, LONG);
+    wait_for_agreement(&session, LONG);
+    session.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 4. Interruption installs nothing, and the transfer completes after restart
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_killed_daemon_never_leaves_a_partial_file_and_finishes_after_restart() {
+    let mut session = start_session("blob-interrupt", 1);
+
+    let bytes = blob_bytes(31, HUGE);
+    write_bytes(&session.host.repo, "video/interrupted.mov", &bytes);
+
+    // Kill the guest while the transfer is in flight. No graceful stop: this is
+    // a crash, so any partial write is abandoned exactly where it stood.
+    std::thread::sleep(Duration::from_millis(400));
+    session.guests[0].kill_daemon();
+
+    // Nothing partial may be visible in the working tree. Materialization
+    // happens only after a blob is installed, and a blob is installed only
+    // after its SHA-256 has been verified whole.
+    let path = session.guests[0].repo.join("video/interrupted.mov");
+    if path.exists() {
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "a partially transferred file appeared in the working tree"
+        );
+    }
+
+    session.guests[0].start_daemon(&["resume"]);
+    session.guests[0].wait_online(LONG);
+    session.guests[0].wait_for_bytes("video/interrupted.mov", &bytes, LONG);
+    wait_for_agreement(&session, LONG);
+
+    session.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 5. Many transfers at once, in both directions, stay separate
+// ---------------------------------------------------------------------------
+
+#[test]
+fn many_concurrent_transfers_stay_isolated() {
+    let mut session = start_session("blob-concurrent", 2);
+
+    // Six blobs of the same size and different content, produced at once from
+    // three different machines. If transfer bookkeeping ever crossed streams,
+    // the result would be a file holding somebody else's bytes, and the hash
+    // check would turn that into a stalled transfer rather than a wrong file —
+    // either way this test fails.
+    let size = 3 * 1024 * 1024;
+    let host_blobs: Vec<Vec<u8>> = (0..2).map(|i| blob_bytes(100 + i, size)).collect();
+    let alice_blobs: Vec<Vec<u8>> = (0..2).map(|i| blob_bytes(200 + i, size)).collect();
+    let bob_blobs: Vec<Vec<u8>> = (0..2).map(|i| blob_bytes(300 + i, size)).collect();
+
+    for (i, bytes) in host_blobs.iter().enumerate() {
+        write_bytes(&session.host.repo, &format!("bulk/host-{i}.bin"), bytes);
+    }
+    for (i, bytes) in alice_blobs.iter().enumerate() {
+        write_bytes(
+            &session.guests[0].repo,
+            &format!("bulk/alice-{i}.bin"),
+            bytes,
+        );
+    }
+    for (i, bytes) in bob_blobs.iter().enumerate() {
+        write_bytes(&session.guests[1].repo, &format!("bulk/bob-{i}.bin"), bytes);
+    }
+
+    for participant in session.everyone() {
+        for (i, bytes) in host_blobs.iter().enumerate() {
+            participant.wait_for_bytes(&format!("bulk/host-{i}.bin"), bytes, LONG);
+        }
+        for (i, bytes) in alice_blobs.iter().enumerate() {
+            participant.wait_for_bytes(&format!("bulk/alice-{i}.bin"), bytes, LONG);
+        }
+        for (i, bytes) in bob_blobs.iter().enumerate() {
+            participant.wait_for_bytes(&format!("bulk/bob-{i}.bin"), bytes, LONG);
+        }
+    }
+    wait_for_agreement(&session, LONG);
+
+    session.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 6. A conflict over a large binary keeps both candidates
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_large_binary_conflict_keeps_both_candidates() {
+    let mut session = start_session("blob-conflict", 1);
+
+    let base = blob_bytes(41, LARGE);
+    write_bytes(&session.host.repo, "assets/poster.psd", &base);
+    session.guests[0].wait_for_bytes("assets/poster.psd", &base, LONG);
+    wait_for_agreement(&session, LONG);
+
+    // Concurrent edits: binary content cannot be merged, so this is a conflict
+    // by construction, and both candidates are large.
+    session.guests[0].stop_daemon();
+    let guest_version = blob_bytes(42, LARGE);
+    write_bytes(&session.guests[0].repo, "assets/poster.psd", &guest_version);
+
+    let host_version = blob_bytes(43, LARGE);
+    write_bytes(&session.host.repo, "assets/poster.psd", &host_version);
+    session.host.wait_for_status("the host edit", LONG, |v| {
+        v["outbox_pending"] == 0 && v["live_revision"].as_u64().unwrap_or(0) >= 1
+    });
+
+    session.guests[0].start_daemon(&["resume"]);
+    session.guests[0].wait_online(LONG);
+
+    let conflict = session.guests[0].wait_for_conflict(LONG);
+    assert_eq!(conflict["conflict"]["path"], "assets/poster.psd");
+
+    // The rejected candidate is preserved on disk in full — that is what makes
+    // "no work is discarded" true for content that never fit in a message.
+    let incoming = conflict["candidate_files"]["incoming"].as_str().unwrap();
+    assert_eq!(
+        std::fs::read(incoming).unwrap(),
+        guest_version,
+        "the guest's large candidate must be preserved byte for byte"
+    );
+
+    // Canonical content is restored in the working tree, whole.
+    session.guests[0].wait_for_bytes("assets/poster.psd", &host_version, LONG);
+
+    // Resolving with the local candidate sends those bytes back up the blob
+    // plane and makes them canonical for everybody.
+    let id = conflict["conflict"]["id"].as_str().unwrap().to_string();
+    session.guests[0].expect(&["conflict", "resolve", &id, "--use", "local"]);
+    session
+        .host
+        .wait_for_bytes("assets/poster.psd", &guest_version, LONG);
+    session.guests[0].wait_for_bytes("assets/poster.psd", &guest_version, LONG);
+    assert_eq!(session.host.json(&["conflict", "list"])["open_count"], 0);
+
+    wait_for_agreement(&session, LONG);
+    session.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 7. Publication: the Git pack travels on the blob plane too
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_publication_containing_a_large_file_reaches_participants() {
+    let mut session = start_session("blob-publish", 1);
+
+    let bytes = blob_bytes(51, LARGE);
+    write_bytes(&session.guests[0].repo, "assets/handout.pdf", &bytes);
+    session
+        .host
+        .wait_for_bytes("assets/handout.pdf", &bytes, LONG);
+    wait_for_agreement(&session, LONG);
+
+    let prepare = session.guests[0].json(&["commit", "prepare"]);
+    let prepare_id = prepare["prepare_id"].as_str().unwrap().to_string();
+    let publication = session.guests[0].json(&[
+        "commit",
+        "create",
+        &prepare_id,
+        "--message",
+        "assets: add the handout",
+    ]);
+    let commit_oid = publication["descriptor"]["commit_oid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_eq!(git(&session.host.repo, &["rev-parse", "HEAD"]), commit_oid);
+
+    // The participant installs the exact objects the host produced, delivered
+    // as a pack on the blob plane rather than inlined in the publication.
+    session.guests[0].wait_for_git(&["rev-parse", "HEAD"], &commit_oid, LONG);
+    let listed = git(
+        &session.guests[0].repo,
+        &["cat-file", "-s", &format!("{commit_oid}^{{tree}}")],
+    );
+    assert!(!listed.is_empty(), "the tree object must be installed");
+    assert_eq!(
+        std::fs::read(session.guests[0].repo.join("assets/handout.pdf")).unwrap(),
+        bytes
+    );
+
+    session.stop();
+}

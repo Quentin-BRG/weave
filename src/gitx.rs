@@ -728,7 +728,12 @@ pub fn read_tree_into_index(root: &Path, tree: &str) -> Result<()> {
 }
 
 /// Pack the objects reachable from `commit` but not from `parent`.
-pub fn pack_objects(root: &Path, commit: &str, parent: Option<&str>) -> Result<Vec<u8>> {
+/// Write the pack introduced by `commit` straight to `dest`.
+///
+/// The pack goes to a file rather than to a `Vec`, because a pack containing a
+/// large blob has exactly the problem the blob plane exists to remove, and this
+/// runs on the critical path of `weave commit create`.
+pub fn pack_objects_to(root: &Path, commit: &str, parent: Option<&str>, dest: &Path) -> Result<()> {
     let mut revs = String::new();
     revs.push_str(commit);
     revs.push('\n');
@@ -737,29 +742,59 @@ pub fn pack_objects(root: &Path, commit: &str, parent: Option<&str>) -> Result<V
         revs.push_str(p);
         revs.push('\n');
     }
-    let out = run_stdin(
-        root,
-        &[
-            "pack-objects",
-            "--revs",
-            "--stdout",
-            "--delta-base-offset",
-            "-q",
-        ],
-        revs.as_bytes(),
-    )?;
-    if !out.ok() {
-        return Err(git_err("Could not pack Git objects for distribution").with_detail(out.stderr));
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir)?;
     }
-    Ok(out.stdout)
+    let file = std::fs::File::create(dest)?;
+
+    let mut cmd = base_command(root);
+    cmd.args([
+        "pack-objects",
+        "--revs",
+        "--stdout",
+        "--delta-base-offset",
+        "-q",
+    ]);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::from(file));
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| git_err(format!("Could not run git: {e}")))?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| git_err("Could not write to git stdin"))?;
+        stdin.write_all(revs.as_bytes())?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| git_err(format!("git failed: {e}")))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(dest);
+        return Err(git_err("Could not pack Git objects for distribution")
+            .with_detail(String::from_utf8_lossy(&out.stderr).trim().to_string()));
+    }
+    Ok(())
 }
 
 /// Install exact host-produced Git objects (specification sections 131, 192).
-pub fn unpack_objects(root: &Path, pack: &[u8]) -> Result<()> {
-    let out = run_stdin(root, &["unpack-objects", "-q"], pack)?;
-    if !out.ok() {
+///
+/// Reads the pack from disk: it arrived over the blob plane as a file and there
+/// is no reason to lift it into memory to hand it back to a child process.
+pub fn unpack_objects(root: &Path, pack: &Path) -> Result<()> {
+    let file = std::fs::File::open(pack)?;
+    let mut cmd = base_command(root);
+    cmd.args(["unpack-objects", "-q"]);
+    cmd.stdin(Stdio::from(file));
+    let out = cmd
+        .output()
+        .map_err(|e| git_err(format!("Could not run git: {e}")))?;
+    if !out.status.success() {
         return Err(
-            git_err("Could not install the Git objects sent by the host").with_detail(out.stderr),
+            git_err("Could not install the Git objects sent by the host")
+                .with_detail(String::from_utf8_lossy(&out.stderr).trim().to_string()),
         );
     }
     Ok(())

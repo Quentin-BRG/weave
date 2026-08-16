@@ -420,16 +420,14 @@ fn no_repository_content_appears_in_the_websocket_frames() {
 
 /// The scan above is only meaningful if it would catch plaintext. This feeds it
 /// exactly what a build without the encryption layer would have written to the
-/// socket: the same `ClientEnvelope`, serialized by the same code, as a
-/// WebSocket text frame.
+/// socket, on both planes: the same `ClientEnvelope` for the path, and the same
+/// blob-plane chunk frame for the content.
 #[test]
 fn the_wire_scan_detects_plaintext_when_it_is_there() {
-    use base64::Engine as _;
     use weave::model::{FileEntry, FileOperation, GitMode};
     use weave::path::RepoPath;
     use weave::proto::{ClientEnvelope, ClientMessage};
 
-    let content = base64::engine::general_purpose::STANDARD.encode(SECRET_CONTENT);
     let envelope = ClientEnvelope::wrap(ClientMessage::SubmitOperation {
         operation: Box::new(FileOperation {
             operation_id: uuid::Uuid::new_v4(),
@@ -443,7 +441,6 @@ fn the_wire_scan_detects_plaintext_when_it_is_there() {
                 SECRET_CONTENT.as_bytes(),
                 GitMode::Regular,
             )),
-            content_b64: Some(content.clone()),
         }),
     });
     let plaintext = serde_json::to_vec(&envelope).unwrap();
@@ -454,12 +451,19 @@ fn the_wire_scan_detects_plaintext_when_it_is_there() {
         contains(&plaintext, SECRET_PATH.as_bytes()),
         "the scan must find a path that really is present"
     );
+
+    // Content travels on the data plane now, as raw bytes rather than base64,
+    // which is if anything easier to spot. The scan must catch that too, or the
+    // assertion above would be checking the wrong plane.
+    let chunk = weave::blobwire::chunk_frame(7, SECRET_CONTENT.as_bytes());
     assert!(
-        contains(&plaintext, content.as_bytes()),
-        "the scan must find the encoded content that really is present"
+        contains(&chunk, SECRET_CONTENT.as_bytes()),
+        "the scan must find content that really is present on the data plane"
     );
+
     // And it does not raise a false alarm on an unrelated value.
     assert!(!contains(&plaintext, b"NOT_IN_THIS_MESSAGE_c0ffee"));
+    assert!(!contains(&chunk, b"NOT_IN_THIS_MESSAGE_c0ffee"));
 }
 
 // ---------------------------------------------------------------------------
