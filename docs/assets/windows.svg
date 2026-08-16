@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="Windows">
+  <title>Windows</title>
+  <!-- Windows logo: Commons "Windows logo - 2021.svg", public domain. Windows is a trademark of Microsoft Corporation. -->
+  <defs>
+    <linearGradient id="weave-tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FDFEFF"/>
+      <stop offset="1" stop-color="#EDF1F7"/>
+    </linearGradient>
+  </defs>
+  <rect x="1.5" y="1.5" width="93" height="93" rx="22" fill="url(#weave-tile)" stroke="#C9D2E0" stroke-width="1.5"/>
+  <svg x="25" y="25" width="46" height="46" viewBox="0 0 4875 4875"><path fill="#0078d4" d="M0 0h2311v2310H0zm2564 0h2311v2310H2564zM0 2564h2311v2311H0zm2564 0h2311v2311H2564"/></svg>
+</svg>

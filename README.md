@@ -25,21 +25,56 @@ into ordinary Git commits when the team decides to publish.
 - **CLI only.** One `weave` binary, Windows / macOS / Linux.
 - **One authoritative host.** No P2P, no CRDT, no leader election.
 - **No lost edits.** Weave never overwrites local bytes it has not already captured
-durably.
+  durably.
 - **Explicit conflicts.** Independent edits merge; overlapping edits become a Weave
-conflict with every candidate preserved. The working tree never receives generated
-Git conflict markers.
+  conflict with every candidate preserved. The working tree never receives generated
+  Git conflict markers.
 - **Ordinary Git, always.** Remove Weave and the repository is still a normal,
-fully usable Git repository.
+  fully usable Git repository.
 
 ---
 
-
-
 ## Install
 
+<table>
+<tr>
+<td align="center" width="33%">
+<img src="docs/assets/windows.svg" width="72" height="72" alt=""><br>
+<b>Windows</b><br><br>
+<a href="https://github.com/Quentin-BRG/weave/releases/latest/download/WeaveSetup-x64.exe"><img src="docs/assets/download-windows.svg" width="220" alt="Download Weave for Windows"></a><br>
+<sub>Windows 10 / 11 · x64 · <code>.exe</code></sub>
+</td>
+<td align="center" width="33%">
+<img src="docs/assets/macos.svg" width="72" height="72" alt=""><br>
+<b>macOS</b><br><br>
+<a href="https://github.com/Quentin-BRG/weave/releases/latest/download/Weave-macos-universal.pkg"><img src="docs/assets/download-macos.svg" width="220" alt="Download Weave for macOS"></a><br>
+<sub>Universal · Apple silicon &amp; Intel · <code>.pkg</code></sub>
+</td>
+<td align="center" width="33%">
+<img src="docs/assets/linux.svg" width="72" height="72" alt=""><br>
+<b>Linux</b><br><br>
+<a href="https://github.com/Quentin-BRG/weave/releases/latest/download/weave-linux-x64.deb"><img src="docs/assets/download-linux.svg" width="220" alt="Download Weave for Linux"></a><br>
+<sub>Debian / Ubuntu · x64 · <code>.deb</code></sub>
+</td>
+</tr>
+</table>
+
+### After installation
+
+```bash
+weave doctor
+```
+
+`weave doctor` verifies the installation and the repository environment: the `weave`
+binary, the **git** executable on PATH, and whether the current repository can host
+or join a session. (`cloudflared` is needed only for remote sessions.)
+
+<sub>Other architectures and previous versions → <a href="https://github.com/Quentin-BRG/weave/releases">Releases</a></sub>
+
+<details>
+<summary><b>Build from source</b></summary>
+
 Weave needs a recent **Rust stable** toolchain and the **git** executable on PATH.
-`cloudflared` is needed only for remote sessions.
 
 ```bash
 cargo install --path .
@@ -52,19 +87,11 @@ cargo build --release
 # target/release/weave
 ```
 
-Check the machine and the repository:
-
-```bash
-weave doctor
-```
+</details>
 
 ---
 
-
-
 ## Quick start
-
-
 
 ### Host a session
 
@@ -88,8 +115,6 @@ weave host --lan     # local network, no Cloudflare process
 weave host --local   # this machine only, no remote endpoint
 ```
 
-
-
 ### Join a session
 
 You must already have a checkout of the same repository, clean, on the same branch,
@@ -108,8 +133,6 @@ weave join --invite-file invite.txt
 weave join --invite-stdin < invite.txt
 ```
 
-
-
 ### Work
 
 Just edit files. Codex, Claude Code, VS Code, `sed`, a formatter — Weave does not
@@ -119,8 +142,6 @@ care which process wrote the file.
 weave status
 weave peers
 ```
-
-
 
 ### Describe intent
 
@@ -142,8 +163,6 @@ weave conflict show C-8F21     # writes every candidate to .git/weave/conflicts/
 weave conflict resolve C-8F21
 ```
 
-
-
 ### Publish to Git
 
 ```bash
@@ -157,8 +176,6 @@ short barrier so nothing in flight is missed. Live editing continues afterwards;
 prepared commit still represents the revision it was bound to.
 
 ---
-
-
 
 ## The rule that matters most
 
@@ -174,8 +191,6 @@ Read-only Git stays available and useful: `git status`, `git diff`, `git log`,
 `git show`.
 
 ---
-
-
 
 ## Agents
 
@@ -206,15 +221,12 @@ It never overwrites unrelated instructions.
 
 ---
 
-
-
 ## Command reference
 
-
 | Command                                             | Purpose                                                   |
-| --------------------------------------------------- | --------------------------------------------------------- |
-| `weave host [--lan|--local]`                        | Host a session (long-lived daemon)                        |
-| `weave join [--invite-file|--invite-stdin]`         | Join a session (long-lived daemon)                        |
+| --------------------------------------------------- | --------------------------------------------------------- | ---------------------------------- | ------------------------- | ---------------------------------- | ------- | -------------------- |
+| `weave host [--lan                                  | --local]`                                                 | Host a session (long-lived daemon) |
+| `weave join [--invite-file                          | --invite-stdin]`                                          | Join a session (long-lived daemon) |
 | `weave resume`                                      | Resume this repository's session after a crash or restart |
 | `weave leave`                                       | Leave the session and forget its local record             |
 | `weave stop`                                        | Stop the daemon, keeping the session record               |
@@ -222,23 +234,20 @@ It never overwrites unrelated instructions.
 | `weave peers [--json]`                              | Participants and presence                                 |
 | `weave invite [--json]`                             | Reprint the invite (host)                                 |
 | `weave rescan [--json]`                             | Force a full repository rescan                            |
-| `weave task start|list|show|update|complete|cancel` | Tasks and soft locks                                      |
-| `weave conflict list|show|resolve|dismiss`          | Conflict inspection and resolution                        |
+| `weave task start                                   | list                                                      | show                               | update                    | complete                           | cancel` | Tasks and soft locks |
+| `weave conflict list                                | show                                                      | resolve                            | dismiss`                  | Conflict inspection and resolution |
 | `weave commit prepare` / `weave commit create <id>` | Git publication                                           |
 | `weave push`                                        | Ask the host to push                                      |
 | `weave tunnel restart`                              | Replace a dead Quick Tunnel, same session                 |
 | `weave agent bootstrap`                             | Manage the `AGENTS.md` block                              |
 | `weave doctor`                                      | Readiness checklist                                       |
 | `weave recover [--rebuild] [--export DIR]`          | Integrity diagnostics and safe recovery                   |
-| `weave config list|get|set`                         | Local Weave configuration                                 |
-
+| `weave config list                                  | get                                                       | set`                               | Local Weave configuration |
 
 Every command an agent drives supports `--json`: stable field names, no prompts,
 machine-readable result on stdout, diagnostics on stderr, meaningful exit codes.
 
 ---
-
-
 
 ## What Weave refuses
 
@@ -249,8 +258,6 @@ and Linux participants can hold the same working tree, and it refuses files abov
 10 MiB. `weave doctor` reports all of it up front.
 
 ---
-
-
 
 ## Tests
 
@@ -271,8 +278,6 @@ so it is opt-in:
 cargo test --test remote_tunnel -- --ignored --test-threads=1 --nocapture
 ```
 
-
-
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the pieces fit together
@@ -282,8 +287,6 @@ cargo test --test remote_tunnel -- --ignored --test-threads=1 --nocapture
 - [docs/SPEC-COVERAGE.md](docs/SPEC-COVERAGE.md) — where each specification section lives
 
 ---
-
-
 
 ## Security in one paragraph
 
@@ -296,16 +299,12 @@ Weave with anything sensitive.
 
 ---
 
-
-
 ## Acknowledgements
 
 Weave was co-designed and co-developed with the assistance of
 GPT-5.6 Sol by OpenAI and Claude Opus 5 by Anthropic.
 
 ---
-
-
 
 ## License
 
