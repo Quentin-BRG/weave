@@ -18,11 +18,16 @@
 //! connects only through the generated `wss://<name>.trycloudflare.com` URL —
 //! the test asserts that, so a regression that quietly falls back to loopback
 //! or LAN fails here rather than passing silently.
+//!
+//! Everything here runs inside the Noise session that Weave establishes through
+//! the tunnel, so this is also the proof that end-to-end encryption survives a
+//! real intermediary that terminates TLS.
 
 mod common;
 
 use common::*;
 use std::time::Duration;
+use weave::session::{decode_invite, encode_invite, InvitePayload};
 
 /// Quick Tunnel startup, DNS propagation and the first WebSocket upgrade are
 /// all slower than anything on loopback.
@@ -54,6 +59,10 @@ fn assert_public_endpoint(endpoint: &str) {
     assert!(
         !endpoint.contains("127.0.0.1") && !endpoint.contains("localhost"),
         "the remote endpoint must not be local: {endpoint}"
+    );
+    assert!(
+        endpoint.ends_with(weave::transport::WS_PATH),
+        "the endpoint must address the encrypted protocol route: {endpoint}"
     );
 }
 
@@ -128,6 +137,63 @@ fn a_full_session_runs_over_a_real_cloudflare_quick_tunnel() {
         v["live_revision"].as_u64() == Some(revision) && v["outbox_pending"] == 0
     });
     assert_eq!(host_status["state"], guest_status["state"]);
+
+    // ---- 3b. a wrong session secret cannot get in over the same tunnel ----
+    //
+    // Same public URL, same live session, one wrong 256-bit secret. Cloudflare
+    // carries the connection exactly as it carries the genuine one; the Noise
+    // handshake is what refuses it, at the far end.
+    {
+        let mut impostor = Participant::new(&sandbox, "gamma");
+        let out = std::process::Command::new("git")
+            .args(["clone", "-q", "-c", "core.autocrlf=false"])
+            .arg(&host.repo)
+            .arg(&impostor.repo)
+            .output()
+            .expect("git clone");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        git(&impostor.repo, &["config", "user.name", "Mallory"]);
+        git(&impostor.repo, &["config", "user.email", "m@example.com"]);
+
+        let genuine = decode_invite(invite["invite"].as_str().unwrap()).unwrap();
+        let forged = encode_invite(&InvitePayload {
+            secret: "f".repeat(64),
+            ..genuine
+        })
+        .unwrap();
+        let forged_path = sandbox.root.join("forged-invite.txt");
+        std::fs::write(&forged_path, &forged).unwrap();
+
+        impostor.start_daemon(&["join", "--invite-file", forged_path.to_str().unwrap()]);
+        std::thread::sleep(Duration::from_secs(25));
+
+        let status = impostor.status();
+        assert_ne!(
+            status["connection"].as_str(),
+            Some("online"),
+            "a wrong secret must not establish a session through the tunnel: {status}"
+        );
+        assert_eq!(
+            status["live_revision"].as_u64().unwrap_or(0),
+            0,
+            "no canonical state may be disclosed to an unauthenticated peer: {status}"
+        );
+        // Live session content that no clone of the base commit can contain.
+        assert!(
+            !file_exists(&impostor.repo, "slides/02-guest.md"),
+            "an unauthenticated peer received live session content"
+        );
+        assert!(!file_exists(&impostor.repo, "assets.bin"));
+        eprintln!("wrong secret refused through the live tunnel");
+        impostor.stop_daemon();
+    }
+
+    // The genuine participant was unaffected by the failed attempts.
+    guest.assert_daemon_healthy();
 
     // ---- 4. Tasks and overlap reporting across the tunnel ----
     guest.expect(&[

@@ -49,7 +49,7 @@ numbers are the specification's.
 | 51 | File limits | `src/model.rs`, `src/scan.rs::read_path` |
 | 52–54 | Transport, serialization, protocol version | `src/proto.rs`, `src/daemon.rs` |
 | 55–57 | Session identity, invites, secure entry | `src/session.rs`, `src/cli.rs::read_invite` |
-| 58 | Remote authentication | `src/daemon.rs::ws_handler`, `src/transport.rs::secret_matches` |
+| 58 | Remote authentication and end-to-end encryption | `src/secure.rs` (Noise handshake, PSK derivation, framing), `src/daemon.rs::host_handshake`, `src/daemon.rs::connect_once` |
 | 59–61 | Quick Tunnel, dependency, existing config | `src/tunnel.rs` |
 | 62 | Tunnel lifecycle | `src/daemon.rs::restart_tunnel` |
 | 63 | LAN mode | `src/daemon.rs::host_async` |
@@ -135,6 +135,25 @@ the raw Git prohibition (§165) and the host-only publication rule (§169).
 Nothing plugin-specific remains here. When a CLI command, flag or `--json` field
 changes, the skills in that repository may need the same change.
 
+## The encrypted transport
+
+`src/secure.rs` carries unit tests for the handshake and the framing in isolation:
+matching secrets round-trip, a wrong secret and a secret for another session both
+fail, tampered ciphertext and truncated or malformed frames are rejected, traffic
+from one connection is invalid on a fresh one, frames cannot be replayed or
+reordered, oversized messages chunk and reassemble while a dropped chunk fails
+rather than truncating, and PSK derivation is deterministic and domain-separated.
+
+`tests/encrypted_transport.rs` checks the same claims against the actual bytes on a
+socket. It runs a recording proxy between two real daemons and asserts that no
+repository sentinel — file content, file path, Task description, commit message —
+appears anywhere in the captured frames; that a participant with the wrong secret
+receives no state and cannot mutate anything; that a single flipped bit in one frame
+is rejected and the session recovers; and that every reconnect performs a fresh
+handshake. One test exists to keep the others honest: it serializes the exact
+message the socket carried before this change and asserts the scan finds it, so the
+no-plaintext assertion cannot pass vacuously.
+
 ## The real remote path
 
 `tests/multi_participant.rs` exercises the protocol over a real WebSocket, but on
@@ -146,6 +165,8 @@ loopback. `tests/remote_tunnel.rs` covers what only the public path can:
 | §53 base64 file content, including binary, across the wire | 40 KiB binary asset |
 | §56–57 invite reaches and authenticates a remote participant | join from the invite alone |
 | §58 TLS transport; `wss://…trycloudflare.com`, never loopback | `assert_public_endpoint` |
+| §58 the Noise session survives a real TLS-terminating intermediary | every assertion in the test runs inside it |
+| §58 a wrong session secret is refused through the live tunnel | step 3b: forged invite, same URL, no state and no online connection |
 | §59–60 Quick Tunnel launch and `cloudflared` dependency | `weave host` with no flags |
 | §62 tunnel identity is not session identity | `weave tunnel restart` keeps `session_id`, canonical state and conflicts, and yields a new URL and invite |
 | §131–132 Git pack distribution over the public path | tree OID equality on both machines |

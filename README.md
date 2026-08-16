@@ -104,7 +104,7 @@ weave host
 Weave prints an invite:
 
 ```
-weave1_eyJ2IjoxLCJ1Ijoi...
+weave2_eyJ2IjoyLCJ1Ijoi...
 ```
 
 Share it over a channel you trust — **the invite grants full read/write access to
@@ -114,6 +114,9 @@ the session.** Other options:
 weave host --lan     # local network, no Cloudflare process
 weave host --local   # this machine only, no remote endpoint
 ```
+
+`--lan` changes where the socket lives, not how it is protected: LAN participants
+run the same encrypted handshake as remote ones.
 
 ### Join a session
 
@@ -292,10 +295,15 @@ cargo test --test remote_tunnel -- --ignored --test-threads=1 --nocapture
 
 Possession of the session secret grants full collaborative read/write authority over
 the repository for the duration of the session. There are no user accounts, no
-fine-grained authorization and no per-file permissions. Remote transport is
-Cloudflare's HTTPS/WebSocket tunnel; Weave does not add application-level end-to-end
-encryption on top of it. Read [docs/SECURITY.md](docs/SECURITY.md) before using
-Weave with anything sensitive.
+fine-grained authorization and no per-file permissions. The session itself is
+encrypted end to end between the host and each participant with a standard Noise
+handshake (`Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`) keyed by a value derived from
+the session secret, so the Cloudflare tunnel that carries remote traffic — which
+still runs over `wss://` with full certificate verification — sees connection
+metadata and ciphertext, never repository content. That protects the channel, not
+the collaborators from each other: every participant sees plaintext by design, and
+so does anyone who obtains the invite. Read [docs/SECURITY.md](docs/SECURITY.md)
+before using Weave with anything sensitive.
 
 ---
 

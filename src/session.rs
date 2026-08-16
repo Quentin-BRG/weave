@@ -339,7 +339,9 @@ pub struct InvitePayload {
     pub repo_name: String,
 }
 
-pub const INVITE_PREFIX: &str = "weave1_";
+pub const INVITE_PREFIX: &str = "weave2_";
+/// Invites minted before the protocol carried end-to-end encryption.
+const LEGACY_INVITE_PREFIX: &str = "weave1_";
 
 pub fn encode_invite(payload: &InvitePayload) -> Result<String> {
     let json = serde_json::to_vec(payload)?;
@@ -348,9 +350,22 @@ pub fn encode_invite(payload: &InvitePayload) -> Result<String> {
 
 pub fn decode_invite(text: &str) -> Result<InvitePayload> {
     let trimmed = text.trim();
+    // Named explicitly rather than swept into "malformed": a `weave1_` invite is
+    // a well-formed invite for a protocol that had no application-level
+    // encryption, and refusing it is the whole point.
+    if trimmed.starts_with(LEGACY_INVITE_PREFIX) {
+        return Err(crate::error::protocol(
+            "This invite is from Weave 1, which did not encrypt the application protocol.",
+        )
+        .with_detail(
+            "Weave 2 sessions are end-to-end encrypted and cannot accept a Weave 1 invite. \
+             Ask the host to upgrade Weave and start a new session, then join with the new \
+             invite.",
+        ));
+    }
     let body = trimmed.strip_prefix(INVITE_PREFIX).ok_or_else(|| {
         usage("That does not look like a Weave invite.")
-            .with_detail("A Weave invite starts with `weave1_`. Ask the host to resend it.")
+            .with_detail("A Weave invite starts with `weave2_`. Ask the host to resend it.")
     })?;
     let bytes = B64_URL_NOPAD
         .decode(body.as_bytes())
@@ -385,8 +400,8 @@ mod tests {
     #[test]
     fn invite_round_trips() {
         let payload = InvitePayload {
-            protocol_version: 1,
-            url: "wss://example.trycloudflare.com/weave".into(),
+            protocol_version: crate::model::PROTOCOL_VERSION,
+            url: "wss://example.trycloudflare.com/weave/v2".into(),
             session_id: Uuid::new_v4(),
             secret: new_session_secret(),
             base_commit: "8f21abc".into(),
@@ -404,6 +419,15 @@ mod tests {
     #[test]
     fn rejects_garbage_invite() {
         assert!(decode_invite("not-an-invite").is_err());
-        assert!(decode_invite("weave1_%%%%").is_err());
+        assert!(decode_invite("weave2_%%%%").is_err());
+    }
+
+    #[test]
+    fn refuses_an_unencrypted_weave_1_invite_by_name() {
+        let err = decode_invite("weave1_eyJ2IjoxfQ").unwrap_err();
+        assert_eq!(err.class, crate::error::ErrorClass::ProtocolError);
+        assert!(err.message.contains("Weave 1"));
+        // No silent downgrade: the payload is never even parsed.
+        assert!(err.detail.unwrap().contains("end-to-end encrypted"));
     }
 }

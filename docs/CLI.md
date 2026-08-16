@@ -53,6 +53,10 @@ creation.
 - `--lan`: binds all interfaces, no Cloudflare process
 - `--local`: no remote endpoint at all
 
+All three protect the session identically: participants authenticate and encrypt
+with the same Noise handshake whether they arrive over `wss://` or over a plain LAN
+`ws://`.
+
 Prints the invite. Runs until Ctrl-C or `weave stop`.
 
 ### `weave join [--invite-file <PATH>] [--invite-stdin]`

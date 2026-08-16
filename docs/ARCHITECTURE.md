@@ -18,7 +18,8 @@ Inside the daemon:
   tokio ────┤  WebSocket server (host)   local IPC server            │
   runtime   │  WebSocket client (guest)  cloudflared child           │
             │            │        ▲            │                     │
-            │        JSON frames  │        JSON requests             │
+            │      Noise transport  │      JSON requests             │
+            │       (JSON inside)   │                                │
             │            ▼        │            ▼                     │
             │  ┌──────────────────┴──┐   ┌──────────────────┐        │
             │  │   HostEngine        │   │   ClientEngine   │        │
@@ -40,7 +41,10 @@ and timers.
 
 The host runs a `ClientEngine` too. Its edits reach the coordinator through an
 in-process loopback pair carrying the **identical JSON frames** a remote participant
-would send (§5), so the host's path is never a special case.
+would send (§5), so the host's path is never a special case. That pair is a pair of
+channels between two threads of one process — no socket, no network — so it is
+deliberately not encrypted; the encryption boundary is the network, and everything
+that crosses it goes through Noise.
 
 ## 2. Module map
 
@@ -59,7 +63,8 @@ would send (§5), so the host's path is never a special case.
 | `watch` | `notify` watcher plus debouncing (§31–33) |
 | `reconcile` | The three-way reconciliation matrix (§71–81) |
 | `proto` | Wire messages, envelopes, replica state hash |
-| `transport` | Bounded outbound queues, backpressure, secret comparison |
+| `secure` | Noise handshake, PSK derivation, encrypted framing (`snow`) |
+| `transport` | Bounded outbound queues, backpressure, route and frame limits |
 | `host` | The coordinator state machine |
 | `client` (+ `client_ipc`) | The replica state machine and CLI command handling |
 | `ipc` | Loopback control endpoint and its blocking client |
@@ -224,7 +229,28 @@ host memory without limit. It recovers through ordinary reconnection
 synchronization (§65, §197). Files above 10 MiB are refused; text above 1 MiB is
 treated as binary for merge purposes (§51).
 
-## 10. TLS
+## 10. The encrypted channel
+
+Every network connection between two Weave processes is a Noise session. The
+handshake runs immediately after the WebSocket upgrade and before a single byte of
+application state; only when it completes does the host register the connection with
+its engine. `src/secure.rs` is the whole of it, and it is deliberately small: it
+configures `snow` with the pattern, the derived PSK and the prologue, and adds
+chunking on top of the transport state. The state machine, key schedule, AEAD and
+nonces belong to the library. [docs/PROTOCOL.md](PROTOCOL.md) has the parameters and
+[docs/SECURITY.md](SECURITY.md) has the properties.
+
+Two consequences shape the surrounding code. First, one `TransportState` is shared
+by the reader and writer tasks of a connection, behind a mutex, because Noise nonces
+are per-direction counters that must advance in order — a poisoned mutex is treated
+as fatal for that connection rather than something to continue past. Second, a
+connection is the unit of key material: a reconnect, a supervised restart or a
+`weave tunnel restart` performs a complete fresh handshake with new ephemeral keys,
+and nothing — nonce state, partially reassembled messages — carries over. That costs
+nothing, because the durable outbox and idempotent `operation_id`s already made
+reconnection free.
+
+## 11. TLS
 
 Remote participants connect over `wss://`, so the process needs a `rustls`
 crypto provider. `rustls` 0.23 refuses to choose one implicitly, and a missing
@@ -235,10 +261,15 @@ installs it explicitly, once, before the first connect. The connection task is
 also supervised: if it ever ends abnormally it is restarted, because a durable
 outbox plus idempotent operations make a restart free.
 
+TLS stays even though the payload is already encrypted. The two protect different
+things — TLS authenticates the tunnel endpoint and hides the Noise session from the
+network path to Cloudflare, Noise protects the payload from Cloudflare itself — and
+dropping one because the other exists would be a downgrade.
+
 Both behaviours are covered by `tests/remote_tunnel.rs`, which is the only test
 that leaves the machine.
 
-## 11. Deliberate non-goals
+## 12. Deliberate non-goals
 
 No P2P, no CRDT, no MCP server, no agent orchestration, no host migration or leader
 election, no automatic reconciliation with external Git history, no first-class

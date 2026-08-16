@@ -26,6 +26,9 @@ A feature that weakens one of these to support a broader use case is outside V1.
 - `src/reconcile.rs` — the three-way reconciliation matrix.
 - `src/store_host.rs`, `src/store_client.rs` — durable state.
 - `src/gitx.rs` — every call into the `git` executable.
+- `src/secure.rs` — the Noise handshake and the encrypted framing. Configuration
+  around `snow`, not cryptography of our own: do not hand-roll primitives, do not
+  reimplement the state machine, and do not add a plaintext fallback path.
 - The agent skills are **not** in this repository. They live in
   [Quentin-BRG/weave-plugin](https://github.com/Quentin-BRG/weave-plugin), as a
   portable Agent Plugins package with a Codex compatibility layer. If you change
@@ -47,6 +50,10 @@ cargo test -- --test-threads=1
 
 The end-to-end tests spawn real daemons and bind loopback sockets, so they must run
 one at a time.
+
+`tests/encrypted_transport.rs` reads the real bytes on the socket through a
+recording proxy. If you touch the handshake or the framing, that is the test that
+tells you whether the wire is still opaque.
 
 `tests/remote_tunnel.rs` is the only test that leaves the machine. It is
 `#[ignore]`d so ordinary runs never depend on `cloudflared`, on Cloudflare, or on

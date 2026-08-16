@@ -8,6 +8,9 @@
 //! authentication), 64 (host connection model), 65-66 (backpressure and
 //! message limits), 67 (heartbeats).
 //!
+//! Every remote frame travels inside a Noise session; see [`crate::secure`].
+//! This module owns the queueing and the limits, not the cryptography.
+//!
 //! The host's own participation uses an in-process loopback pair carrying the
 //! identical JSON frames, so the host's edits travel the same logical path as
 //! everyone else's (specification section 5).
@@ -101,8 +104,11 @@ pub fn default_outbound() -> (Outbound, mpsc::Receiver<String>, Arc<AtomicUsize>
     Outbound::new(MAX_QUEUED_MESSAGES)
 }
 
-/// Constant-time secret comparison so that a remote attacker cannot learn the
-/// session secret from response timing.
+/// Constant-time token comparison for the loopback IPC token.
+///
+/// The session secret is never compared this way and never crosses the network:
+/// remote peers prove possession by completing the Noise handshake in
+/// [`crate::secure`].
 pub fn secret_matches(expected: &str, provided: &str) -> bool {
     let a = expected.as_bytes();
     let b = provided.as_bytes();
@@ -116,13 +122,18 @@ pub fn secret_matches(expected: &str, provided: &str) -> bool {
     diff == 0
 }
 
-/// Extract a bearer token from an `Authorization` header value.
-pub fn bearer(value: &str) -> Option<&str> {
-    let rest = value
-        .strip_prefix("Bearer ")
-        .or_else(|| value.strip_prefix("bearer "))?;
-    Some(rest.trim())
-}
+/// WebSocket route.
+///
+/// The `/v2` suffix is the visible half of the protocol break that introduced
+/// end-to-end encryption: a Weave 1.x peer asks for `/weave` and gets a 404
+/// rather than an unencrypted session, and a Weave 2 peer pointed at a 1.x host
+/// gets the same clear failure instead of a silent downgrade.
+pub const WS_PATH: &str = "/weave/v2";
 
-pub const WS_PATH: &str = "/weave";
-pub const MAX_FRAME: usize = MAX_PROTOCOL_MESSAGE;
+/// Largest WebSocket frame accepted. One Noise message per frame, so this is
+/// far below the application message limit; large application messages are
+/// split across frames by [`crate::secure::SecureChannel`].
+pub const MAX_FRAME: usize = crate::secure::MAX_WS_FRAME;
+
+/// Largest application message, after reassembly (specification section 66).
+pub const MAX_MESSAGE: usize = MAX_PROTOCOL_MESSAGE;

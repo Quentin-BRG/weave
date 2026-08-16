@@ -26,7 +26,11 @@ pub const MAX_PROTOCOL_MESSAGE: usize = 48 * 1024 * 1024;
 pub const MAX_QUEUED_MESSAGES: usize = 256;
 pub const MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
 /// Wire protocol version (specification section 54).
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Version 2 carries every remote frame inside a Noise session. There is no
+/// compatibility mode: a version 1 peer cannot take part in a version 2
+/// session, by design.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // File entries (specification sections 17-19)

@@ -16,6 +16,9 @@ use crate::host::{HostEngine, HostHandle, HostInput};
 use crate::ipc::{IpcCommand, IpcRequest, IpcResponse};
 use crate::model::*;
 use crate::proto::{ClientEnvelope, HostEnvelope, SessionInfo};
+use crate::secure::{
+    Initiator, Responder, SecureChannel, HANDSHAKE_TIMEOUT, MAX_PENDING_HANDSHAKES,
+};
 use crate::session::*;
 use crate::store_client::ClientStore;
 use crate::store_host::HostStore;
@@ -23,17 +26,35 @@ use crate::transport::{default_outbound, secret_matches, MAX_FRAME, WS_PATH};
 use crate::watch;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use uuid::Uuid;
+use zeroize::Zeroizing;
+
+/// The session secret in the only form that ever leaves this module: a derived
+/// Noise pre-shared key. Cloned by reference so the key material exists once.
+#[derive(Clone)]
+struct PeerKey {
+    psk: Arc<Zeroizing<[u8; 32]>>,
+    session_id: Uuid,
+}
+
+impl PeerKey {
+    fn derive(secret: &str, session_id: Uuid) -> PeerKey {
+        PeerKey {
+            psk: Arc::new(crate::secure::derive_psk(secret, session_id)),
+            session_id,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct HostOptions {
@@ -245,10 +266,10 @@ async fn host_async(
         .port();
 
     let ws_state = WsState {
-        secret: Arc::new(secret.clone()),
-        session_id: session.session_id,
+        key: PeerKey::derive(&secret, session.session_id),
         host: host.clone(),
         next_conn: Arc::new(AtomicU64::new(1)),
+        handshakes: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
     };
     let app = Router::new()
         .route(WS_PATH, get(ws_handler))
@@ -490,7 +511,9 @@ async fn participant_async(
     start_ipc(control.clone(), Role::Participant, session.session_id).await?;
     start_watcher(&paths, client.clone())?;
 
-    let connection = tokio::spawn(supervise_connection(url, secret, client.clone()));
+    let key = PeerKey::derive(&secret, session.session_id);
+    drop(secret);
+    let connection = tokio::spawn(supervise_connection(url, key, client.clone()));
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => println!("\nLeaving the Weave session."),
@@ -562,86 +585,86 @@ pub fn run_resume(start_dir: &Path) -> Result<()> {
 
 #[derive(Clone)]
 struct WsState {
-    secret: Arc<String>,
-    session_id: Uuid,
+    key: PeerKey,
     host: HostHandle,
     next_conn: Arc<AtomicU64>,
+    /// Bounds how many unauthenticated peers can sit mid-handshake at once, so
+    /// an anonymous caller cannot turn the public endpoint into an unbounded
+    /// memory and task sink.
+    handshakes: Arc<Semaphore>,
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<WsState>,
-    headers: HeaderMap,
-) -> Response {
-    // The public hostname is not authentication (specification section 58).
-    let provided = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(crate::transport::bearer)
-        .unwrap_or("");
-    if !secret_matches(&state.secret, provided) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-    }
-    let _ = state.session_id;
+/// The upgrade itself carries no authentication.
+///
+/// It cannot: proving possession of the session secret now means completing a
+/// Noise handshake, and that needs a bidirectional channel. Nothing about the
+/// session is disclosed by the upgrade succeeding — the endpoint answers
+/// identically to a peer holding the secret and to one that is guessing.
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<WsState>) -> Response {
     ws.max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)
         .on_upgrade(move |socket| serve_socket(socket, state))
 }
 
 async fn serve_socket(socket: WebSocket, state: WsState) {
+    let Ok(permit) = state.handshakes.clone().try_acquire_owned() else {
+        tracing::warn!("refusing a Weave connection: too many handshakes in flight");
+        return;
+    };
+
+    let (mut sink, mut stream) = socket.split();
+    // The timeout covers the whole exchange, not just the read: a peer that
+    // sends its message and then stops reading would otherwise hold a handshake
+    // permit for as long as it liked once the socket stopped draining.
+    let handshake = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        host_handshake(&state.key, &mut sink, &mut stream),
+    )
+    .await
+    .unwrap_or_else(|_| Err(crate::error::network("The Weave handshake timed out.")));
+    let channel = match handshake {
+        Ok(channel) => Arc::new(channel),
+        Err(e) => {
+            // Deliberately terse and generic: a peer that fails the handshake
+            // learns only that it failed.
+            tracing::warn!("a peer failed the Weave handshake: {}", e.message);
+            let _ = sink.close().await;
+            return;
+        }
+    };
+    drop(permit);
+
+    // Only now does this connection exist as far as the session is concerned.
     let conn_id = state.next_conn.fetch_add(1, Ordering::Relaxed);
-    let (out, mut rx, queued) = default_outbound();
+    let (out, rx, queued) = default_outbound();
     state.host.send(HostInput::Connected {
         conn_id,
         out: out.clone(),
         is_local: false,
     });
 
-    let (mut sink, mut stream) = socket.split();
-    let writer = tokio::spawn(async move {
-        while let Some(text) = rx.recv().await {
-            let len = text.len();
-            let send = sink.send(Message::Text(text.into())).await;
-            queued.fetch_sub(len.min(queued.load(Ordering::Relaxed)), Ordering::Relaxed);
-            if send.is_err() {
-                break;
-            }
-        }
-        let _ = sink.close().await;
-    });
+    let writer = tokio::spawn(encrypt_to_sink(rx, queued, sink, channel.clone()));
 
     while let Some(Ok(message)) = stream.next().await {
         match message {
-            Message::Text(text) => match serde_json::from_str::<ClientEnvelope>(text.as_str()) {
-                Ok(envelope) => {
-                    if envelope.protocol_version != PROTOCOL_VERSION {
-                        out.send_host(crate::proto::HostMessage::Error {
-                            request_id: None,
-                            class: crate::error::ErrorClass::ProtocolError,
-                            message: format!(
-                                "Unsupported Weave protocol version {}.",
-                                envelope.protocol_version
-                            ),
-                            detail: Some(
-                                "Every participant must run a matching Weave version.".into(),
-                            ),
-                        });
+            Message::Binary(bytes) => match channel.decrypt(&bytes) {
+                // A partial application message; more frames follow.
+                Ok(None) => {}
+                Ok(Some(plaintext)) => {
+                    if !dispatch_client_message(&plaintext, conn_id, &state.host, &out) {
                         break;
                     }
-                    state.host.send(HostInput::Message {
-                        conn_id,
-                        message: envelope.message,
-                    });
                 }
                 Err(e) => {
-                    out.send_host(crate::proto::HostMessage::Error {
-                        request_id: None,
-                        class: crate::error::ErrorClass::ProtocolError,
-                        message: format!("Malformed Weave message: {e}"),
-                        detail: None,
-                    });
+                    tracing::warn!("dropping a Weave connection: {}", e.message);
+                    break;
                 }
             },
+            // Nothing is accepted outside the encrypted channel.
+            Message::Text(_) => {
+                tracing::warn!("dropping a Weave connection that sent an unencrypted frame");
+                break;
+            }
             Message::Close(_) => break,
             _ => {}
         }
@@ -653,6 +676,122 @@ async fn serve_socket(socket: WebSocket, state: WsState) {
     out.close();
     writer.abort();
     state.host.send(HostInput::Disconnected { conn_id });
+}
+
+/// Read the initiator's message, reply, and return the established channel.
+///
+/// Until this returns `Ok`, the caller has told the host engine nothing and has
+/// sent nothing but a fixed-size handshake reply. The caller bounds this in
+/// time; there is no internal timeout to keep in step with that one.
+async fn host_handshake(
+    key: &PeerKey,
+    sink: &mut SplitSink<WebSocket, Message>,
+    stream: &mut SplitStream<WebSocket>,
+) -> Result<SecureChannel> {
+    let first = next_binary_frame(stream).await?;
+
+    let responder = Responder::new(&key.psk, key.session_id)?;
+    let (reply, channel) = responder.respond(&first)?;
+    sink.send(Message::Binary(reply.into()))
+        .await
+        .map_err(|e| crate::error::network(format!("Could not send the Weave handshake: {e}")))?;
+    Ok(channel)
+}
+
+async fn next_binary_frame(stream: &mut SplitStream<WebSocket>) -> Result<Vec<u8>> {
+    while let Some(message) = stream.next().await {
+        match message {
+            Ok(Message::Binary(bytes)) => return Ok(bytes.into()),
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+            Ok(_) => {
+                return Err(crate::error::network(
+                    "The peer did not begin with a Weave handshake.",
+                ))
+            }
+            Err(e) => {
+                return Err(crate::error::network(format!(
+                    "The connection ended during the Weave handshake: {e}"
+                )))
+            }
+        }
+    }
+    Err(crate::error::network(
+        "The connection closed before the Weave handshake completed.",
+    ))
+}
+
+/// Decode one decrypted application message and hand it to the host engine.
+/// Returns `false` when the connection must be dropped.
+fn dispatch_client_message(
+    plaintext: &[u8],
+    conn_id: u64,
+    host: &HostHandle,
+    out: &crate::transport::Outbound,
+) -> bool {
+    match serde_json::from_slice::<ClientEnvelope>(plaintext) {
+        Ok(envelope) => {
+            if envelope.protocol_version != PROTOCOL_VERSION {
+                out.send_host(crate::proto::HostMessage::Error {
+                    request_id: None,
+                    class: crate::error::ErrorClass::ProtocolError,
+                    message: format!(
+                        "Unsupported Weave protocol version {}.",
+                        envelope.protocol_version
+                    ),
+                    detail: Some("Every participant must run a matching Weave version.".into()),
+                });
+                return false;
+            }
+            host.send(HostInput::Message {
+                conn_id,
+                message: envelope.message,
+            });
+            true
+        }
+        Err(e) => {
+            // The frame authenticated, so this is a version or bug problem
+            // rather than an attack; the peer gets a useful message.
+            out.send_host(crate::proto::HostMessage::Error {
+                request_id: None,
+                class: crate::error::ErrorClass::ProtocolError,
+                message: format!("Malformed Weave message: {e}"),
+                detail: None,
+            });
+            true
+        }
+    }
+}
+
+/// Drain the outbound queue, encrypting each message into one or more frames.
+async fn encrypt_to_sink(
+    mut rx: mpsc::Receiver<String>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+    mut sink: SplitSink<WebSocket, Message>,
+    channel: Arc<SecureChannel>,
+) {
+    while let Some(text) = rx.recv().await {
+        let len = text.len();
+        let frames = channel.encrypt(text.as_bytes());
+        queued.fetch_sub(len.min(queued.load(Ordering::Relaxed)), Ordering::Relaxed);
+        let frames = match frames {
+            Ok(frames) => frames,
+            Err(e) => {
+                tracing::error!("could not encrypt a Weave message: {}", e.message);
+                break;
+            }
+        };
+        let mut ok = true;
+        for frame in frames {
+            if sink.send(Message::Binary(frame.into())).await.is_err() {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            break;
+        }
+    }
+    let _ = sink.close().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -730,11 +869,11 @@ fn ensure_crypto_provider() {
 /// with no path back, which is exactly the failure mode local editing must
 /// survive. Restarting costs nothing and cannot lose queued work: the outbox is
 /// durable and every operation is idempotent.
-async fn supervise_connection(url: String, secret: String, client: ClientHandle) {
+async fn supervise_connection(url: String, key: PeerKey, client: ClientHandle) {
     loop {
         let task = tokio::spawn(client_connection_loop(
             url.clone(),
-            secret.clone(),
+            key.clone(),
             client.clone(),
         ));
         match task.await {
@@ -751,11 +890,11 @@ async fn supervise_connection(url: String, secret: String, client: ClientHandle)
     }
 }
 
-async fn client_connection_loop(url: String, secret: String, client: ClientHandle) {
+async fn client_connection_loop(url: String, key: PeerKey, client: ClientHandle) {
     ensure_crypto_provider();
     let mut backoff = 1u64;
     loop {
-        match connect_once(&url, &secret, &client).await {
+        match connect_once(&url, &key, &client).await {
             Ok(reason) => {
                 client.send(ClientInput::Disconnected(reason));
                 backoff = 1;
@@ -774,34 +913,70 @@ async fn client_connection_loop(url: String, secret: String, client: ClientHandl
     }
 }
 
-async fn connect_once(url: &str, secret: &str, client: &ClientHandle) -> Result<String> {
+async fn connect_once(url: &str, key: &PeerKey, client: &ClientHandle) -> Result<String> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut request = url
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    // No credential travels with the request. The session secret authenticates
+    // the Noise handshake below and never leaves this machine.
+    let request = url
         .into_client_request()
         .map_err(|e| crate::error::network(format!("Invalid Weave host URL: {e}")))?;
-    request.headers_mut().insert(
-        "authorization",
-        format!("Bearer {secret}")
-            .parse()
-            .map_err(|_| crate::error::network("Invalid session secret encoding."))?,
-    );
     let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(MAX_FRAME))
         .max_frame_size(Some(MAX_FRAME));
     let (socket, _) = tokio_tungstenite::connect_async_with_config(request, Some(config), false)
         .await
-        .map_err(|e| crate::error::network(format!("Could not reach the Weave host: {e}")))?;
+        .map_err(describe_connect_failure)?;
 
     let (mut sink, mut stream) = socket.split();
+
+    // Handshake first: nothing about this repository is sent, and nothing the
+    // host says is trusted, until it succeeds. The send is inside the timeout
+    // too — an endpoint that accepts the upgrade and then stops reading must
+    // not strand the connection task, or the participant sits offline with no
+    // path back.
+    let mut initiator = Initiator::new(&key.psk, key.session_id)?;
+    let first = initiator.first_message()?;
+    let exchange = async {
+        sink.send(WsMessage::Binary(first.into()))
+            .await
+            .map_err(|e| {
+                crate::error::network(format!("Could not start the Weave handshake: {e}"))
+            })?;
+        next_host_frame(&mut stream).await
+    };
+    let reply = match tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange).await {
+        Ok(reply) => reply?,
+        Err(_) => {
+            let _ = sink.close().await;
+            return Err(crate::error::network("The Weave handshake timed out."));
+        }
+    };
+    let channel = Arc::new(initiator.finish(&reply)?);
+
     let (out, mut rx, queued) = default_outbound();
+    let sender = channel.clone();
     let writer = tokio::spawn(async move {
         while let Some(text) = rx.recv().await {
             let len = text.len();
-            let sent = sink
-                .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
-                .await;
+            let frames = sender.encrypt(text.as_bytes());
             queued.fetch_sub(len.min(queued.load(Ordering::Relaxed)), Ordering::Relaxed);
-            if sent.is_err() {
+            let frames = match frames {
+                Ok(frames) => frames,
+                Err(e) => {
+                    tracing::error!("could not encrypt a Weave message: {}", e.message);
+                    break;
+                }
+            };
+            let mut ok = true;
+            for frame in frames {
+                if sink.send(WsMessage::Binary(frame.into())).await.is_err() {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
                 break;
             }
         }
@@ -820,8 +995,9 @@ async fn connect_once(url: &str, secret: &str, client: &ClientHandle) -> Result<
             }
         };
         match message {
-            tokio_tungstenite::tungstenite::Message::Text(text) => {
-                match serde_json::from_str::<HostEnvelope>(text.as_str()) {
+            WsMessage::Binary(bytes) => match channel.decrypt(&bytes) {
+                Ok(None) => {}
+                Ok(Some(plaintext)) => match serde_json::from_slice::<HostEnvelope>(&plaintext) {
                     Ok(envelope) => {
                         if envelope.protocol_version != PROTOCOL_VERSION {
                             out.close();
@@ -834,9 +1010,20 @@ async fn connect_once(url: &str, secret: &str, client: &ClientHandle) -> Result<
                         client.send(ClientInput::Host(envelope.message));
                     }
                     Err(e) => tracing::error!("malformed host message: {e}"),
+                },
+                Err(e) => {
+                    out.close();
+                    writer.abort();
+                    return Ok(e.message);
                 }
+            },
+            // The host never speaks outside the encrypted channel.
+            WsMessage::Text(_) => {
+                out.close();
+                writer.abort();
+                return Ok("the host sent an unencrypted frame".into());
             }
-            tokio_tungstenite::tungstenite::Message::Close(_) => break,
+            WsMessage::Close(_) => break,
             _ => {}
         }
         if out.is_closed() {
@@ -846,6 +1033,64 @@ async fn connect_once(url: &str, secret: &str, client: &ClientHandle) -> Result<
     out.close();
     writer.abort();
     Ok("disconnected".into())
+}
+
+/// Await the host's handshake reply, ignoring keepalives.
+async fn next_host_frame(
+    stream: &mut SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+) -> Result<Vec<u8>> {
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    while let Some(message) = stream.next().await {
+        match message {
+            Ok(WsMessage::Binary(bytes)) => return Ok(bytes.into()),
+            Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => continue,
+            Ok(_) => {
+                return Err(crate::error::network(
+                    "The Weave host did not answer with a handshake.",
+                )
+                .with_detail(
+                    "The endpoint answered, but not as a Weave 2 host. Check the invite.",
+                ))
+            }
+            Err(e) => {
+                return Err(crate::error::network(format!(
+                    "The connection ended during the Weave handshake: {e}"
+                )))
+            }
+        }
+    }
+    Err(
+        crate::error::network("The Weave host closed the connection during the handshake.")
+            .with_detail(
+            "The host rejects peers whose session secret does not match. Ask for a fresh invite.",
+        ),
+    )
+}
+
+/// Turn a WebSocket connect failure into something a person can act on.
+///
+/// A Weave 1.x host has no `/weave/v2` route, so it answers 404; the same host
+/// answered 401 to a missing bearer token. Either way the answer is "upgrade",
+/// never "retry without encryption".
+fn describe_connect_failure(e: tokio_tungstenite::tungstenite::Error) -> crate::error::WeaveError {
+    use tokio_tungstenite::tungstenite::Error as WsError;
+    if let WsError::Http(response) = &e {
+        let status = response.status().as_u16();
+        if status == 404 || status == 401 {
+            return crate::error::protocol(
+                "This host is not running an end-to-end encrypted Weave session.",
+            )
+            .with_detail(
+                "It answered as a Weave 1.x host, whose application protocol was not encrypted. \
+                 Weave will not fall back to it. Both sides must run Weave 2 or newer.",
+            );
+        }
+    }
+    crate::error::network(format!("Could not reach the Weave host: {e}"))
 }
 
 // ---------------------------------------------------------------------------

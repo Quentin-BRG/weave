@@ -393,7 +393,7 @@ mod tests {
         let env = ClientEnvelope::wrap(ClientMessage::Ping { nonce: 7 });
         let text = serde_json::to_string(&env).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(value["protocol_version"], 1);
+        assert_eq!(value["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(value["message_type"], "ping");
         let back: ClientEnvelope = serde_json::from_str(&text).unwrap();
         matches!(back.message, ClientMessage::Ping { nonce: 7 });

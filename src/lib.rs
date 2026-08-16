@@ -31,6 +31,7 @@ pub mod proto;
 pub mod reconcile;
 pub mod recover;
 pub mod scan;
+pub mod secure;
 pub mod session;
 pub mod store_client;
 pub mod store_host;

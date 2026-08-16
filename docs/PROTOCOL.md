@@ -1,6 +1,12 @@
-# Weave V1 wire protocol
+# Weave wire protocol
 
-`protocol_version` is **1**. A peer that announces a different version is rejected.
+`protocol_version` is **2**. A peer that announces a different version is rejected.
+Version 2 encrypts every application message; there is no compatibility mode with
+the unencrypted version 1 protocol and no downgrade path. The break is visible in
+three places, so a mismatch in either direction produces a specific error rather
+than a silent fallback: the version number itself, the WebSocket route
+(`/weave/v2`, previously `/weave`) and the invite prefix (`weave2_`, previously
+`weave1_`).
 
 ## Transport
 
@@ -9,33 +15,102 @@ Remote sessions run through a Cloudflare Quick Tunnel, which supports WebSocket
 upgrades; LAN sessions use a plain socket. The host coordinator binds only to
 loopback in tunnel mode.
 
-Serialization is JSON. File content travels as **complete bytes**, base64-encoded —
-Weave V1 deliberately does not use textual deltas as the primary operation
-representation. That removes patch-application ambiguity, simplifies recovery and
-makes three-way reconciliation straightforward, at the cost of bandwidth Weave's
-target workload can afford.
+Every WebSocket frame Weave sends is **binary** and every payload is a Noise
+transport message. A text frame received on a Weave connection terminates it.
 
-Maximum frame: 48 MiB (comfortably above a 10 MiB file after base64 expansion plus
-overhead). Oversized messages are protocol errors.
+Serialization inside the encrypted channel is JSON. File content travels as
+**complete bytes**, base64-encoded — Weave deliberately does not use textual deltas
+as the primary operation representation. That removes patch-application ambiguity,
+simplifies recovery and makes three-way reconciliation straightforward, at the cost
+of bandwidth Weave's target workload can afford.
 
-## Authentication
+Maximum application message: 48 MiB (comfortably above a 10 MiB file after base64
+expansion plus overhead). Oversized messages are protocol errors.
 
-The public Cloudflare hostname is **not** authentication. The client authenticates
-with the session secret during the WebSocket upgrade:
+## Session establishment
+
+Authentication and confidentiality are the same step: a **Noise** handshake, run by
+the [`snow`](https://crates.io/crates/snow) implementation of the
+[Noise Protocol Framework](https://noiseprotocol.org/noise.html) (revision 34).
+Weave does not implement the Noise state machine, key schedule, AEAD or nonce
+handling itself.
 
 ```
-Authorization: Bearer <session-secret>
+Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s
 ```
 
-The secret is compared in constant time. An unauthenticated client receives no
-repository content: the upgrade is refused with `401`.
+- `NN` — no static keys, no certificates, no PKI. Weave V1 has no public-key user
+  identities, and this pattern does not invent any.
+- `psk0` — the pre-shared key is mixed in at the very start of the first message, so
+  every handshake message including the first is bound to it.
+- The ephemeral-ephemeral Diffie-Hellman gives each connection independent
+  forward-secret transport keys.
+
+The pre-shared key is **not** the session secret. It is derived with HKDF-SHA256
+under explicit domain separation and used for nothing else:
+
+```
+salt = "weave-noise-psk-v1"
+ikm  = session secret
+info = "weave noise pre-shared key" || u16be(transport version) || session UUID
+psk  = HKDF-SHA256(salt, ikm, info)[0..32]
+```
+
+The Noise prologue — authenticated by the handshake hash, so any disagreement fails
+the handshake — is `"weave-noise-v1" || pattern name || u16be(transport version) ||
+session UUID`.
+
+The raw session secret is never transmitted. The handshake is two messages:
+
+```
+-> psk, e
+<- e, ee
+```
+
+The initiator's message carries an ephemeral public key; the responder replies and
+both sides move to transport mode. A peer that does not hold the same secret cannot
+produce a message whose authentication tag verifies, so the handshake fails and no
+application data is ever exchanged. The public Cloudflare hostname is not
+authentication.
+
+An unauthenticated peer may complete the WebSocket upgrade — it learns only that
+something answers — but is given no session information, participant list, manifest
+or repository state before the handshake succeeds. The unauthenticated window is
+bounded by a 15 s handshake timeout covering the whole exchange, a 1 KiB cap on
+handshake messages, and at most 32 concurrent pending handshakes.
+
+Someone who records a genuine first handshake message can replay it and get a reply,
+as in any `NN`-family pattern: the responder has no way to tell a replay from a new
+initiator until the exchange fails. It gains nothing — deriving the transport keys
+needs the initiator's ephemeral private key — and costs one handshake slot for at
+most the timeout. That is the reason the two bounds above exist.
+
+## Framing
+
+A Noise transport message is at most 65535 bytes, so an application message larger
+than that is split. Each WebSocket frame carries one Noise message whose plaintext
+is:
+
+```
+[1-byte continuation flag][chunk]   flag: 1 = more chunks follow, 0 = last chunk
+```
+
+The flag is inside the ciphertext, and Noise's per-direction nonce counter is
+implicit rather than transmitted. A dropped, reordered, duplicated, truncated or
+forged frame therefore fails authentication instead of silently truncating or
+reassembling a message.
+
+Every reconnection — including one caused by a tunnel restart — performs a complete
+fresh handshake with new ephemeral keys and fresh transport keys. Nonce counters and
+partially reassembled messages are never carried across connections.
 
 ## Envelopes
 
-Every frame is an object carrying `protocol_version` and `message_type`:
+Every application message is an object carrying `protocol_version` and
+`message_type`, serialized and then encrypted:
 
 ```json
-{ "protocol_version": 1, "message_type": "submit_operation", "operation": { … } }
+{ "protocol_version": 2, "message_type": "submit_operation", "operation": { … } }
 ```
 
 ### Client → host
@@ -169,7 +244,7 @@ therefore cannot miss it.
 
 Join:
 
-1. authenticate
+1. complete the Noise handshake
 2. validate branch and base commit compatibility
 3. capture a consistent snapshot `rS` (manifest and revision from the same point)
 4. transfer the manifest
@@ -215,7 +290,7 @@ normalization — **Unicode NFC followed by Unicode lowercase** — cannot coexi
 An invite is an opaque URL-safe payload:
 
 ```
-weave1_<base64url(json)>
+weave2_<base64url(json)>
 ```
 
 carrying the protocol version, the WebSocket URL, the session ID, the session
@@ -223,3 +298,8 @@ secret, the base commit, the branch and the repository name. The internal encodi
 is not a user-facing API. Because it contains the secret, `weave join` reads it from
 a hidden prompt by default, with `--invite-file` and `--invite-stdin` for controlled
 automation.
+
+The secret in the invite never reaches the network: it is the input to the PSK
+derivation above, and only the derived key is used, and only inside the handshake.
+A `weave1_` invite is refused by name — Weave 1 sessions were not encrypted, and
+joining one is not something this version will silently do.
