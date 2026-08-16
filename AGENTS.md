@@ -44,6 +44,15 @@ cargo test -- --test-threads=1
 The end-to-end tests spawn real daemons and bind loopback sockets, so they must run
 one at a time.
 
+`tests/remote_tunnel.rs` is the only test that leaves the machine. It is
+`#[ignore]`d so ordinary runs never depend on `cloudflared`, on Cloudflare, or on
+outbound network access. Run it when you touch the transport, the tunnel lifecycle
+or the invite format:
+
+```
+cargo test --test remote_tunnel -- --ignored --test-threads=1 --nocapture
+```
+
 If you change reconciliation, the outbox, materialization or publication, add or
 extend a test in `tests/` that fails without your change. Correctness here is not
 something to assert in a comment.

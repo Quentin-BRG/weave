@@ -1,0 +1,64 @@
+# Revalidates the real Cloudflare Quick Tunnel path.
+#
+# Kept out of the ordinary CI workflow on purpose: it leaves the machine, so a
+# Cloudflare outage or a network hiccup must never redden an unrelated pull
+# request. Run it on demand, or let the weekly schedule catch drift in
+# cloudflared's output format or in Quick Tunnel behaviour.
+name: Remote tunnel
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Mondays, 04:17 UTC.
+    - cron: "17 4 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  quick-tunnel:
+    name: Cloudflare Quick Tunnel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Configure Git identity
+        run: |
+          git config --global user.name "Weave CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+
+      - name: Install cloudflared (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Install cloudflared (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "$env:RUNNER_TEMP\cloudflared"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
+            -OutFile "$dir\cloudflared.exe"
+          "$dir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$dir\cloudflared.exe" --version
+
+      - name: Remote end-to-end test
+        run: cargo test --test remote_tunnel -- --ignored --test-threads=1 --nocapture

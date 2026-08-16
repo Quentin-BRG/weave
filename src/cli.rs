@@ -330,7 +330,14 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Command::Tunnel(TunnelCommand::Restart(args)) => {
             let paths = Paths::discover(&start_dir)?;
-            let value = ipc::call(&paths, IpcCommand::TunnelRestart)?;
+            // Bringing up a replacement Quick Tunnel can take longer than the
+            // default control timeout, and giving up on the reply while the
+            // daemon succeeds would report a failure that did not happen.
+            let value = ipc::call_with_timeout(
+                &paths,
+                IpcCommand::TunnelRestart,
+                std::time::Duration::from_secs(180),
+            )?;
             emit(args.json, value, render::invite);
             Ok(())
         }

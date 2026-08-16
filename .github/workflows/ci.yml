@@ -41,6 +41,7 @@ jobs:
         run: cargo fmt --check
 
       # The end-to-end tests spawn real daemons and bind loopback sockets, so
-      # they run one at a time.
+      # they run one at a time. The Cloudflare test is `#[ignore]`d and is not
+      # part of this job.
       - name: Test
         run: cargo test -- --test-threads=1

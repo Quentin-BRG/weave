@@ -232,7 +232,20 @@ reported and never auto-reconciled.
 ### `weave tunnel restart [--json]`
 
 Replaces a dead Quick Tunnel. The session keeps its ID, secret, canonical state,
-Tasks and conflicts, and receives a new URL and a new invite.
+Tasks and conflicts, and receives a new URL and a new invite. Tunnel identity is
+not session identity: nothing has to be recreated because a URL changed.
+
+Participants are still pointed at the old hostname, so they go offline. Local
+editing continues and every change stays durably queued; each participant rejoins
+with the new invite:
+
+```bash
+weave stop
+weave join --invite-file new-invite.txt
+```
+
+Their queued work is reconciled on reconnect, exactly as after any other outage.
+The new hostname can take a few seconds to resolve; Weave retries until it does.
 
 ---
 

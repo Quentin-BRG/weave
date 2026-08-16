@@ -461,17 +461,17 @@ impl HostEngine {
         let manifest_all = self.store.manifest_all()?;
         let host_hash = state_hash(manifest_all.iter());
 
+        // A client that has no manifest yet is not diverged, it is new.
+        let diverged = resume.has_manifest
+            && resume.last_applied_revision == current
+            && !resume.replica_hash.is_empty()
+            && resume.replica_hash != host_hash;
         let needs_snapshot = !resume.has_manifest
             || resume.last_applied_revision > current
             || current.saturating_sub(resume.last_applied_revision) > MAX_REPLAY
-            || (resume.last_applied_revision == current
-                && !resume.replica_hash.is_empty()
-                && resume.replica_hash != host_hash);
+            || diverged;
 
-        if resume.last_applied_revision == current
-            && !resume.replica_hash.is_empty()
-            && resume.replica_hash != host_hash
-        {
+        if diverged {
             tracing::warn!(
                 actor = %actor_id,
                 "ReplicaDivergence at r{current}; sending a fresh canonical snapshot"

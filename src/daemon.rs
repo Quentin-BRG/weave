@@ -490,7 +490,7 @@ async fn participant_async(
     start_ipc(control.clone(), Role::Participant, session.session_id).await?;
     start_watcher(&paths, client.clone())?;
 
-    let connection = tokio::spawn(client_connection_loop(url, secret, client.clone()));
+    let connection = tokio::spawn(supervise_connection(url, secret, client.clone()));
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => println!("\nLeaving the Weave session."),
@@ -710,7 +710,49 @@ fn spawn_loopback(host: HostHandle, client: ClientHandle) {
 // Participant WebSocket client
 // ---------------------------------------------------------------------------
 
+/// Install the TLS crypto provider once per process.
+///
+/// `rustls` 0.23 refuses to pick a provider implicitly, and a `wss://` connect
+/// panics without one. Weave pins `ring`, which needs no external toolchain on
+/// any supported platform.
+fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Err means another component already installed one, which is fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// Keep the connection loop running.
+///
+/// `client_connection_loop` never returns on its own, so if its task ends, it
+/// ended abnormally. Without this the participant would sit "offline" forever
+/// with no path back, which is exactly the failure mode local editing must
+/// survive. Restarting costs nothing and cannot lose queued work: the outbox is
+/// durable and every operation is idempotent.
+async fn supervise_connection(url: String, secret: String, client: ClientHandle) {
+    loop {
+        let task = tokio::spawn(client_connection_loop(
+            url.clone(),
+            secret.clone(),
+            client.clone(),
+        ));
+        match task.await {
+            Ok(()) => return,
+            Err(e) if e.is_cancelled() => return,
+            Err(e) => {
+                tracing::error!("connection task stopped unexpectedly: {e}; restarting");
+                client.send(ClientInput::Disconnected(
+                    "connection task restarted".into(),
+                ));
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
 async fn client_connection_loop(url: String, secret: String, client: ClientHandle) {
+    ensure_crypto_provider();
     let mut backoff = 1u64;
     loop {
         match connect_once(&url, &secret, &client).await {
@@ -721,7 +763,11 @@ async fn client_connection_loop(url: String, secret: String, client: ClientHandl
             Err(e) => {
                 client.send(ClientInput::Disconnected(e.message.clone()));
                 tracing::warn!("connection failed: {}", e.message);
-                backoff = (backoff * 2).min(30);
+                // Capped low on purpose: after `weave tunnel restart` the new
+                // hostname needs a moment to resolve, and a coarse backoff
+                // would add tens of seconds of avoidable downtime. One DNS
+                // lookup every few seconds costs nothing at this scale.
+                backoff = (backoff * 2).min(8);
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;

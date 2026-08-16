@@ -350,11 +350,15 @@ impl ClientEngine {
                 last_applied_revision: last_applied,
                 active_task_id: self.my_active_task().map(|t| t.id),
             });
-            let manifest = self.store.replica_manifest()?;
-            self.send(ClientMessage::ReplicaHash {
-                revision: last_applied,
-                hash: state_hash(manifest.iter()),
-            });
+            // Only meaningful once a canonical manifest has been installed;
+            // before that an empty replica is not a diverged one.
+            if self.store.has_manifest()? {
+                let manifest = self.store.replica_manifest()?;
+                self.send(ClientMessage::ReplicaHash {
+                    revision: last_applied,
+                    hash: state_hash(manifest.iter()),
+                });
+            }
         }
         if self.connected && now - self.last_heartbeat_ms >= HEARTBEAT_INTERVAL_MS {
             self.last_heartbeat_ms = now;

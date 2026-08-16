@@ -41,6 +41,13 @@ subject to Cloudflare's in-flight request limits. A normal two-to-five person
 session needs only a handful of persistent WebSocket connections, which fits
 comfortably, but Weave V1 is not a production hosting story.
 
+The client side uses `rustls` with the `ring` provider, installed explicitly at
+startup and verifying server certificates against the webpki root store. There is
+no option to skip certificate verification, and `tests/remote_tunnel.rs` asserts
+that a participant reaches the host only through a `wss://…trycloudflare.com`
+endpoint — a regression that quietly downgraded to loopback or plain `ws://` would
+fail there.
+
 The public hostname is **not** authentication. Anyone who finds the URL still needs
 the session secret; an unauthenticated client receives no repository content — the
 WebSocket upgrade is refused with `401` before any state is exchanged. The secret is

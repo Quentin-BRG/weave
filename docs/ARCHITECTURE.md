@@ -224,7 +224,21 @@ host memory without limit. It recovers through ordinary reconnection
 synchronization (§65, §197). Files above 10 MiB are refused; text above 1 MiB is
 treated as binary for merge purposes (§51).
 
-## 10. Deliberate non-goals
+## 10. TLS
+
+Remote participants connect over `wss://`, so the process needs a `rustls`
+crypto provider. `rustls` 0.23 refuses to choose one implicitly, and a missing
+provider does not fail the connection — it *panics inside the connection task*,
+which would leave a participant permanently offline with no path back. Weave
+therefore pins `ring` (no external build toolchain on any supported platform) and
+installs it explicitly, once, before the first connect. The connection task is
+also supervised: if it ever ends abnormally it is restarted, because a durable
+outbox plus idempotent operations make a restart free.
+
+Both behaviours are covered by `tests/remote_tunnel.rs`, which is the only test
+that leaves the machine.
+
+## 11. Deliberate non-goals
 
 No P2P, no CRDT, no MCP server, no agent orchestration, no host migration or leader
 election, no automatic reconciliation with external Git history, no first-class

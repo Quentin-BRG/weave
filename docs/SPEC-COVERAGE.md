@@ -118,6 +118,30 @@ numbers are the specification's.
 | 196 | Late join converges | `tests/multi_participant.rs::start_session` |
 | 197 | Backpressure bounded | `transport::Outbound` |
 
+## The real remote path
+
+`tests/multi_participant.rs` exercises the protocol over a real WebSocket, but on
+loopback. `tests/remote_tunnel.rs` covers what only the public path can:
+
+| Requirement | Covered by |
+| --- | --- |
+| §52 one long-lived WebSocket per participant, over the tunnel | the whole test |
+| §53 base64 file content, including binary, across the wire | 40 KiB binary asset |
+| §56–57 invite reaches and authenticates a remote participant | join from the invite alone |
+| §58 TLS transport; `wss://…trycloudflare.com`, never loopback | `assert_public_endpoint` |
+| §59–60 Quick Tunnel launch and `cloudflared` dependency | `weave host` with no flags |
+| §62 tunnel identity is not session identity | `weave tunnel restart` keeps `session_id`, canonical state and conflicts, and yields a new URL and invite |
+| §131–132 Git pack distribution over the public path | tree OID equality on both machines |
+| §148, §186 queued work survives losing the endpoint | edit while the old tunnel is dead, then re-join |
+
+It is `#[ignore]`d and additionally has its own workflow
+(`.github/workflows/remote-tunnel.yml`, manual plus weekly), so a Cloudflare
+outage can never redden an unrelated pull request:
+
+```
+cargo test --test remote_tunnel -- --ignored --test-threads=1 --nocapture
+```
+
 ## Deliberate implementation choices
 
 Where the specification leaves a detail open, these are the choices made and why:
@@ -139,3 +163,9 @@ Where the specification leaves a detail open, these are the choices made and why
 - **Idempotent retransmission on a live connection.** An in-flight operation with no
   result after 20 seconds is resent with the same `operation_id`, which §24 makes
   safe. This turns a lost frame into a delay rather than a stall.
+- **`ring` as the pinned TLS provider.** `rustls` 0.23 will not pick one implicitly,
+  and `aws-lc-rs` needs cmake and NASM on Windows. Weave installs `ring` explicitly
+  rather than relying on feature unification to do it.
+- **The network task is supervised.** It is an infinite loop, so if its task ends it
+  ended abnormally; restarting is free because the outbox is durable and operations
+  are idempotent, whereas not restarting strands the participant offline forever.

@@ -205,6 +205,23 @@ impl Participant {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
+    /// Fail immediately if the daemon died in a way that would otherwise show
+    /// up only as a wait timing out much later.
+    ///
+    /// A panic inside a network task once made a participant sit "offline"
+    /// forever; every wait below checks for it so the failure names its cause
+    /// instead of a stale timeout.
+    pub fn assert_daemon_healthy(&self) {
+        let log = self.daemon_output();
+        for marker in ["panicked at", "connection task stopped"] {
+            assert!(
+                !log.contains(marker),
+                "the daemon in {} logged `{marker}`:\n{log}",
+                self.repo.display()
+            );
+        }
+    }
+
     /// Ask the daemon to stop and wait for the process to exit.
     pub fn stop_daemon(&mut self) {
         self.shutdown_daemon("stop");
@@ -265,6 +282,7 @@ impl Participant {
                     self.daemon_output()
                 );
             }
+            self.assert_daemon_healthy();
             std::thread::sleep(Duration::from_millis(150));
         }
     }
@@ -296,7 +314,90 @@ impl Participant {
                     self.daemon_output()
                 );
             }
+            self.assert_daemon_healthy();
             std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+
+    /// Wait for a file to hold exactly `expected` bytes.
+    pub fn wait_for_bytes(&self, rel: &str, expected: &[u8], timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(bytes) = std::fs::read(self.repo.join(rel)) {
+                if bytes == expected {
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {rel} ({} bytes) in {}\ndaemon log:\n{}",
+                    expected.len(),
+                    self.repo.display(),
+                    self.daemon_output()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// Wait until a read-only git command returns `expected`.
+    pub fn wait_for_git(&self, args: &[&str], expected: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (ok, output) = git_allow_failure(&self.repo, args);
+            if ok && output.trim() == expected {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for `git {args:?}` to be {expected} in {} (last: {})\n\
+                     daemon log:\n{}",
+                    self.repo.display(),
+                    output.trim(),
+                    self.daemon_output()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    /// Wait until the host can produce an invite, returning it.
+    pub fn wait_for_invite(&self, timeout: Duration) -> Value {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(value) = self.json_allow_failure(&["invite"]) {
+                if value["endpoint"].as_str().is_some_and(|e| !e.is_empty()) {
+                    return value;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for an invite in {}\ndaemon log:\n{}",
+                    self.repo.display(),
+                    self.daemon_output()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    /// Wait until this participant has an active Task, returning its id.
+    pub fn wait_for_active_task(&self, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(value) = self.json_allow_failure(&["task", "list"]) {
+                if let Some(id) = value["active_task_id"].as_str() {
+                    return id.to_string();
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for an active Task in {}\ndaemon log:\n{}",
+                    self.repo.display(),
+                    self.daemon_output()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 

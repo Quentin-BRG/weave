@@ -228,6 +228,25 @@ and Linux participants can hold the same working tree, and it refuses files abov
 
 ---
 
+## Tests
+
+```bash
+cargo test -- --test-threads=1
+```
+
+The end-to-end tests drive the real binary against real Git repositories, so they
+spawn daemons and bind loopback sockets and must run one at a time.
+
+One test leaves the machine: `tests/remote_tunnel.rs` runs a whole session over a
+real Cloudflare Quick Tunnel — join from a `wss://…trycloudflare.com` invite,
+bidirectional sync, Tasks, a conflict, a participant-requested publication, a
+disconnect, and `weave tunnel restart`. It needs `cloudflared` and outbound HTTPS,
+so it is opt-in:
+
+```bash
+cargo test --test remote_tunnel -- --ignored --test-threads=1 --nocapture
+```
+
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the pieces fit together
