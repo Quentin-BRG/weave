@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>
+body { font: 13px -apple-system, "Helvetica Neue", sans-serif; margin: 0; }
+h2 { font-size: 15px; margin: 0 0 8px; }
+pre { font: 12px "SF Mono", Menlo, monospace; background: #f4f4f6; padding: 8px 10px; }
+code { font: 12px "SF Mono", Menlo, monospace; }
+</style></head>
+<body>
+
+<h2>Weave is installed</h2>
+
+<p>The installation self-check ran as part of this install, so there is nothing
+left to set up. Open a new terminal and start collaborating:</p>
+
+<pre>cd my-project
+weave host</pre>
+
+<p>Weave checks the repository itself before starting, prints an invite, and
+publishes a Cloudflare Quick Tunnel using the bundled <code>cloudflared</code>.
+Share the invite over a channel you trust — it grants full read and write access
+to the session.</p>
+
+<p>Someone joining a session runs:</p>
+
+<pre>cd my-project
+weave join</pre>
+
+<p>If anything ever looks wrong, <code>weave doctor</code> is the troubleshooting
+command. You do not need to run it as a setup step.</p>
+
+</body>
+</html>

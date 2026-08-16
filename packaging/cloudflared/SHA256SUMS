@@ -1,0 +1,10 @@
+# SHA-256 of the cloudflared 2026.8.2 release assets Weave bundles.
+#
+# Cloudflare publishes no checksum file with its releases, so these were taken
+# from the assets themselves and committed here. The release build refuses to
+# package a download that does not match, which is what makes the bundled
+# binary reproducible rather than "whatever the URL served today".
+c29eee2b121f5436a642eed69fd9767da7e7b8c510fa50aaa130337f931357b5  cloudflared-windows-amd64.exe
+f1727723c586500e2092368ae21871b3df7ddfd2cb097f22d81bee4a9c458bb4  cloudflared-darwin-amd64.tgz
+9042c2c5d8b2de78e60f313d5fb31b6c5c1cebde787a3caf1f2c9588084ac442  cloudflared-darwin-arm64.tgz
+fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2  cloudflared-linux-amd64

@@ -1,0 +1,384 @@
+name: Release
+
+# Tag-driven releases. Pushing `v1.0.0` publishes a release; `v1.0.0-rc.1`
+# publishes a prerelease. Nothing is published unless every package built:
+# `validate` gates the three packaging jobs, and `release` runs only after all
+# of them succeed, so a broken macOS runner cannot leave a half-populated
+# release page behind.
+#
+#     validate ──┬── package-windows ──┐
+#                ├── package-macos  ───┼── release
+#                └── package-linux  ───┘
+#
+# Neither the Windows installer nor the macOS package is code-signed, and no
+# signing secret is referenced anywhere in this file. See packaging/README.md.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (dry run; nothing is published)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Nothing is built until the tag, the formatting, the lints and the whole
+  # offline test suite agree.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve and check the version
+        id: version
+        run: |
+          set -euo pipefail
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          tag_version="${ref#v}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          echo "tag $ref -> $tag_version, Cargo.toml -> $cargo_version"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::tag $ref does not match the Cargo package version $cargo_version"
+            exit 1
+          fi
+          echo "version=$tag_version" >>"$GITHUB_OUTPUT"
+          # A hyphen in the version is a pre-release under semver: v1.0.0-rc.1.
+          case "$tag_version" in
+            *-*) echo "prerelease=true" >>"$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >>"$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Configure Git identity
+        run: |
+          git config --global user.name "Weave CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The end-to-end tests spawn real daemons and bind loopback sockets, so
+      # they run one at a time. The Cloudflare tunnel test is `#[ignore]`d and
+      # is not part of a release build.
+      - name: Test
+        run: cargo test -- --test-threads=1
+
+  # ---------------------------------------------------------------------------
+  # Windows: WeaveSetup-x64.exe (Inno Setup, per-user, unsigned)
+  # ---------------------------------------------------------------------------
+  package-windows:
+    name: Windows installer
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          packaging/windows/build.ps1 `
+            -Binary target/x86_64-pc-windows-msvc/release/weave.exe `
+            -OutputDir dist
+
+      # Install it exactly as a user would, then prove the installed copy is a
+      # working Weave: on PATH, self-checking, and finding its own cloudflared.
+      - name: Install and verify
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Start-Process -Wait -FilePath dist\WeaveSetup-x64.exe `
+            -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/LOG=install.log'
+          $app = "$env:LOCALAPPDATA\Programs\Weave"
+          Get-ChildItem -Recurse $app | ForEach-Object { $_.FullName }
+          foreach ($f in @('weave.exe','cloudflared.exe','weave-bundle.json','weave.ico',
+                           'licenses\cloudflared\LICENSE','licenses\cloudflared\NOTICE')) {
+            if (-not (Test-Path (Join-Path $app $f))) { throw "missing $f" }
+          }
+
+          # PATH: the installer edits HKCU\Environment, which this process did
+          # not inherit, so read it back from the registry the way a new shell
+          # would.
+          $userPath = (Get-ItemProperty -Path 'HKCU:\Environment' -Name Path).Path
+          if ($userPath -notlike "*$app*") { throw "the installer did not add $app to the user PATH" }
+          $env:PATH = "$app;$env:PATH"
+
+          weave --version
+          weave doctor --install
+          weave doctor --install --json | Tee-Object -Variable report | Out-Null
+          if (($report | ConvertFrom-Json).ready -ne $true) { throw "the self-check is not ready: $report" }
+
+          # The installer runs the same self-check; its log must agree.
+          Get-Content (Join-Path $app 'install-check.log')
+
+      - name: Uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $app = "$env:LOCALAPPDATA\Programs\Weave"
+          $uninstaller = Get-ChildItem "$app\unins*.exe" | Select-Object -First 1
+          Start-Process -Wait -FilePath $uninstaller.FullName `
+            -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+          Start-Sleep -Seconds 5
+          if (Test-Path (Join-Path $app 'weave.exe')) { throw 'weave.exe survived the uninstall' }
+          $userPath = (Get-ItemProperty -Path 'HKCU:\Environment' -Name Path -ErrorAction SilentlyContinue).Path
+          if ($userPath -like "*Programs\Weave*") { throw 'the uninstaller left Weave on the user PATH' }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/WeaveSetup-x64.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # macOS: Weave-macos-universal.pkg (unsigned, not notarized)
+  # ---------------------------------------------------------------------------
+  package-macos:
+    name: macOS package
+    needs: validate
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --target aarch64-apple-darwin --target x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Merge into a universal binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/weave \
+            target/x86_64-apple-darwin/release/weave \
+            -output dist/weave-universal
+          lipo -archs dist/weave-universal
+          file dist/weave-universal
+
+      - name: Build the package
+        run: packaging/macos/build-pkg.sh dist/weave-universal dist
+
+      - name: Install and verify
+        run: |
+          set -euo pipefail
+          sudo installer -pkg dist/Weave-macos-universal.pkg -target / -verbose
+          ls -l /usr/local/bin/weave /usr/local/libexec/weave
+          test -x /usr/local/libexec/weave/cloudflared-aarch64
+          test -x /usr/local/libexec/weave/cloudflared-x86_64
+          test -f /usr/local/libexec/weave/weave-bundle.json
+          test -f /usr/local/libexec/weave/licenses/cloudflared/LICENSE
+          test -f /usr/local/libexec/weave/licenses/cloudflared/NOTICE
+
+          lipo -archs /usr/local/bin/weave
+          # /usr/local/bin is on the default PATH, so this is the user's view.
+          cd /tmp
+          weave --version
+          weave doctor --install
+          weave doctor --install --json | python3 -c \
+            'import json,sys; r=json.load(sys.stdin); sys.exit(0 if r["ready"] else 1)'
+
+          # The bundled cloudflared, not one from Homebrew.
+          weave doctor --install --json | grep -q 'bundled with Weave'
+          pkgutil --pkg-info com.github.quentin-brg.weave
+
+      - name: Confirm the package is unsigned
+        run: |
+          # Recorded in the log deliberately: there is no Developer ID and no
+          # notarization, and the README says so.
+          pkgutil --check-signature dist/Weave-macos-universal.pkg || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/Weave-macos-universal.pkg
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux: weave-linux-x64.deb and weave-linux-x64.tar.gz
+  # ---------------------------------------------------------------------------
+  package-linux:
+    name: Linux packages
+    needs: validate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Built on 22.04 so the glibc requirement stays low enough for every
+      # currently supported Debian and Ubuntu.
+      - name: Build
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Build the packages
+        run: |
+          set -euo pipefail
+          packaging/linux/build-deb.sh target/x86_64-unknown-linux-gnu/release/weave dist
+          packaging/linux/build-tarball.sh target/x86_64-unknown-linux-gnu/release/weave dist
+
+      - name: Install and verify the .deb
+        run: |
+          set -euo pipefail
+          dpkg-deb --info dist/weave-linux-x64.deb
+          dpkg-deb --contents dist/weave-linux-x64.deb
+          sudo apt-get install -y ./dist/weave-linux-x64.deb
+
+          dpkg-query -W -f='${Package} ${Version} ${Status}\n' weave
+          dpkg-query -L weave
+          test -x /usr/lib/weave/cloudflared
+          test -f /usr/lib/weave/weave-bundle.json
+          test -f /usr/share/doc/weave/copyright
+          test -f /usr/share/doc/weave/third-party/cloudflared/NOTICE
+
+          cd /tmp
+          weave --version
+          weave doctor --install
+          weave doctor --install --json | python3 -c \
+            'import json,sys; r=json.load(sys.stdin); sys.exit(0 if r["ready"] else 1)'
+          weave doctor --install --json | grep -q 'bundled with Weave'
+
+      - name: Verify the packaged binary needs no Rust toolchain
+        run: |
+          set -euo pipefail
+          # The release runner has cargo; a user's machine does not. Prove the
+          # installed binary is independent of it.
+          rm -rf ~/.cargo ~/.rustup
+          cd /tmp
+          env -i HOME="$HOME" PATH=/usr/local/bin:/usr/bin:/bin weave doctor --install
+          ldd /usr/bin/weave || true
+
+      - name: Uninstall
+        run: |
+          set -euo pipefail
+          sudo apt-get remove -y weave
+          if [ -e /usr/bin/weave ]; then echo "weave survived removal" >&2; exit 1; fi
+          if [ -e /usr/lib/weave ]; then echo "/usr/lib/weave survived removal" >&2; exit 1; fi
+
+      - name: Verify the tarball
+        run: |
+          set -euo pipefail
+          tar -tzf dist/weave-linux-x64.tar.gz
+          mkdir -p /tmp/portable && tar -xzf dist/weave-linux-x64.tar.gz -C /tmp/portable
+          /tmp/portable/weave-linux-x64/bin/weave --version
+          cd /tmp && /tmp/portable/weave-linux-x64/bin/weave doctor --install
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/weave-linux-x64.deb
+            dist/weave-linux-x64.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Publish, only once every package exists
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish the release
+    needs: [validate, package-windows, package-macos, package-linux]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+
+      - name: Gather the assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find staging -type f -exec mv {} dist/ \;
+          cd dist
+          # Every asset the release promises must be here before anything is
+          # published; a missing one is a failed release, not a partial one.
+          for asset in WeaveSetup-x64.exe Weave-macos-universal.pkg \
+                       weave-linux-x64.deb weave-linux-x64.tar.gz; do
+            test -s "$asset" || { echo "::error::$asset is missing or empty"; exit 1; }
+          done
+          sha256sum -- * >SHA256SUMS
+          cat SHA256SUMS
+          ls -l
+
+      # GitHub's own generated notes, with the standing footer about unsigned
+      # installers appended. Generating them through the API rather than
+      # `--generate-notes` is what makes appending possible at all.
+      - name: Compose the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="${{ github.ref_name }}" \
+            --jq .body >notes.md
+          printf '\n' >>notes.md
+          cat packaging/release-notes-footer.md >>notes.md
+          cat notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prerelease=""
+          if [ "${{ needs.validate.outputs.prerelease }}" = "true" ]; then
+            prerelease="--prerelease"
+          fi
+          gh release create "${{ github.ref_name }}" \
+            --title "Weave ${{ needs.validate.outputs.version }}" \
+            --notes-file notes.md \
+            $prerelease \
+            dist/WeaveSetup-x64.exe \
+            dist/Weave-macos-universal.pkg \
+            dist/weave-linux-x64.deb \
+            dist/weave-linux-x64.tar.gz \
+            dist/SHA256SUMS

@@ -24,6 +24,7 @@ pub mod doctor;
 pub mod error;
 pub mod gitx;
 pub mod host;
+pub mod install;
 pub mod ipc;
 pub mod model;
 pub mod path;

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>
+body { font: 13px -apple-system, "Helvetica Neue", sans-serif; margin: 0; }
+h2 { font-size: 15px; margin: 0 0 8px; }
+code { font: 12px "SF Mono", Menlo, monospace; }
+.note { background: #fff8e1; border-left: 3px solid #e8b339; padding: 8px 10px; margin: 12px 0; }
+ul { padding-left: 18px; }
+</style></head>
+<body>
+
+<h2>Weave</h2>
+
+<p>A lightweight real-time collaboration layer above Git. This installs the
+<code>weave</code> command line tool and everything it needs.</p>
+
+<p>Installed into:</p>
+<ul>
+  <li><code>/usr/local/bin/weave</code> — the universal binary, Apple silicon and Intel</li>
+  <li><code>/usr/local/libexec/weave/</code> — the bundled <code>cloudflared</code> and its licences</li>
+</ul>
+
+<p>You do <b>not</b> need Rust, and you do <b>not</b> need to install
+<code>cloudflared</code> separately: this package contains it.</p>
+
+<div class="note">
+<b>This package is not signed and not notarized.</b> It carries no Apple
+Developer ID. macOS Gatekeeper will say so, and opening it may require
+Control-clicking the file and choosing <b>Open</b>, or allowing it under
+<b>System Settings → Privacy &amp; Security</b>. Verify the download against the
+<code>SHA256SUMS</code> published with the release if that matters to you.
+</div>
+
+<p>Git must be installed. <code>xcode-select --install</code> provides it if you
+do not have it yet.</p>
+
+</body>
+</html>

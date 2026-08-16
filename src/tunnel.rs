@@ -40,19 +40,18 @@ impl Tunnel {
     }
 }
 
+/// Whether this Weave has a `cloudflared` it can launch.
+///
+/// The copy bundled with the installation wins over anything on `PATH`, so a
+/// packaged Weave behaves the same on every machine (see [`crate::install`]).
 pub fn cloudflared_available() -> bool {
-    std::process::Command::new("cloudflared")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    crate::install::cloudflared().is_some()
 }
 
 pub fn missing_cloudflared_error() -> crate::error::WeaveError {
     network("Remote sessions require cloudflared.").with_detail(
-        "Install cloudflared and put it on PATH, or start a local-network session:\n\n\
+        "Weave packages bundle cloudflared. This Weave has none: install Weave from a package, \
+         or start a local-network session:\n\n\
          weave host --lan",
     )
 }
@@ -60,10 +59,15 @@ pub fn missing_cloudflared_error() -> crate::error::WeaveError {
 /// Launch `cloudflared tunnel --url http://127.0.0.1:<port>` and wait for the
 /// generated `trycloudflare.com` hostname.
 pub async fn start(port: u16) -> Result<Tunnel> {
-    if !cloudflared_available() {
+    let Some(cloudflared) = crate::install::cloudflared() else {
         return Err(missing_cloudflared_error());
-    }
-    let mut child = Command::new("cloudflared")
+    };
+    tracing::debug!(
+        "starting {} ({})",
+        cloudflared.path.display(),
+        cloudflared.source.describe()
+    );
+    let mut child = Command::new(&cloudflared.path)
         .arg("tunnel")
         .arg("--no-autoupdate")
         .arg("--url")

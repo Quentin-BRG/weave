@@ -60,8 +60,11 @@ fn uses_json(command: &Command) -> bool {
         | Command::Rescan(a)
         | Command::Leave(a)
         | Command::Stop(a)
-        | Command::Push(a)
-        | Command::Doctor(a) => a.json,
+        | Command::Push(a) => a.json,
+        // `doctor --json` has already printed the report, and the report's
+        // own `ready: false` is the machine-readable failure. Adding an error
+        // object would put two JSON documents on stdout and break every parser.
+        Command::Doctor(_) => false,
         Command::Tunnel(TunnelCommand::Restart(a)) => a.json,
         Command::Agent(AgentCommand::Bootstrap(a)) => a.json,
         Command::Recover(a) => a.json,

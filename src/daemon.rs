@@ -65,6 +65,10 @@ pub struct HostOptions {
 #[derive(Debug, Clone)]
 pub struct JoinOptions {
     pub invite: String,
+    /// Set when the caller already ran the join preflight. The CLI does, before
+    /// prompting: refusing a broken repository is worth doing *before* asking
+    /// somebody to paste a session secret.
+    pub preflighted: bool,
 }
 
 /// Everything the IPC server needs to serve daemon-level commands.
@@ -87,6 +91,18 @@ enum ShutdownKind {
 // ---------------------------------------------------------------------------
 
 pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
+    // The preflight `weave doctor` would run, minus everything that is merely
+    // informative. Nobody should have to remember to run `weave doctor` before
+    // their first session, and a successful start prints nothing extra.
+    crate::doctor::ensure_ready(
+        start_dir,
+        if opts.local_only || opts.lan {
+            crate::doctor::Intent::HostLocal
+        } else {
+            crate::doctor::Intent::HostRemote
+        },
+    )?;
+
     let paths = Paths::discover(start_dir)?;
     paths.ensure()?;
     let existing = load_session_record(&paths)?;
@@ -249,7 +265,7 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
 async fn host_async(
     paths: Paths,
     session: SessionInfo,
-    secret: String,
+    secret: SessionSecret,
     opts: HostOptions,
     host: HostHandle,
     client: ClientHandle,
@@ -346,6 +362,12 @@ async fn host_async(
 // ---------------------------------------------------------------------------
 
 pub fn run_join(start_dir: &Path, opts: JoinOptions) -> Result<()> {
+    // `weave join` connects to somebody else's tunnel; it never launches
+    // cloudflared, so the preflight does not ask for one.
+    if !opts.preflighted {
+        crate::doctor::ensure_ready(start_dir, crate::doctor::Intent::Join)?;
+    }
+
     let payload = decode_invite(&opts.invite)?;
     let paths = Paths::discover(start_dir)?;
     paths.ensure()?;
@@ -484,7 +506,7 @@ async fn participant_async(
     paths: Paths,
     session: SessionInfo,
     url: String,
-    secret: String,
+    secret: SessionSecret,
     client: ClientHandle,
     display_name: String,
 ) -> Result<()> {
@@ -574,7 +596,13 @@ pub fn run_resume(start_dir: &Path) -> Result<()> {
                 branch: record.session.branch.clone(),
                 repo_name: record.session.repo_name.clone(),
             })?;
-            run_join(start_dir, JoinOptions { invite })
+            run_join(
+                start_dir,
+                JoinOptions {
+                    invite,
+                    preflighted: false,
+                },
+            )
         }
     }
 }

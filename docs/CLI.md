@@ -265,12 +265,80 @@ session is active, follow Weave", so it can stay committed permanently.
 
 ## Diagnostics
 
-### `weave doctor [--json]`
+### `weave doctor [--install] [--json]`
 
-Checks the Git executable, repository state, unsupported repository features,
-filesystem writability, Weave metadata, SQLite, `cloudflared`, path portability, Git
-filter compatibility and active external Git operations. Exits non-zero when Weave
-is not ready.
+A troubleshooting command, not a setup step. Nothing needs to be run after
+installing: the installers already ran `weave doctor --install`, and `weave host`
+and `weave join` run the checks they need on their own (see
+[Automatic preflight](#automatic-preflight)).
+
+| Invocation | Scope | Needs a repository |
+| --- | --- | --- |
+| `weave doctor` | Machine, installation **and** the current repository | yes |
+| `weave doctor --install` | Machine and installation only | no |
+
+`--install` covers what an installer can verify: the executable starts and
+reports its version, the OS and CPU architecture are supported, the bundled
+`cloudflared` is present, runs and matches the version the package claims, the
+installation's licence files are readable, Git is available and recent enough,
+and the bundled SQLite is usable. It never reads the current directory, a Git
+repository, or user-level Weave state — the `.deb` and `.pkg` run it as root.
+
+Without `--install`, the same checks run first and the repository checks follow:
+repository discovery, `.git` usability, the checked-out branch, unsupported
+repository features, filesystem writability, Weave metadata storage, path
+portability, an already-running Weave daemon, and any Git operation in progress.
+
+Exits non-zero when Weave is not ready.
+
+`--json` prints one document and nothing else, on both success and failure —
+`ready: false` is how a failure is reported, so the output stays parseable:
+
+```json
+{
+  "scope": "install",
+  "checks": [
+    { "name": "Weave executable", "status": "pass", "detail": "…/weave (weave 1.0.0)" },
+    { "name": "Platform",         "status": "pass", "detail": "linux x86_64" },
+    { "name": "Weave package",    "status": "pass", "detail": "linux-x64-deb (weave 1.0.0)" },
+    { "name": "Bundled cloudflared", "status": "fail",
+      "detail": "no cloudflared in this installation (looked in …).",
+      "hint":   "Reinstall Weave; the package is incomplete." }
+  ],
+  "ready": false
+}
+```
+
+`scope` is `install` or `full`. `status` is `pass`, `warn` or `fail`; `hint` is
+present only when there is something to do about it. `ready` is false if and only
+if some check failed — warnings never make Weave unready.
+
+### Automatic preflight
+
+`weave host` and `weave join` reuse the `doctor` checks — the same functions, not
+a second copy — restricted to what the requested mode actually needs. `weave
+join` never involves `cloudflared`; `weave host --lan` and `weave host --local`
+do not either. A remote `weave host` does.
+
+The outcome is graded, and only the successful path is quiet:
+
+- **Blocker** — Weave refuses to start, with one line naming the cause and one
+  line saying what to do:
+
+  ```
+  Weave cannot start: this directory is not inside a Git repository.
+
+  Run Weave from inside a Git working tree.
+
+  Run `weave doctor` for full diagnostics.
+  ```
+
+- **Warning** — printed to stderr as `! name — detail` and startup continues. A
+  dirty working tree is a warning, not a refusal.
+- **Informational** — not printed at startup at all; `weave doctor` shows it.
+
+A successful start prints no diagnostics. There is no doctor report on every
+`weave host`.
 
 ### `weave recover [--rebuild] [--export <DIR>] [--json]`
 

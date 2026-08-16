@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  productbuild distribution for Weave-macos-universal.pkg.
+
+  Deliberately absent: any <signing> configuration. The package is unsigned and
+  not notarized, and the build requires no Apple credentials.
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>Weave</title>
+    <organization>com.github.quentin-brg</organization>
+
+    <!-- Weave is a universal binary; the installer runs natively on both. -->
+    <options customize="never" require-scripts="true" rootVolumeOnly="true"
+             hostArchitectures="x86_64,arm64"/>
+
+    <background file="background.png" alignment="bottomleft" scaling="none"/>
+    <background-darkAqua file="background.png" alignment="bottomleft" scaling="none"/>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="LICENSE.txt" mime-type="text/plain"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+
+    <!-- macOS 11 is the oldest release with an arm64 story worth supporting. -->
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="11.0"/>
+        </allowed-os-versions>
+    </volume-check>
+
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="@IDENTIFIER@"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="@IDENTIFIER@" visible="false">
+        <pkg-ref id="@IDENTIFIER@"/>
+    </choice>
+    <pkg-ref id="@IDENTIFIER@" version="@VERSION@" onConclusion="none">weave-component.pkg</pkg-ref>
+</installer-gui-script>

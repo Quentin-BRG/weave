@@ -1,0 +1,28 @@
+#!/bin/sh
+# Installation self-check, run by the macOS Installer as root.
+#
+# `weave doctor --install` is the installation diagnostic: it needs no Git
+# repository and touches nothing belonging to a user, which is exactly what a
+# root post-install step is allowed to do. The repository diagnostic
+# (`weave doctor`) is never run from here — it would inspect whatever directory
+# the Installer happens to be in, on behalf of the wrong user.
+set -eu
+
+# $3 is the destination volume; the package installs on the boot volume only,
+# but honour it anyway rather than assuming "/".
+prefix="${3:-/}usr/local"
+prefix="$(printf '%s' "$prefix" | sed 's|//|/|g')"
+weave="$prefix/bin/weave"
+
+if [ ! -x "$weave" ]; then
+  echo "weave: $weave is missing after installation." >&2
+  exit 1
+fi
+
+if "$weave" doctor --install; then
+  exit 0
+fi
+
+echo "weave: the installation self-check failed." >&2
+echo "weave: please report this at https://github.com/Quentin-BRG/weave/issues" >&2
+exit 1

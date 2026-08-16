@@ -34,6 +34,17 @@ A feature that weakens one of these to support a broader use case is outside V1.
   portable Agent Plugins package with a Codex compatibility layer. If you change
   the CLI surface — a command, a flag, a `--json` field — the skills there may need
   the same change.
+- `src/install.rs` — where an installed Weave finds its own files, including the
+  bundled `cloudflared`. Resolution is anchored on the running executable, never
+  on `PATH`. The three layouts it supports are documented there and in
+  `packaging/README.md`; changing one means changing both.
+- `src/doctor.rs` — one implementation, three audiences: `weave doctor`
+  (everything), `weave doctor --install` (machine and installation only, safe to
+  run as root from an installer, never touches a repository), and the silent
+  preflight `weave host` / `weave join` run before starting. Add a check once and
+  put it in the right scope; do not grow a second copy in `daemon.rs`.
+- `packaging/` — the native installers and the pinned cloudflared. No signing
+  credentials are involved anywhere; see `packaging/README.md`.
 - `tests/` — end-to-end tests driving the real binary against real repositories.
 
 Both engines are synchronous single-threaded state machines on their own OS
@@ -67,6 +78,13 @@ cargo test --test remote_tunnel -- --ignored --test-threads=1 --nocapture
 If you change reconciliation, the outbox, materialization or publication, add or
 extend a test in `tests/` that fails without your change. Correctness here is not
 something to assert in a comment.
+
+`tests/packaging.rs` guards the packaging contract without building a package: the
+pinned cloudflared version against `install::CLOUDFLARED_VERSION`, the checksum
+list, the release asset names the README links to, and — by assembling a fake
+installation and running the real binary in it — that each documented layout still
+passes `weave doctor --install`. If you rename an asset, move a file inside a
+package, or bump the cloudflared pin, that file tells you what else to change.
 
 <!-- weave:begin -->
 

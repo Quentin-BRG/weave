@@ -73,8 +73,8 @@ pub enum Command {
     /// Agent integration helpers.
     #[command(subcommand)]
     Agent(AgentCommand),
-    /// Check that this machine and repository can run Weave.
-    Doctor(JsonArgs),
+    /// Troubleshoot: check that this machine and repository can run Weave.
+    Doctor(DoctorArgs),
     /// Diagnose and repair Weave storage without discarding data.
     Recover(RecoverArgs),
     /// Read and write local Weave configuration.
@@ -87,6 +87,19 @@ pub struct JsonArgs {
     /// Machine-readable output.
     #[arg(long)]
     pub json: bool,
+}
+
+/// `weave doctor` is a troubleshooting command, not a setup step: `weave host`
+/// and `weave join` run the checks they need on their own.
+#[derive(Args, Debug)]
+pub struct DoctorArgs {
+    /// Machine-readable output.
+    #[arg(long)]
+    pub json: bool,
+    /// Check the installation only. Needs no Git repository; this is what the
+    /// native installers run to validate themselves.
+    #[arg(long)]
+    pub install: bool,
 }
 
 #[derive(Args, Debug)]
@@ -282,8 +295,17 @@ pub fn run(cli: Cli) -> Result<()> {
             },
         ),
         Command::Join(args) => {
+            // Preflight before the prompt: nobody should paste a session secret
+            // into a repository that cannot host it.
+            crate::doctor::ensure_ready(&start_dir, crate::doctor::Intent::Join)?;
             let invite = read_invite(&args)?;
-            crate::daemon::run_join(&start_dir, crate::daemon::JoinOptions { invite })
+            crate::daemon::run_join(
+                &start_dir,
+                crate::daemon::JoinOptions {
+                    invite,
+                    preflighted: true,
+                },
+            )
         }
         Command::Resume => crate::daemon::run_resume(&start_dir),
         Command::Stop(args) => {
@@ -362,7 +384,11 @@ pub fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Doctor(args) => {
-            let report = crate::doctor::run(&start_dir);
+            let report = if args.install {
+                crate::doctor::install_report()
+            } else {
+                crate::doctor::run(&start_dir)
+            };
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -371,10 +397,7 @@ pub fn run(cli: Cli) -> Result<()> {
             if report.ready {
                 Ok(())
             } else {
-                Err(
-                    crate::error::repository("Weave is not ready in this repository.")
-                        .with_detail("Run `weave doctor` for the full checklist."),
-                )
+                Err(crate::doctor::not_ready_error(&report))
             }
         }
         Command::Recover(args) => {

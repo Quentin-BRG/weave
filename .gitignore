@@ -1,3 +1,8 @@
 /target
 **/*.rs.bk
 *.pdb
+
+# Built packages, and the log Inno Setup writes when the installer is run with
+# /LOG. Release artifacts are published from CI, never committed.
+/dist
+/install.log

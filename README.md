@@ -1,6 +1,11 @@
-# Weave
+<p align="center">
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="docs/assets/weave-logo-dark.svg">
+<img src="docs/assets/weave-logo.svg" width="220" alt="Weave">
+</picture>
+</p>
 
-**A lightweight real-time collaboration layer above Git.**
+<p align="center"><b>A lightweight real-time collaboration layer above Git.</b></p>
 
 Weave lets two to five people — and their agents — work simultaneously on
 independent local copies of the same Git repository while one authoritative host
@@ -59,22 +64,75 @@ into ordinary Git commits when the team decides to publish.
 </tr>
 </table>
 
-### After installation
+Each package installs the `weave` command, puts it on your `PATH`, and includes a
+pinned copy of `cloudflared`. **You do not need Rust, Cargo, or a separate
+`cloudflared` install.** Git is the only thing Weave expects you to already have.
+
+Install, then go:
 
 ```bash
-weave doctor
+cd my-project
+weave host
 ```
 
-`weave doctor` verifies the installation and the repository environment: the `weave`
-binary, the **git** executable on PATH, and whether the current repository can host
-or join a session. (`cloudflared` is needed only for remote sessions.)
+Weave checks the machine and the repository itself every time it starts. If
+something is wrong it says so in one line and stops; otherwise it stays quiet.
 
 <sub>Other architectures and previous versions → <a href="https://github.com/Quentin-BRG/weave/releases">Releases</a></sub>
 
 <details>
+<summary><b>Installed files, and how to remove them</b></summary>
+
+**Windows** — `%LOCALAPPDATA%\Programs\Weave\` holds `weave.exe`,
+`cloudflared.exe` and the third-party licences. The installer needs no
+administrator rights and adds that directory to your user `PATH`. Remove it from
+**Settings → Apps → Installed apps → Weave**.
+
+**macOS** — `/usr/local/bin/weave` (a universal binary),
+`/usr/local/libexec/weave/` (both `cloudflared` architectures, the bundle
+manifest and licences) and `/usr/local/share/doc/weave/`. To remove:
+`sudo rm -rf /usr/local/bin/weave /usr/local/libexec/weave /usr/local/share/doc/weave`
+and `sudo pkgutil --forget com.github.quentin-brg.weave`.
+
+**Linux** — `/usr/bin/weave`, `/usr/lib/weave/cloudflared`,
+`/usr/share/doc/weave/`. Remove with `sudo apt remove weave`.
+
+The portable `weave-linux-x64.tar.gz` unpacks to `bin/` and `lib/weave/` under a
+prefix of your choosing and needs no package manager.
+
+</details>
+
+<details>
+<summary><b>These builds are not code-signed</b></summary>
+
+Weave has no code-signing certificate on any platform yet.
+
+**Windows.** `WeaveSetup-x64.exe` is unsigned, so SmartScreen may show *"Windows
+protected your PC"*. Choose **More info → Run anyway**.
+
+**macOS.** `Weave-macos-universal.pkg` is **not signed with a Developer ID and
+not notarized**. Gatekeeper blocks it on first double-click. Control-click the
+package → **Open**, or approve it under **System Settings → Privacy &
+Security** after the first attempt.
+
+Every release publishes a `SHA256SUMS` file listing a SHA-256 digest for each
+asset, which is what you can actually verify today:
+
+```bash
+shasum -a 256 -c SHA256SUMS --ignore-missing   # macOS
+sha256sum -c SHA256SUMS --ignore-missing       # Linux
+```
+
+</details>
+
+<details>
 <summary><b>Build from source</b></summary>
 
-Weave needs a recent **Rust stable** toolchain and the **git** executable on PATH.
+Only needed to develop Weave. Building from source needs a recent **Rust stable**
+toolchain and the **git** executable on PATH; a source build has no bundled
+`cloudflared`, so remote hosting also needs `cloudflared` on `PATH` (or
+`WEAVE_CLOUDFLARED` pointing at one). `weave host --lan` and `weave host --local`
+need neither.
 
 ```bash
 cargo install --path .
@@ -86,6 +144,24 @@ or build in place:
 cargo build --release
 # target/release/weave
 ```
+
+The native packages are built by [`.github/workflows/release.yml`](.github/workflows/release.yml);
+see [packaging/README.md](packaging/README.md).
+
+</details>
+
+<details>
+<summary><b>Something is wrong</b></summary>
+
+```bash
+weave doctor            # everything: machine, installation and this repository
+weave doctor --install  # the installation only; works outside a Git repository
+weave doctor --json     # the same reports, machine-readable
+```
+
+`weave doctor` is a troubleshooting command, not a setup step — the installers
+already run `weave doctor --install`, and `weave host` / `weave join` run the
+checks they need on their own.
 
 </details>
 
@@ -243,7 +319,7 @@ It never overwrites unrelated instructions.
 | `weave push`                                        | Ask the host to push                                      |
 | `weave tunnel restart`                              | Replace a dead Quick Tunnel, same session                 |
 | `weave agent bootstrap`                             | Manage the `AGENTS.md` block                              |
-| `weave doctor`                                      | Readiness checklist                                       |
+| `weave doctor [--install]`                          | Troubleshooting: environment, installation, repository    |
 | `weave recover [--rebuild] [--export DIR]`          | Integrity diagnostics and safe recovery                   |
 | `weave config list                                  | get                                                       | set`                               | Local Weave configuration |
 
@@ -258,7 +334,8 @@ Weave V1 rejects repositories using Git submodules, Git LFS, sparse checkouts,
 secondary worktrees, tracked symlinks, gitlinks, custom clean/smudge filters or
 `working-tree-encoding`. It enforces a portable filename subset so Windows, macOS
 and Linux participants can hold the same working tree, and it refuses files above
-10 MiB. `weave doctor` reports all of it up front.
+10 MiB. `weave host` and `weave join` refuse such a repository before starting, and
+`weave doctor` lists everything at once.
 
 ---
 
