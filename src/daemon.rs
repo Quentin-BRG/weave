@@ -17,12 +17,12 @@ use crate::ipc::{IpcCommand, IpcRequest, IpcResponse};
 use crate::model::*;
 use crate::proto::{ClientEnvelope, HostEnvelope, SessionInfo};
 use crate::secure::{
-    Initiator, Responder, SecureChannel, HANDSHAKE_TIMEOUT, MAX_PENDING_HANDSHAKES,
+    FrameClass, Initiator, Responder, SecureChannel, HANDSHAKE_TIMEOUT, MAX_PENDING_HANDSHAKES,
 };
 use crate::session::*;
 use crate::store_client::ClientStore;
 use crate::store_host::HostStore;
-use crate::transport::{default_outbound, secret_matches, MAX_FRAME, WS_PATH};
+use crate::transport::{default_outbound, secret_matches, Frame, OutboundRx, MAX_FRAME, WS_PATH};
 use crate::watch;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -150,16 +150,12 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
             // canonical state left by a previous, ended session is discarded so
             // revision numbering starts from zero.
             host_store.reset()?;
-            let scan = crate::scan::scan_repository(&paths.repo_root, &BTreeMap::new(), true)?;
+            // The scan streams every file into the blob store as it hashes it,
+            // so the base manifest is durable content-addressed state without
+            // the repository ever being held in memory.
+            let scan = crate::scan::scan_repository(&paths.repo_root, &BTreeMap::new(), &blobs)?;
             report_rejected(&scan.rejected);
-            let mut manifest = BTreeMap::new();
-            for (path, entry) in &scan.entries {
-                if let Some(bytes) = scan.contents.get(path) {
-                    blobs.put(bytes)?;
-                }
-                manifest.insert(path.clone(), entry.clone());
-            }
-            host_store.install_base_manifest(&manifest)?;
+            host_store.install_base_manifest(&scan.entries)?;
             let session = SessionInfo {
                 session_id: Uuid::new_v4(),
                 repo_name: paths.repo_name(),
@@ -678,10 +674,19 @@ async fn serve_socket(socket: WebSocket, state: WsState) {
             Message::Binary(bytes) => match channel.decrypt(&bytes) {
                 // A partial application message; more frames follow.
                 Ok(None) => {}
-                Ok(Some(plaintext)) => {
+                Ok(Some((FrameClass::Control, plaintext))) => {
                     if !dispatch_client_message(&plaintext, conn_id, &state.host, &out) {
                         break;
                     }
+                }
+                // The data plane is framed and authenticated but has no
+                // consumer until the blob transfer protocol lands; a peer
+                // sending on it now is running a version this one cannot serve.
+                Ok(Some((FrameClass::Data, _))) => {
+                    tracing::warn!(
+                        "dropping a Weave connection that sent an unexpected data frame"
+                    );
+                    break;
                 }
                 Err(e) => {
                     tracing::warn!("dropping a Weave connection: {}", e.message);
@@ -790,18 +795,20 @@ fn dispatch_client_message(
     }
 }
 
-/// Drain the outbound queue, encrypting each message into one or more frames.
+/// Drain the outbound queues, encrypting each message into one or more frames.
+///
+/// Control is served at strict priority; see [`OutboundRx::next`]. A data
+/// message is always exactly one Noise message, so the longest a control
+/// message can wait here is one frame on the wire.
 async fn encrypt_to_sink(
-    mut rx: mpsc::Receiver<String>,
+    mut rx: OutboundRx,
     queued: Arc<std::sync::atomic::AtomicUsize>,
     mut sink: SplitSink<WebSocket, Message>,
     channel: Arc<SecureChannel>,
 ) {
-    while let Some(text) = rx.recv().await {
-        let len = text.len();
-        let frames = channel.encrypt(text.as_bytes());
-        queued.fetch_sub(len.min(queued.load(Ordering::Relaxed)), Ordering::Relaxed);
-        let frames = match frames {
+    while let Some(frame) = rx.next().await {
+        let (class, plaintext) = release(frame, &queued);
+        let frames = match channel.encrypt(class, &plaintext) {
             Ok(frames) => frames,
             Err(e) => {
                 tracing::error!("could not encrypt a Weave message: {}", e.message);
@@ -822,6 +829,20 @@ async fn encrypt_to_sink(
     let _ = sink.close().await;
 }
 
+/// Turn a queued frame into a plaintext, giving the control queue its bytes
+/// back at the moment the message stops being queued.
+fn release(frame: Frame, queued: &Arc<std::sync::atomic::AtomicUsize>) -> (FrameClass, Vec<u8>) {
+    match frame {
+        Frame::Control(text) => {
+            let len = text.len();
+            queued.fetch_sub(len.min(queued.load(Ordering::Relaxed)), Ordering::Relaxed);
+            (FrameClass::Control, text.into_bytes())
+        }
+        // Data is bounded by the queue's frame count, not by a byte total.
+        Frame::Data(bytes) => (FrameClass::Data, bytes),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Loopback pair for the host's own participation
 // ---------------------------------------------------------------------------
@@ -837,35 +858,42 @@ fn spawn_loopback(host: HostHandle, client: ClientHandle) {
         is_local: true,
     });
 
+    // The host and its local client share one blob store, so every hash either
+    // side needs is already on disk and the data plane is never used here. A
+    // data frame on the loopback is a bug, not a slow path.
     let client_for_host = client.clone();
     tokio::spawn(async move {
-        while let Some(text) = host_rx.recv().await {
-            let len = text.len();
-            host_queued.fetch_sub(
-                len.min(host_queued.load(Ordering::Relaxed)),
-                Ordering::Relaxed,
-            );
-            match serde_json::from_str::<HostEnvelope>(&text) {
-                Ok(envelope) => client_for_host.send(ClientInput::Host(envelope.message)),
-                Err(e) => tracing::error!("loopback decode (host->client): {e}"),
+        while let Some(frame) = host_rx.next().await {
+            match release(frame, &host_queued) {
+                (FrameClass::Control, plaintext) => {
+                    match serde_json::from_slice::<HostEnvelope>(&plaintext) {
+                        Ok(envelope) => client_for_host.send(ClientInput::Host(envelope.message)),
+                        Err(e) => tracing::error!("loopback decode (host->client): {e}"),
+                    }
+                }
+                (FrameClass::Data, _) => {
+                    tracing::error!("loopback carried a data frame (host->client)")
+                }
             }
         }
     });
 
     let host_for_client = host.clone();
     tokio::spawn(async move {
-        while let Some(text) = client_rx.recv().await {
-            let len = text.len();
-            client_queued.fetch_sub(
-                len.min(client_queued.load(Ordering::Relaxed)),
-                Ordering::Relaxed,
-            );
-            match serde_json::from_str::<ClientEnvelope>(&text) {
-                Ok(envelope) => host_for_client.send(HostInput::Message {
-                    conn_id,
-                    message: envelope.message,
-                }),
-                Err(e) => tracing::error!("loopback decode (client->host): {e}"),
+        while let Some(frame) = client_rx.next().await {
+            match release(frame, &client_queued) {
+                (FrameClass::Control, plaintext) => {
+                    match serde_json::from_slice::<ClientEnvelope>(&plaintext) {
+                        Ok(envelope) => host_for_client.send(HostInput::Message {
+                            conn_id,
+                            message: envelope.message,
+                        }),
+                        Err(e) => tracing::error!("loopback decode (client->host): {e}"),
+                    }
+                }
+                (FrameClass::Data, _) => {
+                    tracing::error!("loopback carried a data frame (client->host)")
+                }
             }
         }
     });
@@ -986,11 +1014,9 @@ async fn connect_once(url: &str, key: &PeerKey, client: &ClientHandle) -> Result
     let (out, mut rx, queued) = default_outbound();
     let sender = channel.clone();
     let writer = tokio::spawn(async move {
-        while let Some(text) = rx.recv().await {
-            let len = text.len();
-            let frames = sender.encrypt(text.as_bytes());
-            queued.fetch_sub(len.min(queued.load(Ordering::Relaxed)), Ordering::Relaxed);
-            let frames = match frames {
+        while let Some(frame) = rx.next().await {
+            let (class, plaintext) = release(frame, &queued);
+            let frames = match sender.encrypt(class, &plaintext) {
                 Ok(frames) => frames,
                 Err(e) => {
                     tracing::error!("could not encrypt a Weave message: {}", e.message);
@@ -1025,20 +1051,28 @@ async fn connect_once(url: &str, key: &PeerKey, client: &ClientHandle) -> Result
         match message {
             WsMessage::Binary(bytes) => match channel.decrypt(&bytes) {
                 Ok(None) => {}
-                Ok(Some(plaintext)) => match serde_json::from_slice::<HostEnvelope>(&plaintext) {
-                    Ok(envelope) => {
-                        if envelope.protocol_version != PROTOCOL_VERSION {
-                            out.close();
-                            writer.abort();
-                            return Ok(format!(
-                                "host speaks Weave protocol version {}",
-                                envelope.protocol_version
-                            ));
+                Ok(Some((FrameClass::Control, plaintext))) => {
+                    match serde_json::from_slice::<HostEnvelope>(&plaintext) {
+                        Ok(envelope) => {
+                            if envelope.protocol_version != PROTOCOL_VERSION {
+                                out.close();
+                                writer.abort();
+                                return Ok(format!(
+                                    "host speaks Weave protocol version {}",
+                                    envelope.protocol_version
+                                ));
+                            }
+                            client.send(ClientInput::Host(envelope.message));
                         }
-                        client.send(ClientInput::Host(envelope.message));
+                        Err(e) => tracing::error!("malformed host message: {e}"),
                     }
-                    Err(e) => tracing::error!("malformed host message: {e}"),
-                },
+                }
+                // See the host side: framed, authenticated, and not yet served.
+                Ok(Some((FrameClass::Data, _))) => {
+                    out.close();
+                    writer.abort();
+                    return Ok("the host sent an unexpected data frame".into());
+                }
                 Err(e) => {
                     out.close();
                     writer.abort();

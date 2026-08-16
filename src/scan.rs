@@ -8,18 +8,13 @@
 //! authoritative), 45 (safe materialization), 46 (Git ignore semantics),
 //! 49 (symlink safety), 51 (file limits).
 
+use crate::blobs::BlobStore;
 use crate::error::Result;
 use crate::gitx;
-use crate::model::{FileEntry, GitMode, MAX_SYNCED_FILE};
+use crate::model::{FileEntry, GitMode, CLASSIFY_PREFIX};
 use crate::path::{self, RepoPath};
 use std::collections::BTreeMap;
 use std::path::Path;
-
-/// A file as it currently exists on disk.
-pub struct Scanned {
-    pub entry: FileEntry,
-    pub bytes: Vec<u8>,
-}
 
 /// A path Weave refuses to synchronize, with an actionable reason.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -28,15 +23,22 @@ pub struct RejectedPath {
     pub reason: String,
 }
 
-/// Read one repository path from disk.
+/// Read one repository path from disk into the blob store.
 ///
 /// Returns `Ok(None)` when the path does not exist. `previous` supplies the
 /// mode to preserve on platforms that cannot represent the executable bit.
+///
+/// The content is streamed: on return the bytes are in `blobs`, addressed by
+/// the returned entry's `blob_hash`, and were never held whole in memory. Size
+/// is not judged here - a file too large for the session is a session-level
+/// decision, made against canonical state rather than by the scanner
+/// ([docs/BLOB-PLANE.md](../docs/BLOB-PLANE.md)).
 pub fn read_path(
     root: &Path,
     path: &RepoPath,
     previous: Option<&FileEntry>,
-) -> Result<Option<Scanned>> {
+    blobs: &BlobStore,
+) -> Result<Option<FileEntry>> {
     path::ensure_no_indirection(root, path)?;
     let fs_path = path.to_fs_path(root);
     let meta = match std::fs::symlink_metadata(&fs_path) {
@@ -52,33 +54,16 @@ pub fn read_path(
     if meta.is_dir() {
         return Ok(None);
     }
-    if meta.len() > MAX_SYNCED_FILE {
-        return Err(crate::error::unsupported(format!(
-            "{path} is {} bytes, above the {} MiB Weave file limit.",
-            meta.len(),
-            MAX_SYNCED_FILE / (1024 * 1024)
-        ))
-        .with_detail(
-            "Large binaries are outside the V1 target workload. Add the file to .gitignore or \
-             keep it out of the session.",
-        ));
-    }
-    let bytes = match std::fs::read(&fs_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+    let Some(ingested) = blobs.ingest_file(&fs_path, CLASSIFY_PREFIX)? else {
+        return Ok(None);
     };
     let mode = gitx::mode_for_disk_file(&fs_path, previous);
-    Ok(Some(Scanned {
-        entry: FileEntry::from_bytes(&bytes, mode),
-        bytes,
-    }))
+    Ok(Some(FileEntry::from_ingested(&ingested, mode)))
 }
 
 /// Result of a full repository rescan.
 pub struct ScanResult {
     pub entries: BTreeMap<RepoPath, FileEntry>,
-    pub contents: BTreeMap<RepoPath, Vec<u8>>,
     pub rejected: Vec<RejectedPath>,
 }
 
@@ -89,11 +74,10 @@ pub struct ScanResult {
 pub fn scan_repository(
     root: &Path,
     previous: &BTreeMap<RepoPath, FileEntry>,
-    load_contents: bool,
+    blobs: &BlobStore,
 ) -> Result<ScanResult> {
     let raw_paths = gitx::list_repository_paths(root)?;
     let mut entries = BTreeMap::new();
-    let mut contents = BTreeMap::new();
     let mut rejected = Vec::new();
     let mut collision_index: std::collections::HashMap<String, RepoPath> =
         std::collections::HashMap::new();
@@ -121,13 +105,10 @@ pub fn scan_repository(
                 continue;
             }
         }
-        match read_path(root, &repo_path, previous.get(&repo_path)) {
-            Ok(Some(scanned)) => {
+        match read_path(root, &repo_path, previous.get(&repo_path), blobs) {
+            Ok(Some(entry)) => {
                 collision_index.insert(key, repo_path.clone());
-                entries.insert(repo_path.clone(), scanned.entry);
-                if load_contents {
-                    contents.insert(repo_path, scanned.bytes);
-                }
+                entries.insert(repo_path, entry);
             }
             Ok(None) => {}
             Err(e) => rejected.push(RejectedPath {
@@ -137,21 +118,24 @@ pub fn scan_repository(
         }
     }
 
-    Ok(ScanResult {
-        entries,
-        contents,
-        rejected,
-    })
+    Ok(ScanResult { entries, rejected })
 }
 
-/// Write canonical bytes to the working tree using safe replacement semantics.
-pub fn materialize_file(root: &Path, path: &RepoPath, bytes: &[u8], mode: GitMode) -> Result<()> {
+/// Write a canonical blob to the working tree using safe replacement semantics.
+///
+/// Streams out of the blob store, verifying the content hash on the way, so the
+/// working file is replaced only by bytes that are provably the canonical ones
+/// and no file is ever held whole in memory.
+pub fn materialize_file(
+    root: &Path,
+    path: &RepoPath,
+    blobs: &BlobStore,
+    blob_hash: &str,
+    mode: GitMode,
+) -> Result<()> {
     path::ensure_no_indirection(root, path)?;
     let fs_path = path.to_fs_path(root);
-    if let Some(parent) = fs_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    crate::util::write_atomic(&fs_path, bytes)?;
+    blobs.copy_out(blob_hash, &fs_path)?;
     apply_mode(&fs_path, mode)?;
     Ok(())
 }

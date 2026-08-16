@@ -145,15 +145,14 @@ pub fn run(start_dir: &Path, opts: RecoverOptions) -> Result<RecoverReport> {
             let mut exported = 0usize;
             let mut skipped = 0usize;
             for (path, entry) in &manifest {
-                match blobs.get(&entry.blob_hash) {
-                    Ok(bytes) => {
-                        let out = path.to_fs_path(dir);
-                        if let Some(parent) = out.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        crate::util::write_atomic(&out, &bytes)?;
-                        exported += 1;
-                    }
+                let out = path.to_fs_path(dir);
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                // Streamed: a rescue export must not depend on the largest
+                // canonical file fitting in memory.
+                match blobs.copy_out(&entry.blob_hash, &out) {
+                    Ok(()) => exported += 1,
                     Err(_) => skipped += 1,
                 }
             }

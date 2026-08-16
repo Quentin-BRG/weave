@@ -571,10 +571,15 @@ pub fn merge_file(
 // Object construction (specification sections 125-128)
 // ---------------------------------------------------------------------------
 
-/// Create a Git blob from exact Weave bytes, applying the host repository's
+/// Create a Git blob from a stored Weave blob, applying the host repository's
 /// path-specific Git semantics (specification section 126).
-pub fn hash_object(root: &Path, path: &RepoPath, bytes: &[u8]) -> Result<String> {
-    let out = run_stdin(
+///
+/// `source` is the blob store's own file, so Git reads it directly instead of
+/// having the content piped through this process. `--path` still names the
+/// repository path, which is what selects the attributes Git applies.
+pub fn hash_object(root: &Path, path: &RepoPath, source: &Path) -> Result<String> {
+    let source = source.to_string_lossy().to_string();
+    let out = run(
         root,
         &[
             "hash-object",
@@ -583,9 +588,9 @@ pub fn hash_object(root: &Path, path: &RepoPath, bytes: &[u8]) -> Result<String>
             "blob",
             "--path",
             path.as_str(),
-            "--stdin",
+            "--",
+            source.as_str(),
         ],
-        bytes,
     )?;
     if !out.ok() {
         return Err(

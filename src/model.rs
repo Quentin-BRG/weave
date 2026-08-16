@@ -81,7 +81,32 @@ pub enum FileKind {
     Binary,
 }
 
+/// Bytes a caller must keep while streaming a file in order to classify it.
+///
+/// One past `TEXT_MERGE_LIMIT` is enough to decide every case: at or below the
+/// limit the prefix *is* the file, and above it the file is binary whatever it
+/// contains. Nothing else ever needs a large file's bytes in memory.
+pub const CLASSIFY_PREFIX: usize = TEXT_MERGE_LIMIT as usize + 1;
+
 impl FileKind {
+    /// Classify a file from its leading bytes and its total size.
+    ///
+    /// `prefix` must hold `min(total, CLASSIFY_PREFIX)` bytes. Agrees with
+    /// [`FileKind::classify`] on every input, so a file's kind does not depend
+    /// on whether it was read whole or streamed.
+    pub fn classify_prefix(prefix: &[u8], total: u64) -> FileKind {
+        if total > TEXT_MERGE_LIMIT {
+            return FileKind::Binary;
+        }
+        debug_assert_eq!(prefix.len() as u64, total, "short prefix for a small file");
+        if prefix.len() as u64 != total {
+            // Should be unreachable. Binary is the safe answer: it only
+            // forgoes a text merge, it never merges something it should not.
+            return FileKind::Binary;
+        }
+        FileKind::classify(prefix)
+    }
+
     /// Classify bytes. Deterministic from the bytes and the configured limit.
     pub fn classify(bytes: &[u8]) -> FileKind {
         if bytes.len() as u64 > TEXT_MERGE_LIMIT {
@@ -121,6 +146,16 @@ impl FileEntry {
             size: bytes.len() as u64,
             git_mode,
             file_kind: FileKind::classify(bytes),
+        }
+    }
+
+    /// Build an entry from a streamed read, without the file in memory.
+    pub fn from_ingested(ingested: &crate::blobs::Ingested, git_mode: GitMode) -> FileEntry {
+        FileEntry {
+            blob_hash: ingested.hash.clone(),
+            size: ingested.size,
+            git_mode,
+            file_kind: FileKind::classify_prefix(&ingested.prefix, ingested.size),
         }
     }
 

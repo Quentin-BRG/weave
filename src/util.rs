@@ -80,8 +80,17 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         f.flush()?;
         f.sync_all()?;
     }
+    install_atomic(&tmp, path)
+}
+
+/// Move a already-flushed temporary file onto `path`, replacing it.
+///
+/// Split out of [`write_atomic`] because streamed writes - blob installation and
+/// materialization of a large file - flush their own file and only need the
+/// replacement half.
+pub fn install_atomic(tmp: &Path, path: &Path) -> Result<()> {
     // `fs::rename` replaces an existing destination on both Unix and Windows.
-    match fs::rename(&tmp, path) {
+    match fs::rename(tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
             // Windows can transiently fail a replace if the destination is open
@@ -89,12 +98,12 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             let mut last = e;
             for _ in 0..10 {
                 std::thread::sleep(std::time::Duration::from_millis(25));
-                match fs::rename(&tmp, path) {
+                match fs::rename(tmp, path) {
                     Ok(()) => return Ok(()),
                     Err(e2) => last = e2,
                 }
             }
-            let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_file(tmp);
             Err(persistence(format!(
                 "Could not replace {}: {last}",
                 path.display()
@@ -103,7 +112,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 }
 
-fn temp_sibling(path: &Path) -> PathBuf {
+pub fn temp_sibling(path: &Path) -> PathBuf {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())

@@ -57,6 +57,12 @@ const TAG: usize = 16;
 const FLAG: usize = 1;
 /// Largest slice of an application message that fits in one Noise message.
 pub const MAX_CHUNK: usize = MAX_NOISE_MESSAGE - TAG - FLAG;
+/// Largest data-plane application message.
+///
+/// Exactly one Noise message, which is the property the priority writer rests
+/// on: a data payload never occupies the shared transport state for more than
+/// one frame, so a control message never waits longer than that.
+pub const MAX_DATA_MESSAGE: usize = MAX_CHUNK;
 
 /// Generous bound for a handshake message; both are 48 bytes in this pattern.
 pub const MAX_HANDSHAKE_MESSAGE: usize = 1024;
@@ -70,6 +76,40 @@ pub const MAX_WS_FRAME: usize = MAX_NOISE_MESSAGE + 64;
 
 const CONTINUES: u8 = 1;
 const FINAL: u8 = 0;
+/// The class occupies the bit above the continuation flag, so the two together
+/// still cost the single plaintext byte the framing has always spent.
+const CLASS_SHIFT: u8 = 1;
+const FLAG_BITS: u8 = 0b11;
+
+/// Which plane an application message belongs to.
+///
+/// Control and data share one Noise session — one handshake, one set of
+/// transport keys, one reconnection story — and are told apart here rather than
+/// by a second connection. See `docs/BLOB-PLANE.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameClass {
+    /// A JSON protocol envelope.
+    Control,
+    /// An opaque blob-plane payload.
+    Data,
+}
+
+impl FrameClass {
+    fn bit(self) -> u8 {
+        match self {
+            FrameClass::Control => 0,
+            FrameClass::Data => 1,
+        }
+    }
+
+    fn from_bit(bit: u8) -> FrameClass {
+        if bit == 0 {
+            FrameClass::Control
+        } else {
+            FrameClass::Data
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Key derivation
@@ -268,6 +308,12 @@ struct Inner {
     /// message: the byte bound alone does not stop an endless run of chunks
     /// that carry no payload.
     chunks: usize,
+    /// The class `pending` belongs to, while a message is partially received.
+    ///
+    /// A data message is always exactly one Noise message, so a sender never
+    /// has a reason to interleave classes; holding the class here turns that
+    /// invariant into something the receiver checks instead of assumes.
+    pending_class: Option<FrameClass>,
 }
 
 /// An established Noise session.
@@ -292,6 +338,7 @@ impl SecureChannel {
                 state,
                 pending: Vec::new(),
                 chunks: 0,
+                pending_class: None,
             }),
             max_message: crate::model::MAX_PROTOCOL_MESSAGE,
         }
@@ -327,9 +374,17 @@ impl SecureChannel {
     /// each took the lock per chunk would interleave validly encrypted chunks
     /// from different messages; the peer would authenticate every frame and
     /// reassemble the mixture into one corrupt message.
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<Vec<u8>>> {
+    pub fn encrypt(&self, class: FrameClass, plaintext: &[u8]) -> Result<Vec<Vec<u8>>> {
         if plaintext.len() > self.max_message {
             return Err(protocol("Weave message is too large to send."));
+        }
+        // A data message must fit one Noise message. That is what lets the
+        // writer interleave a control message between any two data messages
+        // without ever splitting one across the other: the whole point of the
+        // priority queue is that a bulk transfer delays control by at most a
+        // single frame.
+        if class == FrameClass::Data && plaintext.len() > MAX_CHUNK {
+            return Err(protocol("Weave data frame is too large to send."));
         }
         let mut guard = self.lock()?;
         let mut frames = Vec::with_capacity(plaintext.len() / MAX_CHUNK + 1);
@@ -340,7 +395,7 @@ impl SecureChannel {
             let more = end < plaintext.len();
 
             let mut framed = Vec::with_capacity(chunk.len() + FLAG);
-            framed.push(if more { CONTINUES } else { FINAL });
+            framed.push((class.bit() << CLASS_SHIFT) | if more { CONTINUES } else { FINAL });
             framed.extend_from_slice(chunk);
 
             let mut out = vec![0u8; framed.len() + TAG];
@@ -365,7 +420,7 @@ impl SecureChannel {
     /// Any failure here is terminal for the connection: the caller must drop it
     /// rather than resynchronise, because a rejected frame has already consumed
     /// a nonce.
-    pub fn decrypt(&self, frame: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn decrypt(&self, frame: &[u8]) -> Result<Option<(FrameClass, Vec<u8>)>> {
         if frame.is_empty() || frame.len() > MAX_NOISE_MESSAGE {
             return Err(frame_rejected());
         }
@@ -381,6 +436,30 @@ impl SecureChannel {
         let flag = out[0];
         let body = &out[FLAG..n];
 
+        let guard = &mut *guard;
+        if flag & !FLAG_BITS != 0 {
+            guard.reset_reassembly();
+            return Err(frame_rejected());
+        }
+        let class = FrameClass::from_bit(flag >> CLASS_SHIFT);
+        let continues = flag & CONTINUES == CONTINUES;
+
+        // Switching class halfway through a message would splice two payloads
+        // into one, so it is refused rather than reassembled.
+        match guard.pending_class {
+            Some(open) if open != class => {
+                guard.reset_reassembly();
+                return Err(frame_rejected());
+            }
+            _ => {}
+        }
+        // A data message that claims a continuation is a sender that ignored
+        // the one-frame rule, and the receiver does not have to trust it.
+        if class == FrameClass::Data && continues {
+            guard.reset_reassembly();
+            return Err(frame_rejected());
+        }
+
         // An authenticated peer is still only a peer holding the session
         // secret, so reassembly is bounded on both axes before anything is
         // appended. Bytes: a message can never grow past the protocol limit.
@@ -388,7 +467,6 @@ impl SecureChannel {
         // indefinitely — each one authentic, none of them growing `pending`,
         // the message never completing.
         let max_chunks = self.max_chunks();
-        let guard = &mut *guard;
         if guard.pending.len() + body.len() > self.max_message || guard.chunks >= max_chunks {
             guard.reset_reassembly();
             return Err(protocol("Weave message exceeded the protocol size limit."));
@@ -400,16 +478,13 @@ impl SecureChannel {
         guard.pending.extend_from_slice(body);
         guard.chunks += 1;
 
-        match flag {
-            FINAL => {
-                guard.chunks = 0;
-                Ok(Some(std::mem::take(&mut guard.pending)))
-            }
-            CONTINUES => Ok(None),
-            _ => {
-                guard.reset_reassembly();
-                Err(frame_rejected())
-            }
+        if continues {
+            guard.pending_class = Some(class);
+            Ok(None)
+        } else {
+            guard.chunks = 0;
+            guard.pending_class = None;
+            Ok(Some((class, std::mem::take(&mut guard.pending))))
         }
     }
 
@@ -447,6 +522,7 @@ impl Inner {
     fn reset_reassembly(&mut self) {
         self.pending = Vec::new();
         self.chunks = 0;
+        self.pending_class = None;
     }
 }
 
@@ -478,9 +554,12 @@ mod tests {
     fn matching_secrets_establish_a_channel_and_round_trip() {
         let session = Uuid::new_v4();
         let (client, host) = pair("a-session-secret", session);
-        let frames = client.encrypt(b"{\"hello\":true}").unwrap();
+        let frames = client
+            .encrypt(FrameClass::Control, b"{\"hello\":true}")
+            .unwrap();
         assert_eq!(frames.len(), 1);
-        let got = host.decrypt(&frames[0]).unwrap().unwrap();
+        let (class, got) = host.decrypt(&frames[0]).unwrap().unwrap();
+        assert_eq!(class, FrameClass::Control);
         assert_eq!(got, b"{\"hello\":true}");
     }
 
@@ -495,7 +574,9 @@ mod tests {
         let (reply, host) = responder.respond(&first).unwrap();
         let client = initiator.finish(&reply).unwrap();
 
-        let frames = client.encrypt(b"SENTINEL_PAYLOAD_CONTENT").unwrap();
+        let frames = client
+            .encrypt(FrameClass::Control, b"SENTINEL_PAYLOAD_CONTENT")
+            .unwrap();
         let mut wire = Vec::new();
         wire.extend_from_slice(&first);
         wire.extend_from_slice(&reply);
@@ -507,7 +588,7 @@ mod tests {
         assert!(!contains(&wire, b"SENTINEL_PAYLOAD_CONTENT"));
         // ... and the same bytes really do decrypt, so the scan is not vacuous.
         assert_eq!(
-            host.decrypt(&frames[0]).unwrap().unwrap(),
+            host.decrypt(&frames[0]).unwrap().unwrap().1,
             b"SENTINEL_PAYLOAD_CONTENT"
         );
     }
@@ -535,14 +616,18 @@ mod tests {
     fn tampered_ciphertext_fails_authentication() {
         let session = Uuid::new_v4();
         let (client, host) = pair("secret", session);
-        let mut frames = client.encrypt(b"the quick brown fox").unwrap();
+        let mut frames = client
+            .encrypt(FrameClass::Control, b"the quick brown fox")
+            .unwrap();
         let last = frames[0].len() - 1;
         frames[0][last] ^= 0x01;
         assert!(host.decrypt(&frames[0]).is_err());
 
         // And flipping a byte of the ciphertext body, not just the tag.
         let (client, host) = pair("secret", session);
-        let mut frames = client.encrypt(b"the quick brown fox").unwrap();
+        let mut frames = client
+            .encrypt(FrameClass::Control, b"the quick brown fox")
+            .unwrap();
         frames[0][2] ^= 0x80;
         assert!(host.decrypt(&frames[0]).is_err());
     }
@@ -551,7 +636,9 @@ mod tests {
     fn truncated_and_malformed_frames_fail_safely() {
         let session = Uuid::new_v4();
         let (client, host) = pair("secret", session);
-        let frames = client.encrypt(b"a payload worth truncating").unwrap();
+        let frames = client
+            .encrypt(FrameClass::Control, b"a payload worth truncating")
+            .unwrap();
         let short = &frames[0][..frames[0].len() - 4];
         assert!(host.decrypt(short).is_err());
         assert!(host.decrypt(&[]).is_err());
@@ -563,7 +650,7 @@ mod tests {
     fn traffic_captured_from_one_connection_is_invalid_on_a_fresh_one() {
         let session = Uuid::new_v4();
         let (client, _host) = pair("secret", session);
-        let captured = client.encrypt(b"replay me").unwrap();
+        let captured = client.encrypt(FrameClass::Control, b"replay me").unwrap();
 
         // A brand new connection with the same secret: fresh ephemeral keys
         // mean fresh transport keys, so the captured frame is meaningless.
@@ -575,7 +662,7 @@ mod tests {
     fn a_frame_cannot_be_replayed_within_its_own_connection() {
         let session = Uuid::new_v4();
         let (client, host) = pair("secret", session);
-        let frames = client.encrypt(b"once").unwrap();
+        let frames = client.encrypt(FrameClass::Control, b"once").unwrap();
         assert!(host.decrypt(&frames[0]).unwrap().is_some());
         // The receiving nonce has advanced; the same bytes no longer verify.
         assert!(host.decrypt(&frames[0]).is_err());
@@ -586,8 +673,8 @@ mod tests {
         let session = Uuid::new_v4();
         let (client, host) = pair("secret", session);
         // The first frame is deliberately withheld, not delivered out of order.
-        let _first = client.encrypt(b"first").unwrap();
-        let second = client.encrypt(b"second").unwrap();
+        let _first = client.encrypt(FrameClass::Control, b"first").unwrap();
+        let second = client.encrypt(FrameClass::Control, b"second").unwrap();
         assert!(host.decrypt(&second[0]).is_err());
     }
 
@@ -596,14 +683,14 @@ mod tests {
         let session = Uuid::new_v4();
         let (client, host) = pair("secret", session);
         let payload: Vec<u8> = (0..(MAX_CHUNK * 3 + 17)).map(|i| (i % 251) as u8).collect();
-        let frames = client.encrypt(&payload).unwrap();
+        let frames = client.encrypt(FrameClass::Control, &payload).unwrap();
         assert_eq!(frames.len(), 4);
         assert!(frames.iter().all(|f| f.len() <= MAX_NOISE_MESSAGE));
 
         for frame in &frames[..3] {
             assert!(host.decrypt(frame).unwrap().is_none());
         }
-        assert_eq!(host.decrypt(&frames[3]).unwrap().unwrap(), payload);
+        assert_eq!(host.decrypt(&frames[3]).unwrap().unwrap().1, payload);
     }
 
     #[test]
@@ -611,7 +698,7 @@ mod tests {
         let session = Uuid::new_v4();
         let (client, host) = pair("secret", session);
         let payload = vec![7u8; MAX_CHUNK * 2];
-        let frames = client.encrypt(&payload).unwrap();
+        let frames = client.encrypt(FrameClass::Control, &payload).unwrap();
         assert_eq!(frames.len(), 2);
         // Deliver only the final chunk: the counter no longer matches.
         assert!(host.decrypt(&frames[1]).is_err());
@@ -625,7 +712,7 @@ mod tests {
         // the receiver has decided is too large.
         host.limit_to(MAX_CHUNK * 2);
         let payload = vec![3u8; MAX_CHUNK * 3];
-        let frames = client.encrypt(&payload).unwrap();
+        let frames = client.encrypt(FrameClass::Control, &payload).unwrap();
 
         assert!(host.decrypt(&frames[0]).unwrap().is_none());
         assert!(host.decrypt(&frames[1]).unwrap().is_none());
@@ -670,12 +757,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_continuation_flag_is_refused() {
+    fn an_unknown_flag_bit_is_refused() {
         let session = Uuid::new_v4();
         let (client, host) = pair("secret", session);
         // Authentic, correctly framed, and still not something `encrypt` can
-        // ever produce.
-        let frame = client.encrypt_raw(2, b"body").unwrap();
+        // ever produce: only the class bit and the continuation bit are defined.
+        let frame = client.encrypt_raw(0b100, b"body").unwrap();
         assert!(host.decrypt(&frame).is_err());
         let guard = host.inner.lock().unwrap();
         assert!(guard.pending.is_empty());
@@ -687,7 +774,9 @@ mod tests {
         let session = Uuid::new_v4();
         let (client, host) = pair("secret", session);
         for _ in 0..(host.max_chunks() * 3) {
-            let frames = client.encrypt(b"a whole small message").unwrap();
+            let frames = client
+                .encrypt(FrameClass::Control, b"a whole small message")
+                .unwrap();
             assert_eq!(frames.len(), 1);
             assert!(host.decrypt(&frames[0]).unwrap().is_some());
         }
@@ -698,20 +787,27 @@ mod tests {
     fn an_empty_message_round_trips() {
         let session = Uuid::new_v4();
         let (client, host) = pair("secret", session);
-        let frames = client.encrypt(b"").unwrap();
+        let frames = client.encrypt(FrameClass::Control, b"").unwrap();
         assert_eq!(frames.len(), 1);
-        assert_eq!(host.decrypt(&frames[0]).unwrap().unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            host.decrypt(&frames[0]).unwrap().unwrap().1,
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
     fn both_directions_work_independently() {
         let session = Uuid::new_v4();
         let (client, host) = pair("secret", session);
-        let up = client.encrypt(b"client to host").unwrap();
-        let down = host.encrypt(b"host to client").unwrap();
-        assert_eq!(host.decrypt(&up[0]).unwrap().unwrap(), b"client to host");
+        let up = client
+            .encrypt(FrameClass::Control, b"client to host")
+            .unwrap();
+        let down = host
+            .encrypt(FrameClass::Control, b"host to client")
+            .unwrap();
+        assert_eq!(host.decrypt(&up[0]).unwrap().unwrap().1, b"client to host");
         assert_eq!(
-            client.decrypt(&down[0]).unwrap().unwrap(),
+            client.decrypt(&down[0]).unwrap().unwrap().1,
             b"host to client"
         );
     }
@@ -740,6 +836,79 @@ mod tests {
             .unwrap();
         assert!(first.len() <= MAX_HANDSHAKE_MESSAGE);
         assert!(reply.len() <= MAX_HANDSHAKE_MESSAGE);
+    }
+
+    #[test]
+    fn a_data_message_travels_on_its_own_plane() {
+        let session = Uuid::new_v4();
+        let (client, host) = pair("secret", session);
+        let payload = vec![0xABu8; MAX_DATA_MESSAGE];
+        let frames = client.encrypt(FrameClass::Data, &payload).unwrap();
+        // One Noise message, which is what bounds control latency.
+        assert_eq!(frames.len(), 1);
+        let (class, got) = host.decrypt(&frames[0]).unwrap().unwrap();
+        assert_eq!(class, FrameClass::Data);
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn a_data_message_that_would_need_two_frames_is_refused_by_the_sender() {
+        let session = Uuid::new_v4();
+        let (client, _host) = pair("secret", session);
+        let too_big = vec![0u8; MAX_DATA_MESSAGE + 1];
+        assert!(client.encrypt(FrameClass::Data, &too_big).is_err());
+    }
+
+    #[test]
+    fn the_two_planes_alternate_without_confusing_the_receiver() {
+        let session = Uuid::new_v4();
+        let (client, host) = pair("secret", session);
+        for i in 0..8u8 {
+            let control = format!("{{\"seq\":{i}}}");
+            let frames = client
+                .encrypt(FrameClass::Control, control.as_bytes())
+                .unwrap();
+            assert_eq!(
+                host.decrypt(&frames[0]).unwrap().unwrap(),
+                (FrameClass::Control, control.into_bytes())
+            );
+
+            let data = vec![i; 4096];
+            let frames = client.encrypt(FrameClass::Data, &data).unwrap();
+            assert_eq!(
+                host.decrypt(&frames[0]).unwrap().unwrap(),
+                (FrameClass::Data, data)
+            );
+        }
+    }
+
+    #[test]
+    fn a_data_frame_cannot_splice_itself_into_a_control_message() {
+        let session = Uuid::new_v4();
+        let (client, host) = pair("secret", session);
+        // Only `encrypt_raw` can produce this ordering; `encrypt` holds the
+        // transport state for a whole message and never emits it.
+        let opening = client
+            .encrypt_raw(CONTINUES, b"half a control message")
+            .unwrap();
+        let intruder = client
+            .encrypt_raw(1 << CLASS_SHIFT, b"a data payload")
+            .unwrap();
+        assert!(host.decrypt(&opening).unwrap().is_none());
+        assert!(host.decrypt(&intruder).is_err());
+        let guard = host.inner.lock().unwrap();
+        assert!(guard.pending.is_empty());
+        assert!(guard.pending_class.is_none());
+    }
+
+    #[test]
+    fn a_data_frame_claiming_a_continuation_is_refused() {
+        let session = Uuid::new_v4();
+        let (client, host) = pair("secret", session);
+        let frame = client
+            .encrypt_raw((1 << CLASS_SHIFT) | CONTINUES, b"body")
+            .unwrap();
+        assert!(host.decrypt(&frame).is_err());
     }
 
     #[test]

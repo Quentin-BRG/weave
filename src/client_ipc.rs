@@ -462,15 +462,12 @@ impl ClientEngine {
                     .materialized
                     .clone()
                     .or_else(|| state.confirmed.clone());
-                let scanned =
-                    scan::read_path(&self.paths.repo_root, &conflict.path, previous.as_ref())?;
-                match scanned {
-                    Some(scanned) => {
-                        self.blobs.put(&scanned.bytes)?;
-                        Ok(Some(scanned.entry))
-                    }
-                    None => Ok(None),
-                }
+                scan::read_path(
+                    &self.paths.repo_root,
+                    &conflict.path,
+                    previous.as_ref(),
+                    &self.blobs,
+                )
             }
         }
     }

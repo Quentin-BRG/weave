@@ -1902,8 +1902,8 @@ impl HostEngine {
         let manifest = self.store.manifest_at(prep.target_revision)?;
         let mut tree_entries: BTreeMap<RepoPath, (GitMode, String)> = BTreeMap::new();
         for (path, entry) in &manifest {
-            let bytes = self.blobs.get(&entry.blob_hash)?;
-            let oid = gitx::hash_object(&root, path, &bytes)?;
+            let source = self.blobs.path_of(&entry.blob_hash)?;
+            let oid = gitx::hash_object(&root, path, &source)?;
             tree_entries.insert(path.clone(), (entry.git_mode, oid));
         }
         let tree_oid = gitx::write_tree(&root, &self.paths.scratch(), &tree_entries)?;

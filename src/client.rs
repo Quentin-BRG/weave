@@ -280,15 +280,12 @@ impl ClientEngine {
     /// (specification section 11).
     pub fn seed_materialized_from_disk(&mut self) -> Result<()> {
         let previous = BTreeMap::new();
-        let result = scan::scan_repository(&self.paths.repo_root, &previous, true)?;
+        let result = scan::scan_repository(&self.paths.repo_root, &previous, &self.blobs)?;
         self.rejected_paths = result.rejected;
         for (path, entry) in result.entries {
             let mut state = self.store.path_state(&path)?;
             if state.materialized.is_some() || state.has_local_work() {
                 continue;
-            }
-            if let Some(bytes) = result.contents.get(&path) {
-                self.blobs.put(bytes)?;
             }
             state.materialized = Some(entry);
             self.store.put_path_state(&path, &state)?;
@@ -490,7 +487,7 @@ impl ClientEngine {
         }
         let root = self.paths.repo_root.clone();
         let previous = self.store.replica_manifest()?;
-        let result = scan::scan_repository(&root, &previous, false)?;
+        let result = scan::scan_repository(&root, &previous, &self.blobs)?;
         self.rejected_paths = result.rejected;
 
         let seen: HashSet<RepoPath> = result.entries.keys().cloned().collect();
@@ -543,8 +540,9 @@ impl ClientEngine {
             .materialized
             .clone()
             .or_else(|| state.confirmed.clone());
-        let scanned = scan::read_path(&self.paths.repo_root, path, previous.as_ref())?;
-        let entry = scanned.as_ref().map(|s| s.entry.clone());
+        // Reading the path also stores its content, so by the time the entry
+        // exists the blob it names is durable.
+        let entry = scan::read_path(&self.paths.repo_root, path, previous.as_ref(), &self.blobs)?;
 
         if FileEntry::same_as(entry.as_ref(), state.materialized.as_ref()) {
             return Ok(false);
@@ -553,9 +551,6 @@ impl ClientEngine {
             return Ok(false);
         }
 
-        if let Some(scanned) = &scanned {
-            self.blobs.put(&scanned.bytes)?;
-        }
         let seq = self.store.next_local_seq()?;
         let task_id = self.my_active_task().map(|t| t.id);
 
@@ -1089,8 +1084,13 @@ impl ClientEngine {
                     });
                     return Ok(());
                 }
-                let bytes = self.blobs.get(&entry.blob_hash)?;
-                scan::materialize_file(&self.paths.repo_root, path, &bytes, entry.git_mode)?;
+                scan::materialize_file(
+                    &self.paths.repo_root,
+                    path,
+                    &self.blobs,
+                    &entry.blob_hash,
+                    entry.git_mode,
+                )?;
                 state.materialized = Some(entry.clone());
             }
             None => {
@@ -1326,8 +1326,13 @@ impl ClientEngine {
         let mut state = self.store.path_state(path)?;
         match entry {
             Some(entry) => {
-                let bytes = self.blobs.get(&entry.blob_hash)?;
-                scan::materialize_file(&self.paths.repo_root, path, &bytes, entry.git_mode)?;
+                scan::materialize_file(
+                    &self.paths.repo_root,
+                    path,
+                    &self.blobs,
+                    &entry.blob_hash,
+                    entry.git_mode,
+                )?;
                 state.materialized = Some(entry.clone());
             }
             None => {
@@ -1403,8 +1408,13 @@ impl ClientEngine {
                     });
                     return Ok(());
                 }
-                let bytes = self.blobs.get(&entry.blob_hash)?;
-                scan::materialize_file(&self.paths.repo_root, path, &bytes, entry.git_mode)?;
+                scan::materialize_file(
+                    &self.paths.repo_root,
+                    path,
+                    &self.blobs,
+                    &entry.blob_hash,
+                    entry.git_mode,
+                )?;
                 state.materialized = Some(entry);
             }
             None => {

@@ -693,7 +693,7 @@ fn every_reconnect_performs_a_fresh_handshake_with_new_ephemeral_keys() {
 #[ignore = "measurement, not a pass/fail property; run with --ignored"]
 fn measure_the_cost_of_the_encrypted_transport() {
     use std::time::Instant;
-    use weave::secure::{derive_psk, Initiator, Responder};
+    use weave::secure::{derive_psk, FrameClass, Initiator, Responder};
 
     let session = uuid::Uuid::new_v4();
     let secret = "b".repeat(64);
@@ -734,7 +734,7 @@ fn measure_the_cost_of_the_encrypted_transport() {
     let rounds = 20_000;
     let start = Instant::now();
     for _ in 0..rounds {
-        let frames = client.encrypt(&small).unwrap();
+        let frames = client.encrypt(FrameClass::Control, &small).unwrap();
         host.decrypt(&frames[0]).unwrap().unwrap();
     }
     println!(
@@ -745,7 +745,7 @@ fn measure_the_cost_of_the_encrypted_transport() {
     // --- a maximal V1 payload ---
     let big = vec![7u8; 10 * 1024 * 1024];
     let start = Instant::now();
-    let frames = client.encrypt(&big).unwrap();
+    let frames = client.encrypt(FrameClass::Control, &big).unwrap();
     let encrypt = start.elapsed();
     let start = Instant::now();
     for frame in &frames[..frames.len() - 1] {
