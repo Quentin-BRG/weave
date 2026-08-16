@@ -284,7 +284,7 @@ fn invite_via(original: &str, url: String, secret: Option<String>) -> String {
     let payload = decode_invite(original).expect("decode invite");
     encode_invite(&InvitePayload {
         url,
-        secret: secret.unwrap_or(payload.secret),
+        secret: secret.map(Into::into).unwrap_or(payload.secret),
         ..payload
     })
     .expect("encode invite")

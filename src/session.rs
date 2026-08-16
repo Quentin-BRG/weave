@@ -16,6 +16,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// All Weave-owned locations for one repository.
 ///
@@ -196,7 +197,7 @@ pub enum TransportMode {
 pub struct SessionRecord {
     pub role: crate::model::Role,
     pub session: SessionInfo,
-    pub secret: String,
+    pub secret: SessionSecret,
     /// WebSocket endpoint. For a host this is the last published endpoint; for
     /// a participant it is the host endpoint to reconnect to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -318,6 +319,74 @@ impl Drop for DaemonLock {
 }
 
 // ---------------------------------------------------------------------------
+// The session secret
+// ---------------------------------------------------------------------------
+
+/// The 256-bit session secret, in the only container it is allowed to live in.
+///
+/// The secret is the root of trust for the whole session, so a plain `String`
+/// is the wrong home for it: dropping one frees the heap buffer without
+/// touching the bytes, which leaves the secret readable in whatever allocation
+/// reuses that memory, and its `Debug` prints the secret in full. This wrapper
+/// zeroizes on drop, redacts under `{:?}`, and derefs to `&str` so callers that
+/// legitimately need the characters — HKDF, serialization, the invite encoder —
+/// read it without ceremony.
+///
+/// It cannot make Weave forget a secret that has already been copied elsewhere:
+/// `serde_json` builds an ordinary `String` while parsing an invite, the OS may
+/// have paged either copy, and the invite itself sits in a file or a terminal
+/// scrollback. This closes the copies Weave owns, not the ones it does not.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionSecret(Zeroizing<String>);
+
+impl SessionSecret {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SessionSecret {
+    fn from(value: String) -> SessionSecret {
+        SessionSecret(Zeroizing::new(value))
+    }
+}
+
+impl From<&str> for SessionSecret {
+    fn from(value: &str) -> SessionSecret {
+        SessionSecret(Zeroizing::new(value.to_string()))
+    }
+}
+
+impl std::ops::Deref for SessionSecret {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Redacted on purpose. `SessionRecord` and `InvitePayload` both derive
+/// `Debug`, so without this a single `{:?}` anywhere would print the secret.
+impl std::fmt::Debug for SessionSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionSecret(<redacted>)")
+    }
+}
+
+impl Serialize for SessionSecret {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionSecret {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<SessionSecret, D::Error> {
+        Ok(SessionSecret::from(String::deserialize(d)?))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Invites (specification sections 56, 57)
 // ---------------------------------------------------------------------------
 
@@ -330,7 +399,7 @@ pub struct InvitePayload {
     #[serde(rename = "s")]
     pub session_id: Uuid,
     #[serde(rename = "k")]
-    pub secret: String,
+    pub secret: SessionSecret,
     #[serde(rename = "b")]
     pub base_commit: String,
     #[serde(rename = "r")]
@@ -384,8 +453,8 @@ pub fn decode_invite(text: &str) -> Result<InvitePayload> {
 }
 
 /// A 256-bit session secret from the OS CSPRNG (specification section 55).
-pub fn new_session_secret() -> String {
-    crate::util::random_hex(32)
+pub fn new_session_secret() -> SessionSecret {
+    SessionSecret::from(crate::util::random_hex(32))
 }
 
 /// A local IPC bearer token (specification section 172).
@@ -414,6 +483,43 @@ mod tests {
         assert_eq!(back.session_id, payload.session_id);
         assert_eq!(back.secret, payload.secret);
         assert_eq!(back.url, payload.url);
+    }
+
+    #[test]
+    fn a_session_secret_does_not_print_itself() {
+        let secret = SessionSecret::from("SENTINEL_SECRET_VALUE_9f2c");
+        let shown = format!("{secret:?}");
+        assert!(
+            !shown.contains("SENTINEL"),
+            "Debug leaked the secret: {shown}"
+        );
+
+        // A record printed whole must not leak it either — that is the shape
+        // that actually reaches a log line.
+        let record = SessionRecord {
+            role: crate::model::Role::Host,
+            session: crate::proto::SessionInfo {
+                session_id: Uuid::new_v4(),
+                repo_name: "investor-deck".into(),
+                branch: "main".into(),
+                base_commit: "8f21abc".into(),
+                host_actor_id: Uuid::new_v4(),
+                host_display_name: "ana".into(),
+                created_at_ms: 0,
+            },
+            secret: secret.clone(),
+            endpoint: None,
+            mode: TransportMode::Local,
+            created_at_ms: 0,
+        };
+        assert!(!format!("{record:?}").contains("SENTINEL"));
+
+        // Redaction must not have changed what goes on the wire or on disk.
+        assert_eq!(
+            serde_json::to_string(&secret).unwrap(),
+            "\"SENTINEL_SECRET_VALUE_9f2c\""
+        );
+        assert_eq!(secret.as_str(), "SENTINEL_SECRET_VALUE_9f2c");
     }
 
     #[test]

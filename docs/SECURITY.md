@@ -43,6 +43,29 @@ state machine of its own.
 
 The raw session secret is never sent over the network, in any mode, at any point.
 
+### Audit status of the cryptographic dependencies
+
+**`snow` 0.10.0 — the Noise implementation Weave depends on — has not received a
+formal, published third-party security audit.** This is stated plainly because it
+is the single largest unreviewed component in Weave's security story, and no
+amount of "standard protocol, standard crate" changes that.
+
+What is true alongside it: `snow` is a widely deployed implementation of a
+publicly specified protocol (Noise revision 34), and it does not implement the
+primitives itself. Those come from crates with their own review histories —
+`curve25519-dalek` 4.1.3, `chacha20poly1305` 0.10.1 and `blake2` 0.10.6 from the
+RustCrypto project. The key derivation uses `hkdf` 0.12.4 over `sha2` 0.10.9.
+Weave adds no primitives and no handshake state machine of its own, so the
+unaudited surface is `snow`'s state machine and framing, not the mathematics
+underneath it.
+
+The custom part Weave *does* own — chunking application messages across Noise
+messages, and the reassembly bounds on the receiving side — is described in
+[docs/PROTOCOL.md](PROTOCOL.md) and is deliberately small: a one-byte
+continuation flag carried inside the ciphertext, and two hard limits on
+reassembly (total bytes and chunk count). It has not been externally audited
+either.
+
 ### What this means against Cloudflare
 
 Remote sessions use a **Cloudflare Quick Tunnel**: HTTPS and WebSocket traffic
@@ -160,9 +183,18 @@ wrapped in Noise; loopback plus the token plus the file permissions is the bound
 there.
 
 The derived Noise pre-shared key and the per-connection transport keys exist only in
-memory. The PSK is held in a `Zeroizing` buffer, the daemon drops its copy of the
-session secret string once the PSK is derived, and transport keys live inside the
-`snow` state for the lifetime of one connection.
+memory. The PSK is held in a `Zeroizing` buffer, the session secret is a
+`SessionSecret` newtype over `Zeroizing<String>` so that dropping it wipes the
+bytes instead of merely freeing them, and transport keys live inside the `snow`
+state for the lifetime of one connection.
+
+The honest limit of that: zeroization only covers the copies Weave controls.
+`serde_json` builds an ordinary `String` while parsing an invite or
+`session.json`, the operating system may have paged any copy to disk before it
+was wiped, and the invite itself sits in a file, a clipboard, or terminal
+scrollback. Zeroizing narrows the window in which a secret is recoverable from
+process memory; it does not close it, and it is not a substitute for ending the
+session when it is over.
 
 None of it is ever logged. Not the session secret, not the derived PSK, not the
 transport keys, not the IPC token, not the full invite, and not decrypted payloads.

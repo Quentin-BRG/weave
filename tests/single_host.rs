@@ -10,6 +10,107 @@ mod common;
 use common::*;
 use std::time::Duration;
 
+/// An engine's periodic duties — the Git guard, the safety rescan, the outbox
+/// retry, presence, heartbeats — used to run only when its input channel went
+/// idle for the tick interval. A caller polling `weave status` in a loop keeps
+/// the channel permanently non-empty and used to starve every one of them, for
+/// as long as it kept polling. Measured before the fix: zero ticks in eight
+/// seconds of continuous polling, against five per two seconds when idle.
+///
+/// Presence is the observable here because the participant engine emits it from
+/// its own tick, so the host's `last_seen_ms` for this participant stops
+/// advancing exactly when that engine stops ticking.
+#[test]
+fn periodic_work_continues_while_status_is_polled_continuously() {
+    let sandbox = Sandbox::new("tickstarve");
+    let mut host = Participant::new(&sandbox, "alpha");
+    init_repo(&host.repo, "Quentin", "quentin@example.com");
+
+    host.start_daemon(&["host", "--local"]);
+    host.wait_online(LONG);
+
+    let first_seen = |v: &serde_json::Value| -> i64 {
+        v["participants"][0]["last_seen_ms"].as_i64().unwrap_or(0)
+    };
+    let before = first_seen(&host.status());
+    assert!(before > 0, "expected a presence timestamp to start from");
+
+    // Several pollers with no sleep between calls: one is not enough, because
+    // process startup leaves gaps long enough for an idle-derived tick to slip
+    // through.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let noise: Vec<_> = (0..4)
+        .map(|_| {
+            let stop = stop.clone();
+            let repo = host.repo.clone();
+            let home = host.home.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = weave_command(&repo, &home).args(["status"]).output();
+                }
+            })
+        })
+        .collect();
+
+    // Comfortably longer than the presence interval, so a healthy engine sends
+    // at least one while the polling is happening.
+    std::thread::sleep(Duration::from_secs(20));
+
+    let during = host.status();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for t in noise {
+        let _ = t.join();
+    }
+    host.stop_daemon();
+
+    let after = first_seen(&during);
+    assert!(
+        after > before,
+        "the participant engine stopped its periodic work while status was \
+         polled continuously: last_seen_ms stayed at {before}\nstatus: {}",
+        serde_json::to_string_pretty(&during).unwrap_or_default()
+    );
+}
+
+/// The Git guard confirms a problem on a second check before pausing, because
+/// publishing moves HEAD and then the index in two separate commands and a
+/// single observation can catch Weave mid-write. Confirmation must not turn
+/// into "never pauses": a change a user really made stays, and must still stop
+/// the session.
+#[test]
+fn staging_a_change_by_hand_still_pauses_the_session() {
+    let sandbox = Sandbox::new("gitguard");
+    let mut host = Participant::new(&sandbox, "alpha");
+    init_repo(&host.repo, "Quentin", "quentin@example.com");
+
+    host.start_daemon(&["host", "--local"]);
+    host.wait_online(LONG);
+
+    write_file(
+        &host.repo,
+        "staged-by-hand.md",
+        "Weave does not own this.\n",
+    );
+    git(&host.repo, &["add", "staged-by-hand.md"]);
+
+    let status = host.wait_for_status("Weave to notice the staged change", LONG, |v| {
+        v["sync_state"]["state"] == "paused"
+    });
+    let reason = status["sync_state"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("index"),
+        "the pause should name the Git index: {reason}"
+    );
+
+    // Undoing it lets the session resume on its own.
+    git(&host.repo, &["reset"]);
+    host.wait_for_status("Weave to resume", LONG, |v| {
+        v["sync_state"]["state"] == "live"
+    });
+
+    host.stop_daemon();
+}
+
 #[test]
 fn host_captures_edits_and_publishes_a_historical_revision() {
     let sandbox = Sandbox::new("single");

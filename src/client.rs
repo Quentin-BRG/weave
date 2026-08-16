@@ -28,7 +28,7 @@ use crate::transport::Outbound;
 use crate::watch::WatchEvent;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[path = "client_ipc.rs"]
@@ -118,6 +118,8 @@ pub struct ClientEngine {
     last_retry_ms: i64,
     heartbeat_nonce: u64,
 
+    /// A Git-guard problem seen once and awaiting confirmation.
+    git_problem_pending: bool,
     /// Set when materialization is waiting for blobs from the host.
     materialization_blocked: bool,
     shutdown: bool,
@@ -169,6 +171,7 @@ impl ClientEngine {
             last_git_check_ms: 0,
             last_retry_ms: 0,
             heartbeat_nonce: 0,
+            git_problem_pending: false,
             materialization_blocked: false,
             shutdown: false,
         }
@@ -190,11 +193,28 @@ impl ClientEngine {
         if let Err(e) = self.rebuild_op_index() {
             tracing::error!("client: {}", e.message);
         }
+        // Ticks are scheduled against the clock, not against an idle input
+        // channel. Deriving them from `recv_timeout` expiring means a caller
+        // polling `weave status` faster than TICK_MS keeps the channel
+        // permanently non-empty and starves every timed duty — the Git guard,
+        // the safety rescan, the outbox retry, presence and heartbeats — for as
+        // long as it keeps polling.
+        let tick = Duration::from_millis(TICK_MS);
+        let mut next_tick = Instant::now() + tick;
         loop {
-            let input = match rx.recv_timeout(Duration::from_millis(TICK_MS)) {
-                Ok(v) => v,
-                Err(RecvTimeoutError::Timeout) => ClientInput::Tick,
-                Err(RecvTimeoutError::Disconnected) => return,
+            let now = Instant::now();
+            let input = if now >= next_tick {
+                next_tick = now + tick;
+                ClientInput::Tick
+            } else {
+                match rx.recv_timeout(next_tick - now) {
+                    Ok(v) => v,
+                    Err(RecvTimeoutError::Timeout) => {
+                        next_tick = Instant::now() + tick;
+                        ClientInput::Tick
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
             };
             if let ClientInput::Shutdown = input {
                 return;
@@ -405,14 +425,28 @@ impl ClientEngine {
             None
         };
 
+        // A publication moves HEAD and then the index, in two separate Git
+        // commands, and the host engine does the same on its own thread against
+        // the same repository. Between those two commands the repository really
+        // does look like someone staged something — so a single observation is
+        // not evidence of an external change, it may just be Weave mid-write.
+        // Only a problem still present on the following check is treated as
+        // real: a `git commit` a user ran stays, a publication window does not.
         match (problem, &self.local_state) {
             (Some((reason, detail)), SyncState::Live) => {
-                self.local_state = SyncState::Paused { reason, detail };
+                if self.git_problem_pending {
+                    self.git_problem_pending = false;
+                    self.local_state = SyncState::Paused { reason, detail };
+                } else {
+                    self.git_problem_pending = true;
+                }
             }
             (None, SyncState::Paused { .. }) => {
+                self.git_problem_pending = false;
                 self.local_state = SyncState::Live;
                 self.full_rescan()?;
             }
+            (None, _) => self.git_problem_pending = false,
             _ => {}
         }
         Ok(())

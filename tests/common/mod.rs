@@ -18,6 +18,18 @@ pub fn weave_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_weave"))
 }
 
+/// A `weave` invocation against one participant's repository and identity.
+/// Exposed separately from `Participant` so a test can drive the daemon from
+/// threads without holding a borrow on the participant.
+pub fn weave_command(repo: &Path, home: &Path) -> Command {
+    let mut cmd = Command::new(weave_bin());
+    cmd.env("WEAVE_HOME", home);
+    cmd.env("WEAVE_LAN_ADDRESS", "127.0.0.1");
+    cmd.env("WEAVE_LOG", "weave=info");
+    cmd.arg("--repo").arg(repo);
+    cmd
+}
+
 pub struct Sandbox {
     pub root: PathBuf,
 }
@@ -143,12 +155,7 @@ impl Participant {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(weave_bin());
-        cmd.env("WEAVE_HOME", &self.home);
-        cmd.env("WEAVE_LAN_ADDRESS", "127.0.0.1");
-        cmd.env("WEAVE_LOG", "weave=info");
-        cmd.arg("--repo").arg(&self.repo);
-        cmd
+        weave_command(&self.repo, &self.home)
     }
 
     /// Run a short-lived Weave command and return its stdout.

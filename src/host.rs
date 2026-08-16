@@ -20,12 +20,14 @@ use crate::store_host::{validate_base, ActorRecord, HostStore};
 use crate::transport::Outbound;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// How long the host waits for every connected participant to complete a
 /// commit-preparation barrier before proceeding with a warning.
 const BARRIER_TIMEOUT_MS: i64 = 20_000;
+/// Engine wake-up interval for periodic duties.
+const TICK_MS: u64 = 400;
 /// Replaying more than this many revisions is slower than sending a snapshot.
 const MAX_REPLAY: u64 = 5_000;
 /// Approximate byte budget for one `Blobs` response.
@@ -103,6 +105,8 @@ pub struct HostEngine {
     deferred_ops: Vec<(u64, FileOperation)>,
     state: SyncState,
     last_git_check_ms: i64,
+    /// A Git-guard problem seen once and awaiting confirmation.
+    git_problem_pending: bool,
     expected_head: String,
     branch: String,
     host_git_name: String,
@@ -134,6 +138,7 @@ impl HostEngine {
             deferred_ops: Vec::new(),
             state: SyncState::Live,
             last_git_check_ms: 0,
+            git_problem_pending: false,
             expected_head,
             branch,
             host_git_name,
@@ -153,11 +158,26 @@ impl HostEngine {
     }
 
     fn run(&mut self, rx: Receiver<HostInput>) {
+        // Scheduled against the clock rather than against an idle input
+        // channel: a busy session must not be able to starve the timed duties
+        // (the Git guard, presence, barrier progress) simply by keeping the
+        // channel non-empty. See the same note in `ClientEngine::run`.
+        let tick = Duration::from_millis(TICK_MS);
+        let mut next_tick = Instant::now() + tick;
         loop {
-            let input = match rx.recv_timeout(Duration::from_millis(400)) {
-                Ok(v) => v,
-                Err(RecvTimeoutError::Timeout) => HostInput::Tick,
-                Err(RecvTimeoutError::Disconnected) => return,
+            let now = Instant::now();
+            let input = if now >= next_tick {
+                next_tick = now + tick;
+                HostInput::Tick
+            } else {
+                match rx.recv_timeout(next_tick - now) {
+                    Ok(v) => v,
+                    Err(RecvTimeoutError::Timeout) => {
+                        next_tick = Instant::now() + tick;
+                        HostInput::Tick
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
             };
             match input {
                 HostInput::Shutdown => {
@@ -278,20 +298,31 @@ impl HostEngine {
             None
         };
 
+        // Confirmed on the following check rather than acted on immediately.
+        // Publishing moves HEAD and the index in two separate Git commands, and
+        // the host's own participant engine does the same on another thread
+        // against this repository, so one observation can catch Weave mid-write
+        // and read it as an external change. See `ClientEngine::check_git_state`.
         match (problem, &self.state) {
             (Some((reason, detail)), SyncState::Live) => {
-                self.state = SyncState::Paused { reason, detail };
-                let state = self.state.clone();
-                self.broadcast(HostMessage::HostState { state });
+                if self.git_problem_pending {
+                    self.git_problem_pending = false;
+                    self.state = SyncState::Paused { reason, detail };
+                    let state = self.state.clone();
+                    self.broadcast(HostMessage::HostState { state });
+                } else {
+                    self.git_problem_pending = true;
+                }
             }
             (Some(_), _) => {}
             (None, SyncState::Paused { .. }) => {
+                self.git_problem_pending = false;
                 self.state = SyncState::Live;
                 let state = self.state.clone();
                 self.broadcast(HostMessage::HostState { state });
                 tracing::info!("host resumed: expected Git state restored");
             }
-            (None, _) => {}
+            (None, _) => self.git_problem_pending = false,
         }
         Ok(())
     }

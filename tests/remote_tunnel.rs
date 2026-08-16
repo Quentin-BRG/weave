@@ -161,7 +161,7 @@ fn a_full_session_runs_over_a_real_cloudflare_quick_tunnel() {
 
         let genuine = decode_invite(invite["invite"].as_str().unwrap()).unwrap();
         let forged = encode_invite(&InvitePayload {
-            secret: "f".repeat(64),
+            secret: "f".repeat(64).into(),
             ..genuine
         })
         .unwrap();

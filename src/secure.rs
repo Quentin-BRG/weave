@@ -15,6 +15,12 @@
 //! key exchange, key derivation, AEAD, nonce counters, transcript hashing and
 //! transport keys. This module is the framing and lifecycle around it.
 //!
+//! `snow` 0.10.0 has not received a formal, published third-party security
+//! audit. It is a widely used implementation of a specified protocol, and its
+//! primitives come from separately reviewed crates (`curve25519-dalek`,
+//! `chacha20poly1305`, `blake2`), but "no audit" is the accurate statement and
+//! is documented in `docs/SECURITY.md` rather than glossed over here.
+//!
 //! What is deliberately *not* attempted: hiding traffic metadata. Sizes, timing
 //! and volume stay observable, and no padding or traffic shaping is added.
 
@@ -257,6 +263,11 @@ struct Inner {
     state: TransportState,
     /// Chunks of a partially received application message.
     pending: Vec<u8>,
+    /// Chunks accumulated into `pending`. Bounded alongside the byte count so a
+    /// peer cannot stream continuation frames forever without ever finishing a
+    /// message: the byte bound alone does not stop an endless run of chunks
+    /// that carry no payload.
+    chunks: usize,
 }
 
 /// An established Noise session.
@@ -280,9 +291,19 @@ impl SecureChannel {
             inner: Mutex::new(Inner {
                 state,
                 pending: Vec::new(),
+                chunks: 0,
             }),
             max_message: crate::model::MAX_PROTOCOL_MESSAGE,
         }
+    }
+
+    /// Most chunks a single application message may be split into.
+    ///
+    /// Exactly what a maximum-size message needs, plus one for the terminating
+    /// chunk when the payload divides evenly. Anything beyond that is a peer
+    /// sending chunks that cannot belong to a legal message.
+    fn max_chunks(&self) -> usize {
+        self.max_message.div_ceil(MAX_CHUNK) + 1
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>> {
@@ -300,6 +321,12 @@ impl SecureChannel {
     /// travels *inside* the ciphertext, so an intermediary cannot forge, drop
     /// or reorder a chunk — Noise's per-direction counter makes any such edit
     /// fail authentication on the next frame.
+    ///
+    /// The lock is held for the whole message rather than per chunk, and that is
+    /// a correctness requirement, not convenience. Two concurrent calls that
+    /// each took the lock per chunk would interleave validly encrypted chunks
+    /// from different messages; the peer would authenticate every frame and
+    /// reassemble the mixture into one corrupt message.
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<Vec<u8>>> {
         if plaintext.len() > self.max_message {
             return Err(protocol("Weave message is too large to send."));
@@ -354,25 +381,72 @@ impl SecureChannel {
         let flag = out[0];
         let body = &out[FLAG..n];
 
-        if guard.pending.len() + body.len() > self.max_message {
-            guard.pending.clear();
+        // An authenticated peer is still only a peer holding the session
+        // secret, so reassembly is bounded on both axes before anything is
+        // appended. Bytes: a message can never grow past the protocol limit.
+        // Chunks: without this, a peer could stream empty continuation frames
+        // indefinitely — each one authentic, none of them growing `pending`,
+        // the message never completing.
+        let max_chunks = self.max_chunks();
+        let guard = &mut *guard;
+        if guard.pending.len() + body.len() > self.max_message || guard.chunks >= max_chunks {
+            guard.reset_reassembly();
             return Err(protocol("Weave message exceeded the protocol size limit."));
         }
+        // Reserve exactly, so the buffer's capacity is bounded by the protocol
+        // limit too. `extend_from_slice` alone grows geometrically and would let
+        // a maximum-size message transiently hold roughly twice that in memory.
+        guard.pending.reserve_exact(body.len());
         guard.pending.extend_from_slice(body);
+        guard.chunks += 1;
 
         match flag {
-            FINAL => Ok(Some(std::mem::take(&mut guard.pending))),
+            FINAL => {
+                guard.chunks = 0;
+                Ok(Some(std::mem::take(&mut guard.pending)))
+            }
             CONTINUES => Ok(None),
             _ => {
-                guard.pending.clear();
+                guard.reset_reassembly();
                 Err(frame_rejected())
             }
         }
     }
 
-    /// Messages sent so far on this channel. Diagnostics only; never a secret.
-    pub fn sent(&self) -> u64 {
-        self.lock().map(|g| g.state.sending_nonce()).unwrap_or(0)
+    /// Shrink the reassembly limit. Test-only: the real limit is the protocol
+    /// message size, and exercising it directly would mean moving tens of
+    /// megabytes through the AEAD in a unit test.
+    #[cfg(test)]
+    fn limit_to(&mut self, max_message: usize) {
+        self.max_message = max_message;
+    }
+
+    /// Encrypt one chunk with a caller-chosen continuation flag, bypassing the
+    /// chunking loop. Test-only: it is the only way to produce the frames a
+    /// hostile peer would send — bad flag bytes, endless continuations — which
+    /// `encrypt` will never emit.
+    #[cfg(test)]
+    fn encrypt_raw(&self, flag: u8, body: &[u8]) -> Result<Vec<u8>> {
+        let mut guard = self.lock()?;
+        let mut framed = Vec::with_capacity(body.len() + FLAG);
+        framed.push(flag);
+        framed.extend_from_slice(body);
+        let mut out = vec![0u8; framed.len() + TAG];
+        let n = guard
+            .state
+            .write_message(&framed, &mut out)
+            .map_err(|_| protocol("Could not encrypt a Weave message."))?;
+        out.truncate(n);
+        Ok(out)
+    }
+}
+
+impl Inner {
+    /// Drop a partial message and its accounting together, so the two can never
+    /// disagree about how much has been accumulated.
+    fn reset_reassembly(&mut self) {
+        self.pending = Vec::new();
+        self.chunks = 0;
     }
 }
 
@@ -541,6 +615,83 @@ mod tests {
         assert_eq!(frames.len(), 2);
         // Deliver only the final chunk: the counter no longer matches.
         assert!(host.decrypt(&frames[1]).is_err());
+    }
+
+    #[test]
+    fn reassembly_stops_at_the_size_limit_instead_of_growing() {
+        let session = Uuid::new_v4();
+        let (client, mut host) = pair("secret", session);
+        // The sender keeps the real limit so it will happily produce a message
+        // the receiver has decided is too large.
+        host.limit_to(MAX_CHUNK * 2);
+        let payload = vec![3u8; MAX_CHUNK * 3];
+        let frames = client.encrypt(&payload).unwrap();
+
+        assert!(host.decrypt(&frames[0]).unwrap().is_none());
+        assert!(host.decrypt(&frames[1]).unwrap().is_none());
+        {
+            let guard = host.inner.lock().unwrap();
+            assert_eq!(guard.pending.len(), MAX_CHUNK * 2);
+            // Reserved exactly, so the buffer never overshoots the limit it is
+            // being held to.
+            assert!(guard.pending.capacity() <= MAX_CHUNK * 2);
+        }
+
+        assert!(host.decrypt(&frames[2]).is_err());
+        let guard = host.inner.lock().unwrap();
+        assert!(guard.pending.is_empty());
+        assert_eq!(guard.chunks, 0);
+    }
+
+    #[test]
+    fn an_endless_run_of_continuation_chunks_is_refused() {
+        let session = Uuid::new_v4();
+        let (client, mut host) = pair("secret", session);
+        host.limit_to(MAX_CHUNK * 2);
+        let limit = host.max_chunks();
+
+        // Empty continuation chunks never grow `pending`, so only the chunk
+        // bound can stop them.
+        for _ in 0..limit {
+            let frame = client.encrypt_raw(CONTINUES, b"").unwrap();
+            assert!(host.decrypt(&frame).unwrap().is_none());
+        }
+        let frame = client.encrypt_raw(CONTINUES, b"").unwrap();
+        assert!(host.decrypt(&frame).is_err());
+        assert_eq!(host.inner.lock().unwrap().chunks, 0);
+    }
+
+    #[test]
+    fn the_chunk_bound_still_admits_a_maximum_size_message() {
+        let session = Uuid::new_v4();
+        let (_client, host) = pair("secret", session);
+        let needed = crate::model::MAX_PROTOCOL_MESSAGE.div_ceil(MAX_CHUNK);
+        assert!(needed <= host.max_chunks());
+    }
+
+    #[test]
+    fn an_unknown_continuation_flag_is_refused() {
+        let session = Uuid::new_v4();
+        let (client, host) = pair("secret", session);
+        // Authentic, correctly framed, and still not something `encrypt` can
+        // ever produce.
+        let frame = client.encrypt_raw(2, b"body").unwrap();
+        assert!(host.decrypt(&frame).is_err());
+        let guard = host.inner.lock().unwrap();
+        assert!(guard.pending.is_empty());
+        assert_eq!(guard.chunks, 0);
+    }
+
+    #[test]
+    fn a_completed_message_resets_the_chunk_count() {
+        let session = Uuid::new_v4();
+        let (client, host) = pair("secret", session);
+        for _ in 0..(host.max_chunks() * 3) {
+            let frames = client.encrypt(b"a whole small message").unwrap();
+            assert_eq!(frames.len(), 1);
+            assert!(host.decrypt(&frames[0]).unwrap().is_some());
+        }
+        assert_eq!(host.inner.lock().unwrap().chunks, 0);
     }
 
     #[test]

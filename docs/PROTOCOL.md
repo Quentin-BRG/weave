@@ -100,6 +100,15 @@ implicit rather than transmitted. A dropped, reordered, duplicated, truncated or
 forged frame therefore fails authentication instead of silently truncating or
 reassembling a message.
 
+Reassembly is bounded on two axes, checked before any chunk is appended. **Bytes:**
+the running total may never exceed the protocol message limit, and the buffer is
+reserved exactly so its capacity is bounded by that limit too. **Chunks:** a message
+may span at most as many chunks as a maximum-size message needs, plus one. The chunk
+bound exists because the byte bound alone does not stop a peer from streaming
+empty continuation chunks forever — each authentic, none of them growing the buffer,
+the message never completing. Exceeding either bound discards the partial message and
+fails the connection; a peer holding the session secret is still only a peer.
+
 Every reconnection — including one caused by a tunnel restart — performs a complete
 fresh handshake with new ephemeral keys and fresh transport keys. Nonce counters and
 partially reassembled messages are never carried across connections.
