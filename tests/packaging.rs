@@ -137,6 +137,33 @@ fn the_release_asset_names_are_the_ones_the_readme_links_to() {
     }
 }
 
+/// Every packaging format has its own idea of a legal version string, and a
+/// prerelease is where they disagree. Debian wants `0.1.0~rc.1`; the Win32
+/// VERSIONINFO resource Inno writes is four numbers and rejects `0.1.0-rc.1`
+/// outright, aborting the compile. Both build scripts derive what their format
+/// needs, and a release candidate is exactly when a regression here would be
+/// discovered by a failed tag rather than by a test.
+#[test]
+fn every_packaging_format_can_express_a_prerelease_version() {
+    let iss = read(&repo_root().join("packaging/windows/weave.iss"));
+    assert!(
+        iss.contains("VersionInfoVersion={#AppFileVersion}"),
+        "weave.iss feeds a raw semver string to Inno's numeric version resource"
+    );
+
+    let ps1 = read(&repo_root().join("packaging/windows/build.ps1"));
+    assert!(
+        ps1.contains("/DAppFileVersion=$fileVersion"),
+        "build.ps1 no longer passes a numeric file version to ISCC"
+    );
+
+    let deb = read(&repo_root().join("packaging/linux/build-deb.sh"));
+    assert!(
+        deb.contains(r#"deb_version="${version//-/\~}""#),
+        "build-deb.sh no longer converts a prerelease to Debian's `~` form"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The installed layout
 // ---------------------------------------------------------------------------

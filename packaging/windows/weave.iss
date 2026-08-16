@@ -22,11 +22,17 @@
 ; secret is required to build it. SmartScreen will warn until the download earns
 ; reputation; see the README.
 ;
-; Built by packaging/windows/build.ps1, which passes AppVersion, StageDir,
-; RepoDir and OutputDir.
+; Built by packaging/windows/build.ps1, which passes AppVersion,
+; AppFileVersion, StageDir, RepoDir and OutputDir.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
+#endif
+; The Win32 VERSIONINFO resource is four numbers; a semver prerelease such as
+; `0.1.0-rc.1` is not a legal value and aborts the compile. build.ps1 derives
+; the numeric part, and only this field uses it.
+#ifndef AppFileVersion
+  #define AppFileVersion "0.0.0"
 #endif
 #ifndef StageDir
   #define StageDir "stage"
@@ -49,7 +55,8 @@ AppPublisher=Weave
 AppPublisherURL=https://github.com/Quentin-BRG/weave
 AppSupportURL=https://github.com/Quentin-BRG/weave/issues
 AppUpdatesURL=https://github.com/Quentin-BRG/weave/releases
-VersionInfoVersion={#AppVersion}
+VersionInfoVersion={#AppFileVersion}
+VersionInfoTextVersion={#AppVersion}
 
 ; Per-user installation: no UAC prompt, no administrator, no elevation dialog
 ; on a locked-down machine.

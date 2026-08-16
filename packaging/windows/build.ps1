@@ -25,7 +25,18 @@ $OutputDir = (Resolve-Path $OutputDir).Path
 $version = (Select-String -Path (Join-Path $Repo 'Cargo.toml') -Pattern '^version = "(.*)"' |
     Select-Object -First 1).Matches[0].Groups[1].Value
 if (-not $version) { throw 'could not read the Weave version from Cargo.toml' }
-Write-Output "build.ps1: packaging Weave $version"
+
+# Inno's VersionInfoVersion writes the Win32 VERSIONINFO resource, which is four
+# 16-bit numbers and nothing else: ISCC rejects `0.1.0-rc.1` outright and the
+# compile aborts. Strip the semver prerelease and build metadata for that field
+# only. `AppVersion` — what the user sees in the wizard and in Installed apps —
+# keeps the full string, so the RC is never disguised as the final release.
+# packaging/linux/build-deb.sh does the same thing for Debian's `~` convention.
+$fileVersion = ($version -split '[-+]')[0]
+if ($fileVersion -notmatch '^\d+(\.\d+){0,3}$') {
+    throw "cannot derive a numeric Windows file version from '$version'"
+}
+Write-Output "build.ps1: packaging Weave $version (file version $fileVersion)"
 
 # ---------------------------------------------------------------------------
 # Stage
@@ -139,6 +150,7 @@ a per-user install is enough and requires no administrator rights.
 
     & $isccPath `
         "/DAppVersion=$version" `
+        "/DAppFileVersion=$fileVersion" `
         "/DStageDir=$stage" `
         "/DRepoDir=$Repo" `
         "/DOutputDir=$OutputDir" `
