@@ -179,54 +179,21 @@ Read-only Git stays available and useful: `git status`, `git diff`, `git log`,
 
 ## Agents
 
-Weave ships a plugin containing four skills and **no MCP server**, plus a
-repo-local marketplace so the plugin is discoverable straight from a checkout:
+The agent skills for Weave live in their own repository:
 
-```
-.agents/plugins/
-├── marketplace.json
-└── weave/
-    ├── .codex-plugin/plugin.json
-    └── skills/
-        ├── weave-collaboration/    SKILL.md + agents/openai.yaml
-        ├── weave-task/             SKILL.md + agents/openai.yaml
-        ├── weave-conflict/         SKILL.md + agents/openai.yaml
-        └── weave-commit/           SKILL.md + agents/openai.yaml
-```
+### **https://github.com/Quentin-BRG/weave-plugin**
 
-The CLI is the protocol surface; the skills teach an agent when and how to use it.
+It ships four provider-neutral skills — collaboration, Tasks, conflicts, Git
+publication — as a portable
+[Agent Plugins v1.0.0](https://agent-plugins.org/specification) package, with a
+Codex packaging and marketplace layer wrapped around the same skills. There is **no
+MCP server**; the CLI in this repository is the entire protocol surface.
 
-**The skills are provider-neutral.** Each `SKILL.md` is a plain skill document —
-`name` and `description` frontmatter, then instructions — so the same four skills
-work unchanged in Codex, in Claude Code, or in any agent that reads the open skill
-format. Nothing in them names a vendor, and nothing in the Weave core depends on
-one: any agent that can run a shell command can participate. The
-`.codex-plugin/plugin.json` manifest and the optional `agents/openai.yaml` sidecars
-carry Codex packaging and presentation metadata only; other agents ignore them and
-lose nothing.
+They are kept separate because they version and install on their own schedule: the
+plugin is instructions about a CLI, this repository is the CLI.
 
-Install it in Codex by registering the repository's marketplace, then installing
-`weave` from the plugins directory:
-
-```bash
-codex plugin marketplace add Quentin-BRG/weave
-# or, from a local checkout:
-codex plugin marketplace add .
-```
-
-A repository-scoped marketplace is not picked up automatically — it has to be added
-once, deliberately.
-
-To reuse the same skills in Claude Code, point it at the skill directories:
-
-```bash
-cp -r .agents/plugins/weave/skills/* .claude/skills/    # this project only
-cp -r .agents/plugins/weave/skills/* ~/.claude/skills/  # everywhere
-```
-
-No edits are needed; the `SKILL.md` files are the whole contract.
-
-For a permanent, agent-independent activation hook, write the managed block into the
+For a permanent, agent-independent activation hook that needs no plugin at all,
+write the managed block into the
 repository's `AGENTS.md`:
 
 ```bash

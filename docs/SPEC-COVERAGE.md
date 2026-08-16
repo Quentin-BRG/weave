@@ -74,7 +74,7 @@ numbers are the specification's.
 | 116 | Disconnected participants warning | `src/host.rs::build_preparation` |
 | 117–119 | Active Task rule, unassigned edits | `src/host.rs::build_preparation` |
 | 120–121 | Prepare object and `--json` | `src/model.rs::CommitPreparation`, `PreparedTask` |
-| 122–124 | Semantic message, `commit create`, who may request | `src/cli.rs`, `.agents/plugins/weave/skills/weave-commit` |
+| 122–124 | Semantic message, `commit create`, who may request | `src/cli.rs`; skill in [weave-plugin](https://github.com/Quentin-BRG/weave-plugin) |
 | 125–128 | Host-only Git construction, plumbing | `src/host.rs::create_commit`, `src/gitx.rs` |
 | 129–130 | Commit descriptor, author and co-authors | `src/model.rs::CommitDescriptor`, `src/host.rs::coauthor_trailers` |
 | 131–132 | Object propagation and verification | `src/gitx.rs::pack_objects`/`unpack_objects`, `src/client.rs::apply_publication` |
@@ -86,9 +86,9 @@ numbers are the specification's.
 | 144–146 | Disk-full, missing blob, `weave recover` | `src/host.rs`, `src/blobs.rs`, `src/recover.rs` |
 | 147–150 | Participant recovery, disconnect, host absence | `src/client.rs`, `src/daemon.rs::client_connection_loop` |
 | 151–157 | CLI surface, JSON, `status`, `peers`, `doctor`, errors | `src/cli.rs`, `src/doctor.rs`, `src/error.rs` |
-| 158–160 | Codex plugin and skills, no MCP | `.agents/plugins/weave/`, `.agents/plugins/marketplace.json`; enforced by `tests/plugin_manifest.rs` |
+| 158–160 | Plugin and skills, no MCP | [weave-plugin](https://github.com/Quentin-BRG/weave-plugin): portable Agent Plugins v1.0.0 package plus a Codex compatibility layer, each validated independently there |
 | 161–163 | `AGENTS.md` bootstrap | `src/bootstrap.rs` |
-| 164–169 | Skill contents | `.agents/plugins/weave/skills/*/SKILL.md`; the raw Git prohibition (§165) and the host-only commit rule (§169) are asserted by `tests/plugin_manifest.rs` |
+| 164–169 | Skill contents | [weave-plugin](https://github.com/Quentin-BRG/weave-plugin) `skills/*/SKILL.md`; the raw Git prohibition (§165) and the host-only commit rule (§169) are asserted by its validators |
 | 170 | Agent-independent design | CLI is the only integration surface |
 | 171–174 | Security model, secrets, transport, logging | `docs/SECURITY.md`, `src/session.rs`, `src/util.rs` |
 | 175–176 | Retention and snapshot equivalence | `src/store_host.rs::manifest_at` |
@@ -120,21 +120,20 @@ numbers are the specification's.
 
 ## Plugin packaging
 
-`tests/plugin_manifest.rs` holds the plugin to the current Codex plugin contract
-without needing Python or network access, so it runs everywhere `cargo test` does:
+Sections 158-169 are implemented in a separate repository,
+[Quentin-BRG/weave-plugin](https://github.com/Quentin-BRG/weave-plugin), because the
+skills version and install on their own schedule: they are instructions about a CLI,
+this repository is the CLI.
 
-| Checked | Why |
-| --- | --- |
-| `plugin.json` required fields, allowed-key set, strict semver, https URLs, `#RRGGBB` | the official validator rejects anything else |
-| folder name equals `plugin.json` `name` | required by the packaging rules |
-| `skills` resolves to `skills` as a **path**, not a list | a list silently ships zero skills |
-| referenced assets exist; no `[TODO:` placeholders | broken references fail at install time |
-| no `mcpServers`, no `apps`, no `.mcp.json`, no `hooks` | Weave ships no MCP server, by design |
-| `SKILL.md` frontmatter: delimiters, `name` equals folder, description says *when* to use it | the description is the trigger; the body only loads after it fires |
-| `agents/openai.yaml`, when present, carries `interface.display_name` and `short_description` | the validator checks the sidecar too |
-| marketplace entry resolves to the shipped plugin, names agree, policy enums valid | a marketplace that points nowhere installs nothing |
-| no vendor name appears in any `SKILL.md` | the skills must stay reusable by any agent |
-| the raw Git prohibition and host-only commit rule are present | these protect the repository, so they are not left to drift |
+That repository carries the portable
+[Agent Plugins v1.0.0](https://agent-plugins.org/specification) package as its source
+of truth, with Codex packaging as a compatibility layer around the same canonical
+skills. It validates the two formats independently — a Codex validator passing says
+nothing about portable conformance — and additionally asserts provider neutrality,
+the raw Git prohibition (§165) and the host-only publication rule (§169).
+
+Nothing plugin-specific remains here. When a CLI command, flag or `--json` field
+changes, the skills in that repository may need the same change.
 
 ## The real remote path
 

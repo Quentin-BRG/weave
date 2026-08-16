@@ -1,7 +1,0 @@
-interface:
-  display_name: Weave collaboration
-  short_description: Work safely in a shared, live Weave working tree.
-  brand_color: "#3B6EA5"
-  default_prompt: Is a Weave session active in this repository?
-policy:
-  allow_implicit_invocation: true

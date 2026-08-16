@@ -26,8 +26,11 @@ A feature that weakens one of these to support a broader use case is outside V1.
 - `src/reconcile.rs` — the three-way reconciliation matrix.
 - `src/store_host.rs`, `src/store_client.rs` — durable state.
 - `src/gitx.rs` — every call into the `git` executable.
-- `.agents/plugins/weave/` — the plugin: provider-neutral skills, no MCP server.
-  `.agents/plugins/marketplace.json` makes it installable from a checkout.
+- The agent skills are **not** in this repository. They live in
+  [Quentin-BRG/weave-plugin](https://github.com/Quentin-BRG/weave-plugin), as a
+  portable Agent Plugins package with a Codex compatibility layer. If you change
+  the CLI surface — a command, a flag, a `--json` field — the skills there may need
+  the same change.
 - `tests/` — end-to-end tests driving the real binary against real repositories.
 
 Both engines are synchronous single-threaded state machines on their own OS
