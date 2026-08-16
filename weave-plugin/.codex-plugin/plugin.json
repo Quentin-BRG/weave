@@ -1,0 +1,13 @@
+{
+  "name": "weave",
+  "version": "1.0.0",
+  "description": "Work safely inside a Weave live collaboration session: shared working tree, Tasks, conflicts and host-only Git publication, all through the weave CLI.",
+  "license": "MPL-2.0",
+  "homepage": "https://github.com/Quentin-BRG/weave",
+  "skills": [
+    "skills/weave-collaboration",
+    "skills/weave-task",
+    "skills/weave-conflict",
+    "skills/weave-commit"
+  ]
+}
