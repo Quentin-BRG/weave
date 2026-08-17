@@ -12,16 +12,6 @@ independent local copies of the same Git repository while one authoritative host
 maintains a single shared live state. Git keeps its ordinary role: durable history,
 branch identity, remotes, portability.
 
-```
-Quentin / Codex ──┐
-Alice / Codex ────┼────── Weave ────── shared live state
-Bob / Codex ──────┘                        │
-                                    semantic publication
-                                           │
-                                           ▼
-                                          Git
-```
-
 Weave is a collaboration primitive, not an agent manager, an IDE, a Git
 replacement, a CRDT platform or a distributed filesystem. Everyone runs their own
 editor and their own agent; Weave only keeps the files in sync and turns the result
