@@ -42,7 +42,7 @@ on stdout.
 
 ## Session lifecycle
 
-### `weave host [--lan] [--local]`
+### `weave host [--lan] [--local] [--max-file-size <SIZE>]`
 
 Starts the coordinator and this machine's replica. Requires a valid Git repository
 with a checked-out branch, at least one commit, no Git operation in progress, and —
@@ -52,6 +52,12 @@ creation.
 - default: binds loopback and launches `cloudflared tunnel`
 - `--lan`: binds all interfaces, no Cloudflare process
 - `--local`: no remote endpoint at all
+- `--max-file-size <SIZE>`: the session's file size limit, default `128MiB`
+
+A repository already holding a file above the limit does not start a session: the
+refusal names the files and offers both remedies. On a resumed session the flag
+changes the limit, and is refused if it would drop below content the session
+already carries.
 
 All three protect the session identically: participants authenticate and encrypt
 with the same Noise handshake whether they arrive over `wss://` or over a plain LAN
@@ -128,8 +134,14 @@ Conflicts:
 JSON fields include `active`, `role`, `branch`, `base_commit`, `git_publication`,
 `published_revision`, `live_revision`, `revisions_ahead`, `state` (the deterministic
 replica hash), `connection`, `sync_state`, `participants`, `active_task`,
-`outbox_pending`, `conflicts_open`, `conflict_drafts`, `rejected_paths`, `notices`
-and `file_count`.
+`outbox_pending`, `conflicts_open`, `conflict_drafts`, `rejected_paths`, `notices`,
+`file_count`, `max_file_size`, `oversize` and `disk`.
+
+`oversize` lists every path in the session that is above the file size limit,
+whoever owns it: `path`, `size`, `display_name`, `mine`, and `canonical` (true when
+the session already holds earlier content for that path). It is empty in the
+ordinary case. `disk` carries `available_bytes` — absent, rather than zero, on a
+platform that will not report it.
 
 When no session is running, `weave status --json` prints `{"active": false, …}` and
 exits 0 — an agent can branch on it safely.
@@ -201,9 +213,11 @@ the file and resolve again.
 Runs the synchronization barrier and binds the publication to one immutable target
 revision. It does **not** create a Git commit.
 
-Fails when a conflict is open, or when an active Task contributed accepted revisions
-that would be inside the target. `--allow-active-tasks` overrides the second check
-deliberately.
+Fails when a conflict is open, when any participant is holding back a file above
+the session file size limit, or when an active Task contributed accepted revisions
+that would be inside the target. `--allow-active-tasks` overrides the last check
+deliberately; the other two are not overridable, because both mean some replica
+cannot reproduce the state that would be committed.
 
 JSON includes `prepare_id`, `target_revision`, `previous_published_revision`,
 `parent_commit_oid`, `included_tasks` (descriptions, actors, touched paths,
@@ -228,6 +242,33 @@ so later work correctly remains visible as uncommitted changes.
 Any participant may request it; only the host Git process performs it. Automatic
 push after publication is the default when an upstream exists. A diverged remote is
 reported and never auto-reconciled.
+
+---
+
+## The session file size limit
+
+### `weave limit show [--json]`
+
+The limit in force, the largest file the session currently carries, and anything
+above the limit right now. JSON fields: `max_file_size`, `max_file_size_human`,
+`control_version`, `largest_file` and `oversize`.
+
+### `weave limit set <SIZE> [--json]`
+
+Changes the limit for the whole session. Any participant may ask; the host is the
+authority and every replica observes the new value at the same `control_version`,
+re-evaluating its own working tree against it — files that were held back are
+captured and synchronized, and files that no longer fit start being held back.
+
+`SIZE` is written the way people write it: `256MiB`, `512MB`, `2G`, or a plain
+number of bytes. Both spellings of a unit mean the binary one. The limit must be
+between 1 MiB and 8 GiB.
+
+Lowering it below content the session already holds is refused, naming the file
+that prevents it: canonical content cannot be un-synchronized by changing a number.
+
+Prints the resulting state, so the output is the limit that is actually in force
+rather than the one that was requested.
 
 ---
 

@@ -100,6 +100,38 @@ pub struct ClientResumeState {
     pub has_manifest: bool,
 }
 
+/// A path one participant is holding back because it is above the session
+/// limit (`docs/BLOB-PLANE.md`, section 4).
+///
+/// Carried in the control snapshot rather than kept local, because the file
+/// blocks publication for everybody: whoever runs `weave commit prepare` has to
+/// be able to see which file it is, how large, and whose machine it is on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OversizePath {
+    pub actor_id: Uuid,
+    pub display_name: String,
+    pub path: RepoPath,
+    pub size: u64,
+    /// The session already holds canonical content for this path, and the local
+    /// file has since grown past the limit. The replicas differ until it
+    /// shrinks or the limit rises — the one divergence Weave tolerates, and
+    /// only because it refuses to publish while it lasts.
+    #[serde(default)]
+    pub canonical: bool,
+}
+
+/// What one participant reports about its own oversize paths.
+///
+/// A report replaces that actor's whole set, so a path that came back under the
+/// limit needs no separate retraction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OversizeReport {
+    pub path: RepoPath,
+    pub size: u64,
+    #[serde(default)]
+    pub canonical: bool,
+}
+
 /// Current control state (specification sections 99, 100).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlSnapshot {
@@ -109,6 +141,18 @@ pub struct ControlSnapshot {
     pub publication: Option<GitPublication>,
     pub publication_sequence: u64,
     pub session: SessionInfo,
+    /// Largest file this session synchronizes. Canonical session state: every
+    /// participant judges its own working tree against this value, at this
+    /// control version, and never against a local preference.
+    #[serde(default = "default_max_file_size")]
+    pub max_file_size: u64,
+    /// Every path any participant is currently holding back, session-wide.
+    #[serde(default)]
+    pub oversize: Vec<OversizePath>,
+}
+
+fn default_max_file_size() -> u64 {
+    DEFAULT_MAX_FILE_SIZE
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +231,18 @@ pub enum ClientMessage {
         reason: String,
     },
     RequestControlSnapshot,
+    /// This participant's complete set of paths held back for being above the
+    /// session limit. Sent whenever the set changes and once on every connect,
+    /// so the host's view is rebuilt from the reporter rather than remembered
+    /// across a socket it cannot vouch for.
+    ReportOversize {
+        paths: Vec<OversizeReport>,
+    },
+    /// Ask the session to change its file size limit.
+    SetFileLimit {
+        request_id: Uuid,
+        max_file_size: u64,
+    },
     ReportConflict {
         report: Box<ConflictReport>,
     },

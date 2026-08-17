@@ -38,6 +38,10 @@ const TEMP_PREFIX: &str = ".part-";
 /// scarce enough to be worth racing over.
 pub const GC_GRACE_MS: u64 = 60 * 60 * 1000;
 
+/// Headroom kept beyond what a transfer itself needs, so accepting one does not
+/// leave the machine with nothing to write a database page into.
+const SPACE_MARGIN: u64 = 64 * 1024 * 1024;
+
 /// Partial files claimed by a live writer somewhere in this process.
 ///
 /// Two writers must never append to the same partial: each hashes what it
@@ -189,6 +193,35 @@ impl BlobStore {
 
     pub fn size_of(&self, hash: &str) -> Result<u64> {
         Ok(std::fs::metadata(self.path_of(hash)?)?.len())
+    }
+
+    /// Refuse an incoming transfer that this disk plainly cannot hold.
+    ///
+    /// Filling a disk is not a corruption risk here — nothing partial is ever
+    /// installed — but it is a slow, repeated, confusing failure, and it takes
+    /// the working tree down with it. Better to decline the transfer with a
+    /// sentence that says what is wrong. The margin covers the working copy
+    /// this content is destined for on top of the blob itself.
+    ///
+    /// A platform that will not report free space is not an obstacle: unknown
+    /// means proceed.
+    pub fn ensure_room_for(&self, size: u64) -> Result<()> {
+        let Some(free) = crate::util::available_space(&self.root) else {
+            return Ok(());
+        };
+        let needed = size.saturating_mul(2).saturating_add(SPACE_MARGIN);
+        if free >= needed {
+            return Ok(());
+        }
+        Err(crate::error::persistence(format!(
+            "Not enough disk space for a {} file: {} free.",
+            crate::util::format_size(size),
+            crate::util::format_size(free)
+        ))
+        .with_detail(
+            "Weave keeps a working copy and a content-addressed copy of every file. Free some \
+             space; the transfer is retried on its own.",
+        ))
     }
 
     /// Start a streamed write. The blob is installed only by

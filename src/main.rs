@@ -85,6 +85,10 @@ fn uses_json(command: &Command) -> bool {
         Command::Commit(c) => match c {
             CommitCommand::Prepare { json, .. } | CommitCommand::Create { json, .. } => *json,
         },
+        Command::Limit(c) => match c {
+            LimitCommand::Set { json, .. } => *json,
+            LimitCommand::Show(a) => a.json,
+        },
         Command::Config(c) => match c {
             ConfigCommand::Get { json, .. } | ConfigCommand::Set { json, .. } => *json,
             ConfigCommand::List(a) => a.json,

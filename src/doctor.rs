@@ -22,6 +22,7 @@
 use crate::error::{Result, WeaveError};
 use crate::gitx;
 use crate::install;
+use crate::model::DEFAULT_MAX_FILE_SIZE;
 use crate::path::RepoPath;
 use crate::session::Paths;
 use serde::Serialize;
@@ -457,8 +458,45 @@ fn check_repository(start_dir: &Path) -> Vec<Check> {
     checks.extend(check_supported(&root));
     checks.push(check_portable_paths(&root));
     checks.push(check_storage(&paths));
+    checks.push(check_disk_space(&paths));
     checks.push(check_working_tree_writable(&paths));
     checks
+}
+
+/// Room to work in.
+///
+/// Weave keeps content twice while a file is live — once in the working tree,
+/// once content-addressed in the blob store — and a transfer needs room for a
+/// partial on top of that. A session that runs out of space mid-transfer fails
+/// safely (nothing partial is ever installed) but repeatedly, so it is worth
+/// saying beforehand. Never a hard failure: the number is a snapshot, other
+/// programs are using the same disk, and a platform that will not answer must
+/// not be read as an empty one.
+fn check_disk_space(paths: &Paths) -> Check {
+    let Some(free) = crate::util::available_space(&paths.repo_root) else {
+        return pass("Disk space", "not reported by this platform");
+    };
+    let human = crate::util::format_size(free);
+    // Three times the default limit: one working copy, one blob, one partial.
+    let comfortable = DEFAULT_MAX_FILE_SIZE.saturating_mul(3);
+    if free < DEFAULT_MAX_FILE_SIZE {
+        return warn(
+            "Disk space",
+            format!(
+                "{human} free, less than the {} a single file may reach",
+                crate::util::format_size(DEFAULT_MAX_FILE_SIZE)
+            ),
+        )
+        .with_hint(
+            "Free some space, or run the session with a smaller limit: \
+             `weave host --max-file-size <size>`.",
+        );
+    }
+    if free < comfortable {
+        return warn("Disk space", format!("{human} free"))
+            .with_hint("Weave keeps a working copy and a content-addressed copy of every file.");
+    }
+    pass("Disk space", format!("{human} free"))
 }
 
 fn check_git_dir(paths: &Paths) -> Check {

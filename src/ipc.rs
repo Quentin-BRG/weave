@@ -86,6 +86,10 @@ pub enum IpcCommand {
         message: String,
     },
     Push,
+    LimitShow,
+    LimitSet {
+        max_file_size: u64,
+    },
     TunnelRestart,
     Stop,
     Leave,

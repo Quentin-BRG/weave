@@ -259,12 +259,43 @@ fn make_executable(_path: &Path) {}
 /// `WEAVE_CLOUDFLARED` is explicitly cleared: a developer machine that sets it
 /// would otherwise mask exactly the bug this test exists to catch.
 fn install_check(weave: &Path, dir: &Path) -> (bool, Value, String) {
-    let out = Command::new(weave)
+    install_check_with_path(weave, dir, None)
+}
+
+/// A PATH with every directory holding a `cloudflared` removed.
+///
+/// The doctor deliberately accepts a `cloudflared` found on PATH when the
+/// bundled one is missing, so a machine with Weave (or cloudflared) actually
+/// installed on it would otherwise turn "this package is broken" into "this
+/// package is fine, using the one next door" — a true answer to a different
+/// question than the test is asking.
+fn path_without_cloudflared() -> std::ffi::OsString {
+    let name = if cfg!(windows) {
+        "cloudflared.exe"
+    } else {
+        "cloudflared"
+    };
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let kept: Vec<PathBuf> = std::env::split_paths(&current)
+        .filter(|dir| !dir.join(name).exists())
+        .collect();
+    std::env::join_paths(kept).expect("rebuild PATH")
+}
+
+fn install_check_with_path(
+    weave: &Path,
+    dir: &Path,
+    path: Option<std::ffi::OsString>,
+) -> (bool, Value, String) {
+    let mut command = Command::new(weave);
+    command
         .args(["doctor", "--install", "--json"])
         .current_dir(dir)
-        .env_remove("WEAVE_CLOUDFLARED")
-        .output()
-        .expect("run weave doctor --install");
+        .env_remove("WEAVE_CLOUDFLARED");
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let out = command.output().expect("run weave doctor --install");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     let json: Value = serde_json::from_str(&stdout)
@@ -338,7 +369,8 @@ fn a_package_without_its_cloudflared_is_reported_as_broken() {
     let sandbox = Sandbox::new("install-incomplete");
     let weave = fake_installation(&sandbox.root, "lib", false);
 
-    let (ok, report, _) = install_check(&weave, &sandbox.root);
+    let (ok, report, _) =
+        install_check_with_path(&weave, &sandbox.root, Some(path_without_cloudflared()));
     assert!(!ok, "an incomplete package must exit non-zero: {report:#}");
     assert_eq!(report["ready"], false, "{report:#}");
 

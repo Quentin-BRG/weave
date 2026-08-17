@@ -214,22 +214,38 @@ At a 60 second budget that lands between ~60 MB on VDSL and ~240 MB on symmetric
 fibre. The default is **128 MiB**, configurable far higher for LAN sessions.
 
 The limit is **canonical session state**, not a local preference. It lives in
-`ControlSnapshot`, which already carries a monotonic `control_version`, is
-broadcast to every participant, is cached durably by clients, and is re-delivered
-on reconnect through `Welcome`. Raising it is a session decision that every
-participant observes at the same control version.
+`ControlSnapshot::max_file_size`, which already carries a monotonic
+`control_version`, is broadcast to every participant, is cached durably by
+clients, and is re-delivered on reconnect through `Welcome`. It is durable on the
+host, so a restart cannot fall back to the default under a replica that has
+already been told otherwise, and each replica caches the last value it learned so
+its very first scan — which happens before `Welcome` — judges files against the
+session's number rather than the compiled-in one. Raising it is a session
+decision that every participant observes at the same control version.
+
+`weave limit show` reads it; `weave limit set <size>` changes it, from any
+participant, because it is a session decision rather than a host privilege. The
+host chooses the initial value with `weave host --max-file-size <size>`. Sizes
+are written the way people write them (`256MiB`, `512MB`, `2G`), and both
+spellings of a unit mean the binary one.
 
 ### At startup
 
-`weave host` refuses to start when the initial scan finds a file above the limit,
+`weave host` refuses to start when the repository holds a file above the limit,
 naming the file and the two remedies: raise the session limit, or remove the file
 from the session. A session whose initial state cannot be fully represented is
-never started.
+never started. The check reads sizes from the filesystem rather than from the
+scan, so a repository holding a 4 GiB file is refused in milliseconds instead of
+after hashing it.
 
 `weave join` cannot know the canonical limit before connecting, so its preflight
 checks against the default as a hint and the authoritative check runs on
 `Welcome`. Failing it ends the join with a clear error instead of starting a
-degraded session.
+degraded session: the daemon exits, and the local session record is discarded so
+nothing later tries to resume what never started. That fatal path applies only to
+a **first** join. Once a replica is established, the same situation is the
+ordinary oversize condition below — there is then a session to be part of, and
+local work not to throw away.
 
 ### A file created above the limit during a session
 
@@ -240,21 +256,47 @@ synchronized state.
 | --- | --- |
 | local bytes | preserved exactly; Weave neither reads, rewrites nor deletes the file |
 | capture | none — no blob, no operation, no revision |
-| durable state | `oversize { path, size }` in the client store, reported to the host |
+| durable state | `oversize { path, size, canonical }` in the client store, reported to the host |
 | visibility | `weave status` (human and `--json`), a persistent notice, and the host's `ControlSnapshot` so **every** participant sees which file blocks publication and whose it is |
 | the rest of the session | unaffected; every other path synchronizes normally |
 | `weave commit prepare` | refused while any participant reports an oversize path, listing path, size, owner and remedy |
+
+The size question is asked from the filesystem, before anything is opened: both
+in `capture_path`, which is every watcher event and every capture-before-overwrite
+check, and in `scan_repository`, which lists such a path in `ScanResult::oversize`
+and never reads it. That is what makes "Weave neither reads nor rewrites the file"
+true rather than aspirational, and it is also why a repository holding one does
+not pay a full read of it on every rescan.
+
+Reports travel as a whole set (`ReportOversize`), replacing whatever that actor
+said before, so a path that came back under the limit needs no retraction and the
+host's picture of a replica cannot drift from the replica's own. The host holds
+them in memory, keyed by actor, and drops an actor's entries when it disconnects:
+the report describes a working tree that is connected right now, every replica
+re-reports on connect, and the barrier already treats an absent participant as
+outside the publication.
+
+Publication is refused twice over, on purpose. The replica answers the barrier
+`ok: false` with the path and size — the same mechanism an open conflict uses —
+and the host independently refuses `build_preparation` from the reports it holds,
+before it reads any barrier answer, so the message names the size limit rather
+than filing it under unresolved conflicts.
 
 Two ways out, both ordinary:
 
 1. **Delete or shrink the file.** Below the limit it becomes an ordinary create
    and enters the normal pipeline. Nothing special is needed: it was never
    canonical, so no revision has to be undone.
-2. **Raise the session limit.** On the new control version every client
-   re-evaluates its oversize set, captures the file, and submits it through the
-   normal blob pipeline. It becomes a canonical revision like any other.
+2. **Raise the session limit.** On the new control version every client discards
+   its oversize set and rescans, so the set is re-derived from the files
+   themselves rather than filtered; the file is captured and submitted through
+   the normal blob pipeline, and becomes a canonical revision like any other. The
+   same rescan runs when the limit is *lowered*, which is how a path that was
+   ordinary a moment ago starts being held back.
 
-Lowering the limit is refused while any manifest entry exceeds the new value.
+Lowering the limit is refused while any manifest entry exceeds the new value,
+both live (`weave limit set`) and at `weave host --max-file-size` on a resumed
+session. Canonical content cannot be un-synchronized by changing a number.
 
 ### The one residual divergence, stated plainly
 
@@ -262,6 +304,14 @@ A path that is *already canonical* and then grows above the limit is the only
 case where replicas differ: canonical holds the old content, the author's disk
 holds the new. Weave will not capture it (over the limit) and must not
 materialize over it (priority 1, no lost edits).
+
+Concretely: `materialize_if_safe` tries to capture first, as it always does, and
+capture declines because the file is above the limit. Nothing has been recorded
+from it, so there is no local work to rebase and canonical content written over
+it would be a silent deletion of bytes only this machine holds. The write is
+skipped, the condition is reported with `canonical: true` so the session knows the
+divergence is a divergence rather than a file nobody has seen yet, and the write
+happens on the ordinary sweep the moment the file comes back under the limit.
 
 That window is bounded and explicit: it is reported everywhere, and it blocks
 publication, so a divergent state can never be committed or pushed. The
@@ -271,6 +321,30 @@ bytes in the blob store, at the cost of reverting a working file the user may be
 actively editing with an external tool. The conservative reading of "the local
 file is always preserved" won; this is the decision most worth revisiting with
 usage.
+
+### Disk, the other resource
+
+The size limit bounds what one file may cost the network. Disk is the resource it
+does not bound, and running out of it is the one failure that can take the
+working tree down with the session.
+
+Nothing here risks corruption — a transfer that cannot be written installs
+nothing, exactly as an interrupted one does — so the checks are about saying so
+early rather than about safety:
+
+- `weave doctor` reports free space, warning below the default limit and again
+  below three times it: one working copy, one content-addressed copy, one partial.
+- `BlobStore::ensure_room_for` declines an incoming transfer that plainly will
+  not fit, at `accept_offer`, before a byte is written. The transfer is retried
+  on its own, so freeing space is all the recovery there is.
+- `weave status --json` carries a `disk` block, and the human form says something
+  only when the number is low enough to matter.
+
+Free space comes from `GetDiskFreeSpaceExW` on Windows and `df -Pk` elsewhere —
+`statvfs` would mean a libc dependency for a struct whose layout differs across
+the platforms Weave supports. A platform that will not answer yields `None`, and
+every caller reads that as permission to continue: a check that cannot be made
+must never become a refusal.
 
 ## 5. What does not change
 
@@ -288,7 +362,7 @@ the places where `content_b64` appears.
 | **1 — Transport** | frame class, priority writer, waiting data queue | medium | done |
 | **2 — Protocol v3** | `content_b64` removed everywhere, pull-based broadcast, upload-before-submit, conflict blobs, publication pack | **high** | done |
 | **3 — Robustness** | offset resumption, barrier precondition, blob GC, fast rescan, stability detection | medium | done |
-| **4 — Policy** | canonical session limit and its state machine, startup refusal, disk checks, docs | low | |
+| **4 — Policy** | canonical session limit and its state machine, startup refusal, disk checks, docs | low | done |
 
 Phase 0 stands alone and ships value without a protocol change: it removes the
 memory ceiling before the wire changes at all. Phase 1 likewise changes no
@@ -333,7 +407,10 @@ they are what make large files bearable in practice. Both landed with phase 3:
 ## 7. Test matrix
 
 End-to-end, driving the real binary, as everything in `tests/` does. The
-blob-plane cases live in `tests/blob_plane.rs`; the framing and installation
+blob-plane cases live in `tests/blob_plane.rs` and the size-limit cases in
+`tests/size_limit.rs`, whose sessions run under a deliberately small limit —
+nothing in the state machine depends on the size, and 6 MiB proves it as well as
+200 MiB would in a fraction of the time. The framing and installation
 invariants they rest on are unit-tested in `src/blobwire.rs` and `src/blobs.rs`,
 where a corrupt or truncated transfer can actually be constructed — on the wire,
 Noise authentication fails long before a hash check would. The one exception is a
@@ -353,4 +430,11 @@ corrupted end-to-end, between a crash and the restart that resumes from it.
 | a damaged partial recovered after a crash | a partial that is no longer a prefix is destroyed rather than installed, and the content is fetched again | phase 3 |
 | publication prepared while a participant is still receiving | the barrier waits: `prepare` cannot return before that participant can reproduce the state, and it is not written off as disconnected | phase 3 |
 | collection with no age guard at all | live content survives on both replicas, the host's whole revision history still resolves, and unreachable content is actually removed | phase 3 |
+| host started on a repository holding a file above the limit | the session never starts on state it cannot represent, and says which file and both remedies | phase 4 |
+| a file created above the limit | local bytes untouched, nothing captured, nothing reaching anybody, the whole session shown whose machine it is on, publication refused from either end, and the rest of the repository still synchronizing | phase 4 |
+| the file shrunk, then deleted | both ways out are ordinary work with nothing to undo, and publication resumes | phase 4 |
+| the limit raised from a participant | a new control version everyone observes, the held-back file captured and transferred, and published | phase 4 |
+| the limit lowered under canonical content | refused, naming the file, with the old value still in force everywhere | phase 4 |
+| an oversize condition across a restart | the record is durable in the participant's own store, re-reported on reconnect, and still blocking | phase 4 |
+| a canonical file grown past the limit | canonical content is **never** written over bytes Weave has not captured, the divergence is reported as such, publication is blocked, and the owed content arrives once it is resolved | phase 4 |
 | file created above the session limit | preserved locally, publication blocked, both remedies, and the raise propagating as a control version | phase 4 |

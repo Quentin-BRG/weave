@@ -226,8 +226,16 @@ auto-reconciled (§140).
 Each remote connection has a bounded outbound queue — 256 messages and 32 MiB — and
 a participant that exceeds either bound is disconnected rather than allowed to grow
 host memory without limit. It recovers through ordinary reconnection
-synchronization (§65, §197). Files above 10 MiB are refused; text above 1 MiB is
-treated as binary for merge purposes (§51).
+synchronization (§65, §197). File content does not travel on that queue: it is
+streamed on a separate data plane, chunk by chunk, paced by a fixed window of
+in-flight frames (`docs/BLOB-PLANE.md`).
+
+File size is therefore a resource budget rather than a protocol constraint. The
+session carries its own limit in `ControlSnapshot`, default 128 MiB, readable with
+`weave limit show` and changeable with `weave limit set`; a file above it is
+preserved untouched on its own machine, reported to the whole session, and blocks
+Git publication until it is resolved. Text above 1 MiB is treated as binary for
+merge purposes (§51).
 
 ## 10. The encrypted channel
 

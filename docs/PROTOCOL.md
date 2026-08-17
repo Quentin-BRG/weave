@@ -18,14 +18,21 @@ loopback in tunnel mode.
 Every WebSocket frame Weave sends is **binary** and every payload is a Noise
 transport message. A text frame received on a Weave connection terminates it.
 
-Serialization inside the encrypted channel is JSON. File content travels as
-**complete bytes**, base64-encoded — Weave deliberately does not use textual deltas
-as the primary operation representation. That removes patch-application ambiguity,
-simplifies recovery and makes three-way reconciliation straightforward, at the cost
-of bandwidth Weave's target workload can afford.
+Serialization inside the encrypted channel is JSON, and it carries control state
+only. File content never appears in it: messages carry `FileEntry` metadata, and
+the bytes behind a `blob_hash` are streamed on a second plane inside the same Noise
+session, chunk by chunk, referenced by hash. See `docs/BLOB-PLANE.md` for the
+frame classes, the priority rule that keeps control traffic ahead of content, and
+the transfer protocol.
 
-Maximum application message: 48 MiB (comfortably above a 10 MiB file after base64
-expansion plus overhead). Oversized messages are protocol errors.
+Weave still transfers **complete content** rather than textual deltas — that
+removes patch-application ambiguity, simplifies recovery and makes three-way
+reconciliation straightforward, at the cost of bandwidth Weave's target workload
+can afford. What changed is that the content is streamed rather than embedded.
+
+Maximum application message: 48 MiB, sized for a full canonical manifest, which is
+now the largest control message that exists. Oversized messages are protocol
+errors.
 
 ## Session establishment
 

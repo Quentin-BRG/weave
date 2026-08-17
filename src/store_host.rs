@@ -103,6 +103,7 @@ const K_CONTROL_VERSION: &str = "control_version";
 const K_SESSION: &str = "session";
 const K_SCHEMA: &str = "schema_version";
 const K_PUB_SEQ: &str = "publication_sequence";
+const K_MAX_FILE_SIZE: &str = "max_file_size";
 
 #[derive(Debug, Clone)]
 pub struct ActorRecord {
@@ -158,6 +159,33 @@ impl HostStore {
         Ok(v)
     }
 
+    /// The session's file size limit. Durable, so it survives a host restart
+    /// and cannot silently fall back to the default under a replica that has
+    /// already been told otherwise.
+    pub fn max_file_size(&self) -> Result<u64> {
+        db::get_u64(&self.conn, K_MAX_FILE_SIZE, DEFAULT_MAX_FILE_SIZE)
+    }
+
+    pub fn set_max_file_size(&self, bytes: u64) -> Result<()> {
+        db::set_u64(&self.conn, K_MAX_FILE_SIZE, bytes)
+    }
+
+    /// The largest canonical entry, if there is one. What a proposed lowering
+    /// of the limit has to clear.
+    pub fn largest_manifest_entry(&self) -> Result<Option<(RepoPath, u64)>> {
+        let mut largest: Option<(RepoPath, u64)> = None;
+        for (path, entry) in self.manifest_all()? {
+            let beats = match &largest {
+                Some((_, size)) => entry.size > *size,
+                None => true,
+            };
+            if beats {
+                largest = Some((path, entry.size));
+            }
+        }
+        Ok(largest)
+    }
+
     // --------------------------------------------------------------- manifest
 
     /// Discard all canonical state so a brand new session can start from r0.
@@ -183,6 +211,7 @@ impl HostStore {
         db::set_u64(&self.conn, K_CURRENT_REVISION, 0)?;
         db::set_u64(&self.conn, K_CONTROL_VERSION, 1)?;
         db::set_u64(&self.conn, K_PUB_SEQ, 0)?;
+        db::set_u64(&self.conn, K_MAX_FILE_SIZE, DEFAULT_MAX_FILE_SIZE)?;
         Ok(())
     }
 

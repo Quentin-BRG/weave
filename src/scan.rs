@@ -188,21 +188,32 @@ pub fn read_path(
 pub struct ScanResult {
     pub entries: BTreeMap<RepoPath, FileEntry>,
     pub rejected: Vec<RejectedPath>,
+    /// Files above the session limit, with their sizes. Present on disk,
+    /// deliberately unread, and the caller's business rather than the
+    /// scanner's: they are a session condition, not a broken path.
+    pub oversize: Vec<(RepoPath, u64)>,
 }
 
 /// Enumerate every synchronizable file, using Git's own ignore rules.
 ///
 /// A rescan is authoritative: it is how Weave recovers from a watcher that
 /// dropped an event (specification sections 32, 185).
+///
+/// `max_file_size` is the session's limit. A file above it is listed in
+/// `oversize` and never opened: the promise that Weave neither reads nor
+/// rewrites such a file starts here, and so does the promise that a repository
+/// holding one does not cost a full read of it on every rescan.
 pub fn scan_repository(
     root: &Path,
     previous: &BTreeMap<RepoPath, FileEntry>,
     blobs: &BlobStore,
     cache: &mut ScanCache,
+    max_file_size: u64,
 ) -> Result<ScanResult> {
     let raw_paths = gitx::list_repository_paths(root)?;
     let mut entries = BTreeMap::new();
     let mut rejected = Vec::new();
+    let mut oversize = Vec::new();
     let mut collision_index: std::collections::HashMap<String, RepoPath> =
         std::collections::HashMap::new();
 
@@ -229,6 +240,15 @@ pub fn scan_repository(
                 continue;
             }
         }
+        // Asked of the filesystem before the file is opened: what makes this a
+        // limit on synchronization rather than on reading.
+        if let Ok(meta) = std::fs::symlink_metadata(repo_path.to_fs_path(root)) {
+            if meta.is_file() && meta.len() > max_file_size {
+                collision_index.insert(key, repo_path.clone());
+                oversize.push((repo_path, meta.len()));
+                continue;
+            }
+        }
         match read_path(root, &repo_path, previous.get(&repo_path), blobs, cache) {
             Ok(Some(entry)) => {
                 collision_index.insert(key, repo_path.clone());
@@ -242,7 +262,11 @@ pub fn scan_repository(
         }
     }
 
-    Ok(ScanResult { entries, rejected })
+    Ok(ScanResult {
+        entries,
+        rejected,
+        oversize,
+    })
 }
 
 /// Write a canonical blob to the working tree using safe replacement semantics.

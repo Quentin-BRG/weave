@@ -63,6 +63,9 @@ impl PeerKey {
 pub struct HostOptions {
     pub lan: bool,
     pub local_only: bool,
+    /// The session's file size limit, when the host chose one. `None` keeps
+    /// whatever the session already holds, or the default for a new one.
+    pub max_file_size: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +144,35 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
     let mut host_store = HostStore::open(&paths.host_db())?;
     let blobs = BlobStore::open(paths.blobs())?;
 
+    // The limit this session will run under, decided before anything is read.
+    let max_file_size = match opts.max_file_size {
+        Some(requested) => {
+            verify_file_limit_bounds(requested)?;
+            requested
+        }
+        None if resuming => host_store.max_file_size()?,
+        None => DEFAULT_MAX_FILE_SIZE,
+    };
+    if resuming {
+        // Lowering the limit under content the session already carries is
+        // refused here for the same reason it is refused live: canonical state
+        // cannot be un-synchronized by changing a number.
+        if let Some((path, size)) = host_store.largest_manifest_entry()? {
+            if size > max_file_size {
+                return Err(unsupported(format!(
+                    "Cannot resume with a {} file size limit: {path} is already {}.",
+                    crate::util::format_size(max_file_size),
+                    crate::util::format_size(size)
+                ))
+                .with_detail(
+                    "Resume without --max-file-size, or choose a limit at least as large as the \
+                     content this session already holds.",
+                ));
+            }
+        }
+    }
+    host_store.set_max_file_size(max_file_size)?;
+
     let (session, secret) = match (&existing, resuming) {
         (Some(record), true) => {
             let session = host_store
@@ -149,10 +181,15 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
             (session, record.secret.clone())
         }
         _ => {
+            // A session whose initial state cannot be fully represented is
+            // never started. Checked from the filesystem's own sizes, before
+            // the scan below reads a single byte of a file it would refuse.
+            verify_repository_within_limit(&paths, max_file_size)?;
             // A fresh session: r0 is the host working tree at creation. Any
             // canonical state left by a previous, ended session is discarded so
             // revision numbering starts from zero.
             host_store.reset()?;
+            host_store.set_max_file_size(max_file_size)?;
             // The scan streams every file into the blob store as it hashes it,
             // so the base manifest is durable content-addressed state without
             // the repository ever being held in memory.
@@ -161,6 +198,7 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
                 &BTreeMap::new(),
                 &blobs,
                 &mut crate::scan::ScanCache::new(),
+                max_file_size,
             )?;
             report_rejected(&scan.rejected);
             host_store.install_base_manifest(&scan.entries)?;
@@ -239,6 +277,7 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
     if first_run {
         client_engine.seed_materialized_from_disk()?;
     }
+    client_engine.load_cached_limit()?;
     let repaired = client_engine.repair_publications()?;
     for line in repaired {
         println!("Recovered: {line}");
@@ -400,6 +439,11 @@ pub fn run_join(start_dir: &Path, opts: JoinOptions) -> Result<()> {
 
     if !rejoining {
         verify_clean_working_tree(&paths)?;
+        // A hint, not the authority: only the session knows its own limit, and
+        // it arrives with `Welcome`. Checking the default here catches the
+        // common case before a secret is pasted, and the engine repeats the
+        // check against the real value the moment it knows it.
+        verify_repository_within_limit(&paths, DEFAULT_MAX_FILE_SIZE)?;
         if head != payload.base_commit {
             return Err(
                 repository("Cannot join Weave session.").with_detail(format!(
@@ -471,6 +515,12 @@ pub fn run_join(start_dir: &Path, opts: JoinOptions) -> Result<()> {
     if first_run {
         client_engine.seed_materialized_from_disk()?;
     }
+    client_engine.load_cached_limit()?;
+    // A condition the engine can only discover once connected, and which must
+    // end the daemon rather than degrade it. Created before the runtime exists,
+    // which tokio channels allow, and signalled from the engine's own thread.
+    let (fatal_tx, fatal_rx) = mpsc::channel::<crate::error::WeaveError>(1);
+    client_engine.set_fatal_channel(fatal_tx);
     let repaired = client_engine.repair_publications()?;
     for line in repaired {
         println!("Recovered: {line}");
@@ -502,6 +552,7 @@ pub fn run_join(start_dir: &Path, opts: JoinOptions) -> Result<()> {
         payload.secret,
         client_handle,
         display_name,
+        fatal_rx,
     ));
 
     drop(lock);
@@ -509,6 +560,7 @@ pub fn run_join(start_dir: &Path, opts: JoinOptions) -> Result<()> {
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn participant_async(
     paths: Paths,
     session: SessionInfo,
@@ -516,6 +568,7 @@ async fn participant_async(
     secret: SessionSecret,
     client: ClientHandle,
     display_name: String,
+    mut fatal: mpsc::Receiver<crate::error::WeaveError>,
 ) -> Result<()> {
     println!("Weave — {}", paths.repo_name());
     println!();
@@ -549,8 +602,11 @@ async fn participant_async(
         BlobStore::open(paths.blobs())?,
     ));
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => println!("\nLeaving the Weave session."),
+    let outcome = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            println!("\nLeaving the Weave session.");
+            Ok(())
+        }
         kind = shutdown_rx.recv() => {
             if kind == Some(ShutdownKind::Leave) {
                 clear_session_record(&paths)?;
@@ -558,12 +614,22 @@ async fn participant_async(
             } else {
                 println!("Weave stopped.");
             }
+            Ok(())
         }
-    }
+        // The session cannot be entered at all. The local session record is
+        // discarded so nothing later tries to resume what never started.
+        reason = fatal.recv() => {
+            let _ = clear_session_record(&paths);
+            match reason {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+    };
 
     connection.abort();
     client.send(ClientInput::Shutdown);
-    Ok(())
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -579,17 +645,21 @@ pub fn run_resume(start_dir: &Path) -> Result<()> {
     match record.role {
         Role::Host => {
             let opts = match record.mode {
+                // No limit is passed: a resumed session keeps the one it has.
                 TransportMode::Lan => HostOptions {
                     lan: true,
                     local_only: false,
+                    max_file_size: None,
                 },
                 TransportMode::Local => HostOptions {
                     lan: false,
                     local_only: true,
+                    max_file_size: None,
                 },
                 TransportMode::Tunnel => HostOptions {
                     lan: false,
                     local_only: false,
+                    max_file_size: None,
                 },
             };
             run_host(start_dir, opts)
@@ -1557,6 +1627,64 @@ pub fn verify_clean_working_tree(paths: &Paths) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub fn verify_file_limit_bounds(bytes: u64) -> Result<()> {
+    if !(MIN_FILE_LIMIT..=MAX_FILE_LIMIT).contains(&bytes) {
+        return Err(crate::error::usage(format!(
+            "A Weave session file size limit must be between {} and {}.",
+            crate::util::format_size(MIN_FILE_LIMIT),
+            crate::util::format_size(MAX_FILE_LIMIT)
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a session whose initial repository holds a file it could not carry.
+///
+/// Sizes come from the filesystem rather than from a scan: this runs before
+/// anything is hashed, so a repository with a 4 GiB file in it is refused in
+/// milliseconds instead of after reading it.
+fn verify_repository_within_limit(paths: &Paths, max_file_size: u64) -> Result<()> {
+    let mut too_large: Vec<(String, u64)> = Vec::new();
+    for raw in gitx::list_repository_paths(&paths.repo_root)? {
+        let fs_path = paths.repo_root.join(&raw);
+        let Ok(meta) = std::fs::symlink_metadata(&fs_path) else {
+            continue;
+        };
+        if meta.is_file() && meta.len() > max_file_size {
+            too_large.push((raw, meta.len()));
+        }
+    }
+    if too_large.is_empty() {
+        return Ok(());
+    }
+    too_large.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
+    let listed: Vec<String> = too_large
+        .iter()
+        .take(12)
+        .map(|(path, size)| format!("  {path} — {}", crate::util::format_size(*size)))
+        .collect();
+    let more = if too_large.len() > listed.len() {
+        format!("\n  ... and {} more", too_large.len() - listed.len())
+    } else {
+        String::new()
+    };
+    Err(unsupported(format!(
+        "This repository holds {} above the session file size limit of {}.",
+        if too_large.len() == 1 {
+            "a file".to_string()
+        } else {
+            format!("{} files", too_large.len())
+        },
+        crate::util::format_size(max_file_size)
+    ))
+    .with_detail(format!(
+        "{}{more}\n\nA Weave session never starts on state it cannot fully represent. Either \
+         raise the session limit:\n\n  weave host --max-file-size <size>\n\nor remove these \
+         files from the session (delete them, or add them to .gitignore).",
+        listed.join("\n")
+    )))
 }
 
 fn verify_new_host_repository(paths: &Paths) -> Result<()> {

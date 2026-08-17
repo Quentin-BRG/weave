@@ -119,6 +119,15 @@ pub struct HostEngine {
     host_git_name: String,
     host_git_email: String,
     remote_name: Option<String>,
+    /// What each connected participant is currently holding back for being
+    /// above the session limit.
+    ///
+    /// Not durable, and deliberately so: it describes the working tree of a
+    /// machine that is connected right now, and the only honest source for it
+    /// is that machine. Every replica re-reports on connect, and a participant
+    /// that leaves takes its entries with it — the barrier already treats an
+    /// absent participant as outside the publication.
+    oversize: HashMap<Uuid, Vec<OversizePath>>,
 }
 
 impl HostEngine {
@@ -151,6 +160,7 @@ impl HostEngine {
             host_git_name,
             host_git_email,
             remote_name,
+            oversize: HashMap::new(),
         }
     }
 
@@ -236,9 +246,20 @@ impl HostEngine {
             }
             HostInput::Data { conn_id, frame } => self.on_data(conn_id, frame),
             HostInput::Disconnected { conn_id } => {
+                let actor = self.actor_of(conn_id);
                 self.conns.remove(&conn_id);
                 if let Some(barrier) = &mut self.barrier {
                     barrier.peers.remove(&conn_id);
+                }
+                // A participant that is gone is no longer holding anything
+                // back: its report described a working tree nobody in this
+                // session can see any more. It re-reports on reconnect.
+                if let Some(actor_id) = actor {
+                    let still_connected = self.conns.values().any(|c| c.actor_id == Some(actor_id));
+                    if !still_connected && self.oversize.remove(&actor_id).is_some() {
+                        self.store.bump_control_version()?;
+                        self.broadcast_control()?;
+                    }
                 }
                 self.try_finish_barrier()?;
                 self.broadcast_presence();
@@ -629,6 +650,13 @@ impl HostEngine {
                 );
                 Ok(())
             }
+            ClientMessage::ReportOversize { paths } => {
+                self.on_report_oversize(conn_id, actor_id, paths)
+            }
+            ClientMessage::SetFileLimit {
+                request_id,
+                max_file_size,
+            } => self.on_set_file_limit(conn_id, request_id, max_file_size),
             ClientMessage::ReportConflict { report } => {
                 self.on_report_conflict(conn_id, actor_id, *report)
             }
@@ -879,13 +907,17 @@ impl HostEngine {
         crate::path::validate(op.path.as_str())?;
 
         if let Some(entry) = &op.desired_entry {
-            if entry.size > MAX_SYNCED_FILE {
+            let limit = self.store.max_file_size()?;
+            if entry.size > limit {
                 return Err(crate::error::unsupported(format!(
-                    "{} is {} bytes, above the {} MiB Weave file limit.",
+                    "{} is {}, above this session's {} file size limit.",
                     op.path,
-                    entry.size,
-                    MAX_SYNCED_FILE / (1024 * 1024)
-                )));
+                    crate::util::format_size(entry.size),
+                    crate::util::format_size(limit)
+                ))
+                .with_detail(
+                    "Shrink or delete the file, or raise the limit with `weave limit set <size>`.",
+                ));
             }
             self.require_blob(entry)?;
         }
@@ -1502,6 +1534,143 @@ impl HostEngine {
 
     // ------------------------------------------------------- commit preparation
 
+    // -------------------------------------------------------- the size limit
+
+    /// Record one participant's oversize set, replacing whatever it said before.
+    fn on_report_oversize(
+        &mut self,
+        conn_id: u64,
+        actor_id: Uuid,
+        paths: Vec<OversizeReport>,
+    ) -> Result<()> {
+        let display_name = self
+            .conns
+            .get(&conn_id)
+            .map(|c| c.display_name.clone())
+            .unwrap_or_else(|| "a participant".into());
+        let mut reported: Vec<OversizePath> = paths
+            .into_iter()
+            .map(|item| OversizePath {
+                actor_id,
+                display_name: display_name.clone(),
+                path: item.path,
+                size: item.size,
+                canonical: item.canonical,
+            })
+            .collect();
+        reported.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let changed = match self.oversize.get(&actor_id) {
+            Some(previous) => previous != &reported,
+            None => !reported.is_empty(),
+        };
+        if reported.is_empty() {
+            self.oversize.remove(&actor_id);
+        } else {
+            self.oversize.insert(actor_id, reported);
+        }
+        if changed {
+            // A control version, not a private note: the file blocks
+            // publication for the whole session, so the whole session is told.
+            self.store.bump_control_version()?;
+            self.broadcast_control()?;
+        }
+        Ok(())
+    }
+
+    fn on_set_file_limit(
+        &mut self,
+        conn_id: u64,
+        request_id: Uuid,
+        max_file_size: u64,
+    ) -> Result<()> {
+        if let Err(e) = self.validate_file_limit(max_file_size) {
+            self.send(
+                conn_id,
+                HostMessage::Error {
+                    request_id: Some(request_id),
+                    class: e.class,
+                    message: e.message,
+                    detail: e.detail,
+                },
+            );
+            return Ok(());
+        }
+        let previous = self.store.max_file_size()?;
+        self.store.set_max_file_size(max_file_size)?;
+        self.store.bump_control_version()?;
+        self.broadcast_control()?;
+        let note = if max_file_size == previous {
+            format!(
+                "The session file size limit is unchanged at {}.",
+                crate::util::format_size(max_file_size)
+            )
+        } else {
+            tracing::info!(
+                "session file size limit {} -> {}",
+                crate::util::format_size(previous),
+                crate::util::format_size(max_file_size)
+            );
+            format!(
+                "The session file size limit is now {}.",
+                crate::util::format_size(max_file_size)
+            )
+        };
+        self.send(
+            conn_id,
+            HostMessage::Ack {
+                request_id,
+                note: Some(note),
+            },
+        );
+        Ok(())
+    }
+
+    /// A limit the session can actually honour.
+    ///
+    /// Lowering is the interesting direction: canonical state that already
+    /// exceeds the new value cannot be un-synchronized, and pretending
+    /// otherwise would leave every replica holding content the session claims
+    /// it does not carry.
+    fn validate_file_limit(&self, proposed: u64) -> Result<()> {
+        if !(MIN_FILE_LIMIT..=MAX_FILE_LIMIT).contains(&proposed) {
+            return Err(crate::error::usage(format!(
+                "A Weave session file size limit must be between {} and {}.",
+                crate::util::format_size(MIN_FILE_LIMIT),
+                crate::util::format_size(MAX_FILE_LIMIT)
+            )));
+        }
+        if let Some((path, size)) = self.store.largest_manifest_entry()? {
+            if size > proposed {
+                return Err(crate::error::usage(format!(
+                    "Cannot lower the session file size limit to {}: {path} is already {}.",
+                    crate::util::format_size(proposed),
+                    crate::util::format_size(size)
+                ))
+                .with_detail(
+                    "Canonical content cannot be un-synchronized by changing a limit. Delete or \
+                     shrink the files above the new limit first, then lower it.",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// How a publication attempt describes the paths blocking it.
+    fn oversize_blockers(&self) -> Vec<String> {
+        self.oversize_all()
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} — {} on {}'s machine",
+                    item.path,
+                    crate::util::format_size(item.size),
+                    item.display_name
+                )
+            })
+            .collect()
+    }
+
     fn on_commit_prepare(
         &mut self,
         conn_id: u64,
@@ -1635,6 +1804,26 @@ impl HostEngine {
         not_responding: &[String],
         timed_out: bool,
     ) -> Result<CommitPreparation> {
+        // A file somebody is holding back is state this session cannot
+        // reproduce everywhere. Publishing around it would commit a tree that
+        // is right for every replica except the one whose disk it is on.
+        //
+        // Checked before the barrier answers are read: a participant blocked
+        // this way also answers "not ready", and the reason it gives deserves
+        // its own message rather than being filed under unresolved conflicts.
+        let blocked = self.oversize_blockers();
+        if !blocked.is_empty() {
+            let limit = self.store.max_file_size()?;
+            return Err(crate::error::conflict(
+                "Cannot prepare Git publication: a file is above the session size limit.",
+            )
+            .with_detail(format!(
+                "{}\n\nThe session limit is {}. Shrink or delete the file, or raise the limit \
+                 with `weave limit set <size>`.",
+                blocked.join("\n"),
+                crate::util::format_size(limit)
+            )));
+        }
         if !unready.is_empty() {
             return Err(crate::error::conflict(
                 "Cannot prepare Git publication: unresolved conflicts from pre-barrier work.",
@@ -1644,6 +1833,7 @@ impl HostEngine {
                 unready.join("\n")
             )));
         }
+
         let open = self.store.open_conflicts()?;
         if !open.is_empty() {
             let list: Vec<String> = open
@@ -2167,13 +2357,15 @@ impl HostEngine {
                 hash,
                 size,
             } => {
-                let reply = if size > MAX_SYNCED_FILE {
+                let limit = self.store.max_file_size()?;
+                let reply = if size > limit {
                     BlobControl::Failed {
                         transfer_id,
                         hash,
                         reason: format!(
-                            "{size} bytes is above the {} MiB Weave file limit.",
-                            MAX_SYNCED_FILE / (1024 * 1024)
+                            "{} is above this session's {} file size limit.",
+                            crate::util::format_size(size),
+                            crate::util::format_size(limit)
                         ),
                     }
                 } else if self.blobs.has(&hash) {
@@ -2301,7 +2493,17 @@ impl HostEngine {
                 .map(|p| p.sequence)
                 .unwrap_or(0),
             session: self.session.clone(),
+            max_file_size: self.store.max_file_size()?,
+            oversize: self.oversize_all(),
         })
+    }
+
+    /// Every oversize path in the session, in a stable order so an unchanged
+    /// situation produces an unchanged snapshot.
+    fn oversize_all(&self) -> Vec<OversizePath> {
+        let mut all: Vec<OversizePath> = self.oversize.values().flatten().cloned().collect();
+        all.sort_by(|a, b| a.path.cmp(&b.path).then(a.actor_id.cmp(&b.actor_id)));
+        all
     }
 
     fn broadcast_control(&mut self) -> Result<()> {

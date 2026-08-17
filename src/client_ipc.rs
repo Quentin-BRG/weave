@@ -239,6 +239,19 @@ impl ClientEngine {
                 self.requests.insert(request_id, PendingRequest { reply });
                 self.send(ClientMessage::PushRequest { request_id });
             }
+            IpcCommand::LimitShow => {
+                let value = attempt!(self.limit_json());
+                let _ = reply.send(IpcResponse::ok(value));
+            }
+            IpcCommand::LimitSet { max_file_size } => {
+                attempt!(self.require_connection());
+                let request_id = Uuid::new_v4();
+                self.requests.insert(request_id, PendingRequest { reply });
+                self.send(ClientMessage::SetFileLimit {
+                    request_id,
+                    max_file_size,
+                });
+            }
             IpcCommand::Invite
             | IpcCommand::TunnelRestart
             | IpcCommand::Stop
@@ -327,7 +340,85 @@ impl ClientEngine {
             "rejected_paths": self.rejected_paths,
             "notices": self.notices,
             "file_count": manifest.len(),
+            "max_file_size": self.max_file_size,
+            "max_file_size_human": crate::util::format_size(self.max_file_size),
+            "oversize": self.oversize_json()?,
+            "disk": self.disk_json(),
         }))
+    }
+
+    fn limit_json(&mut self) -> Result<serde_json::Value> {
+        let largest = self
+            .store
+            .replica_manifest()?
+            .into_iter()
+            .max_by_key(|(_, entry)| entry.size);
+        Ok(serde_json::json!({
+            "max_file_size": self.max_file_size,
+            "max_file_size_human": crate::util::format_size(self.max_file_size),
+            "control_version": self.store.control_version()?,
+            "largest_file": largest.as_ref().map(|(path, entry)| serde_json::json!({
+                "path": path,
+                "size": entry.size,
+                "size_human": crate::util::format_size(entry.size),
+            })),
+            "oversize": self.oversize_json()?,
+        }))
+    }
+
+    /// Every path the session is holding back, whoever it belongs to.
+    ///
+    /// Taken from the control snapshot so each participant sees the same list,
+    /// and marked with `mine` so a reader can tell at a glance whether the file
+    /// blocking publication is one they can do something about.
+    pub(crate) fn oversize_json(&self) -> Result<serde_json::Value> {
+        let mut rows = Vec::new();
+        let mut seen: HashSet<(Uuid, String)> = HashSet::new();
+        if let Some(control) = &self.control {
+            for item in &control.oversize {
+                seen.insert((item.actor_id, item.path.to_string()));
+                rows.push(serde_json::json!({
+                    "path": item.path,
+                    "size": item.size,
+                    "size_human": crate::util::format_size(item.size),
+                    "actor_id": item.actor_id,
+                    "display_name": item.display_name,
+                    "canonical": item.canonical,
+                    "mine": item.actor_id == self.actor_id,
+                }));
+            }
+        }
+        // Anything this replica knows about but has not managed to report yet -
+        // offline, or found a moment ago. Being disconnected is not a reason to
+        // stop showing the file that is blocking the session.
+        for item in self.store.oversize()? {
+            if seen.contains(&(self.actor_id, item.path.to_string())) {
+                continue;
+            }
+            rows.push(serde_json::json!({
+                "path": item.path,
+                "size": item.size,
+                "size_human": crate::util::format_size(item.size),
+                "actor_id": self.actor_id,
+                "display_name": self.display_name,
+                "canonical": item.canonical,
+                "mine": true,
+            }));
+        }
+        Ok(serde_json::Value::Array(rows))
+    }
+
+    /// What this machine has left to work with.
+    ///
+    /// `available_bytes` is absent rather than zero when the platform will not
+    /// say, so nothing downstream mistakes "unknown" for "full".
+    fn disk_json(&self) -> serde_json::Value {
+        let available = crate::util::available_space(&self.paths.repo_root);
+        serde_json::json!({
+            "available_bytes": available,
+            "available_human": available.map(crate::util::format_size),
+            "low": available.map(|free| free < self.max_file_size.saturating_mul(2)),
+        })
     }
 
     fn overlapping_tasks(&self, task: &Task) -> Vec<serde_json::Value> {
@@ -453,9 +544,15 @@ impl ClientEngine {
                     .blobs
                     .ingest_file(std::path::Path::new(&source), CLASSIFY_PREFIX)?
                     .ok_or_else(|| crate::error::usage(format!("No such file: {source}")))?;
-                if ingested.size > MAX_SYNCED_FILE {
-                    return Err(crate::error::unsupported(
-                        "The supplied resolution is above the Weave file size limit.",
+                if ingested.size > self.max_file_size {
+                    return Err(crate::error::unsupported(format!(
+                        "The supplied resolution is {}, above this session's {} file size limit.",
+                        crate::util::format_size(ingested.size),
+                        crate::util::format_size(self.max_file_size)
+                    ))
+                    .with_detail(
+                        "Resolve with smaller content, or raise the limit with \
+                         `weave limit set <size>`.",
                     ));
                 }
                 let mode = conflict

@@ -240,6 +240,35 @@ impl Participant {
         self.daemon = Some(child);
     }
 
+    /// Run a command that is meant to finish on its own, and return whether it
+    /// succeeded together with everything it printed.
+    ///
+    /// Used for the daemon commands that are supposed to refuse: `weave host`
+    /// blocks forever once it has started, so a refusal that failed to happen
+    /// must end the test rather than hang it.
+    pub fn run_until_exit(&mut self, args: &[&str], timeout: Duration) -> (bool, String) {
+        self.start_daemon(args);
+        let deadline = Instant::now() + timeout;
+        let mut child = self.daemon.take().expect("spawned");
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return (status.success(), self.daemon_output()),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "`weave {args:?}` never exited in {}\noutput:\n{}",
+                        self.repo.display(),
+                        self.daemon_output()
+                    );
+                }
+            }
+        }
+    }
+
     pub fn daemon_output(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }

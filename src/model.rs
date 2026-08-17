@@ -17,14 +17,23 @@ use uuid::Uuid;
 
 /// Files larger than this are never three-way merged as text.
 pub const TEXT_MERGE_LIMIT: u64 = 1024 * 1024; // 1 MiB
-/// Largest file a session will synchronize.
+/// Largest file a session will synchronize, until the session says otherwise.
 ///
 /// No longer a protocol constraint — content is streamed and nothing holds a
 /// whole file — but a resource budget: the host uploads every change to every
 /// participant over one uplink, so one modification costs `size x participants`
-/// on a single machine (`docs/BLOB-PLANE.md`). Phase 4 turns this constant into
-/// canonical session state that a session can raise.
-pub const MAX_SYNCED_FILE: u64 = 128 * 1024 * 1024; // 128 MiB
+/// on a single machine (`docs/BLOB-PLANE.md`). This is only the default: the
+/// live value is canonical session state, carried in [`crate::proto::
+/// ControlSnapshot::max_file_size`] and authoritative for every participant.
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 128 * 1024 * 1024; // 128 MiB
+/// Bounds on what a session may set the limit to.
+///
+/// The floor keeps a session from being configured into uselessness — below a
+/// megabyte, ordinary source files start failing. The ceiling is a sanity
+/// bound, not a capability claim: the transport streams, but one modification
+/// still costs `size x participants` on the host's uplink.
+pub const MIN_FILE_LIMIT: u64 = 1024 * 1024; // 1 MiB
+pub const MAX_FILE_LIMIT: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
 /// Maximum application message accepted after reassembly (specification
 /// section 66). Sized for a full canonical manifest, the largest control
 /// message that exists now that no file content travels on the control plane.

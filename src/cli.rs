@@ -67,6 +67,9 @@ pub enum Command {
     Commit(CommitCommand),
     /// Ask the host to push the published branch to its remote.
     Push(JsonArgs),
+    /// Show or change the session's file size limit.
+    #[command(subcommand)]
+    Limit(LimitCommand),
     /// Manage the Cloudflare Quick Tunnel.
     #[command(subcommand)]
     Tunnel(TunnelCommand),
@@ -110,6 +113,9 @@ pub struct HostArgs {
     /// Do not expose any remote endpoint; only this machine participates.
     #[arg(long)]
     pub local: bool,
+    /// Largest file this session will synchronize (default 128MiB).
+    #[arg(long, value_name = "SIZE")]
+    pub max_file_size: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -234,6 +240,19 @@ pub enum CommitCommand {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum LimitCommand {
+    /// Show the session file size limit and anything above it.
+    Show(JsonArgs),
+    /// Change the session file size limit for every participant.
+    Set {
+        /// A size such as 256MiB, 512MB or a plain number of bytes.
+        size: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum TunnelCommand {
     /// Replace the Quick Tunnel, keeping the same Weave session.
     Restart(JsonArgs),
@@ -287,13 +306,20 @@ pub fn run(cli: Cli) -> Result<()> {
     };
 
     match cli.command {
-        Command::Host(args) => crate::daemon::run_host(
-            &start_dir,
-            crate::daemon::HostOptions {
-                lan: args.lan,
-                local_only: args.local,
-            },
-        ),
+        Command::Host(args) => {
+            let max_file_size = match &args.max_file_size {
+                Some(text) => Some(crate::util::parse_size(text)?),
+                None => None,
+            };
+            crate::daemon::run_host(
+                &start_dir,
+                crate::daemon::HostOptions {
+                    lan: args.lan,
+                    local_only: args.local,
+                    max_file_size,
+                },
+            )
+        }
         Command::Join(args) => {
             // Preflight before the prompt: nobody should paste a session secret
             // into a repository that cannot host it.
@@ -348,6 +374,22 @@ pub fn run(cli: Cli) -> Result<()> {
             let paths = Paths::discover(&start_dir)?;
             let value = ipc::call(&paths, IpcCommand::Push)?;
             emit(args.json, value, render::push);
+            Ok(())
+        }
+        Command::Limit(LimitCommand::Show(args)) => {
+            let paths = Paths::discover(&start_dir)?;
+            let value = ipc::call(&paths, IpcCommand::LimitShow)?;
+            emit(args.json, value, render::limit);
+            Ok(())
+        }
+        Command::Limit(LimitCommand::Set { size, json }) => {
+            let paths = Paths::discover(&start_dir)?;
+            let max_file_size = crate::util::parse_size(&size)?;
+            ipc::call(&paths, IpcCommand::LimitSet { max_file_size })?;
+            // Read it back rather than echoing the request: what matters is the
+            // value the session now holds, which every participant will see.
+            let value = ipc::call(&paths, IpcCommand::LimitShow)?;
+            emit(json, value, render::limit);
             Ok(())
         }
         Command::Tunnel(TunnelCommand::Restart(args)) => {
@@ -835,6 +877,8 @@ mod render {
         println!("Conflicts:");
         println!("{}", u64_of(v, "conflicts_open"));
 
+        oversize_section(v);
+
         if let Some(rejected) = v.get("rejected_paths").and_then(|x| x.as_array()) {
             if !rejected.is_empty() {
                 println!();
@@ -843,6 +887,16 @@ mod render {
                     println!("  {} — {}", str_of(item, "path"), str_of(item, "reason"));
                 }
             }
+        }
+        if v.pointer("/disk/low").and_then(|x| x.as_bool()) == Some(true) {
+            println!();
+            println!(
+                "Disk: {} free — close to this session's {} file size limit.",
+                v.pointer("/disk/available_human")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("very little"),
+                str_of(v, "max_file_size_human")
+            );
         }
         if let Some(notices) = v.get("notices").and_then(|x| x.as_array()) {
             if !notices.is_empty() {
@@ -855,6 +909,55 @@ mod render {
                 }
             }
         }
+    }
+
+    /// The files holding the session back, if any. Silent when there are none:
+    /// this is a problem report, not a routine statistic.
+    fn oversize_section(v: &Value) {
+        let Some(list) = v.get("oversize").and_then(|x| x.as_array()) else {
+            return;
+        };
+        if list.is_empty() {
+            return;
+        }
+        println!();
+        println!("Above the session file size limit:");
+        for item in list {
+            let owner = if item.get("mine").and_then(|x| x.as_bool()) == Some(true) {
+                "on this machine".to_string()
+            } else {
+                format!("on {}'s machine", str_of(item, "display_name"))
+            };
+            println!(
+                "  {} — {} {owner}",
+                str_of(item, "path"),
+                str_of(item, "size_human")
+            );
+            if item.get("canonical").and_then(|x| x.as_bool()) == Some(true) {
+                println!("    the session still holds the previous content of this file");
+            }
+        }
+        println!();
+        println!("Git publication is blocked until every one of these is resolved.");
+        println!(
+            "Shrink or delete the file, or raise the limit with `weave limit set <size>` \
+             (currently {}).",
+            str_of(v, "max_file_size_human")
+        );
+    }
+
+    pub fn limit(v: &Value) {
+        println!("Session file size limit:");
+        println!("{}", str_of(v, "max_file_size_human"));
+        if let Some(largest) = v.get("largest_file").filter(|x| !x.is_null()) {
+            println!();
+            println!(
+                "Largest synchronized file: {} ({})",
+                str_of(largest, "path"),
+                str_of(largest, "size_human")
+            );
+        }
+        oversize_section(v);
     }
 
     pub fn peers(v: &Value) {

@@ -13,7 +13,7 @@ use crate::db;
 use crate::error::Result;
 use crate::model::*;
 use crate::path::RepoPath;
-use crate::proto::{ControlSnapshot, SessionInfo};
+use crate::proto::{ControlSnapshot, OversizeReport, SessionInfo};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -46,6 +46,12 @@ CREATE TABLE IF NOT EXISTS pub_journal (
 CREATE TABLE IF NOT EXISTS control_cache (
     id   INTEGER PRIMARY KEY CHECK (id = 1),
     data TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oversize (
+    path      TEXT PRIMARY KEY,
+    size      INTEGER NOT NULL,
+    canonical INTEGER NOT NULL DEFAULT 0
 );
 "#;
 
@@ -438,6 +444,71 @@ impl ClientStore {
         Ok(())
     }
 
+    // ---------------------------------------------------------------- oversize
+
+    /// Paths this replica is holding back for being above the session limit.
+    ///
+    /// Durable rather than in-memory: the condition outlives the daemon that
+    /// noticed it, and a restart must not quietly resume publishing a session
+    /// whose state one machine still cannot represent.
+    pub fn oversize(&self) -> Result<Vec<OversizeReport>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, size, canonical FROM oversize ORDER BY path")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (path, size, canonical) = row?;
+            out.push(OversizeReport {
+                path: RepoPath::new(&path)?,
+                size: size as u64,
+                canonical: canonical != 0,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn put_oversize(&self, path: &RepoPath, size: u64, canonical: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO oversize(path, size, canonical) VALUES (?1, ?2, ?3)
+             ON CONFLICT(path) DO UPDATE SET size = excluded.size,
+                                            canonical = excluded.canonical",
+            params![path.as_str(), size as i64, canonical as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Forget a path's oversize condition. Returns whether there was one.
+    pub fn clear_oversize(&self, path: &RepoPath) -> Result<bool> {
+        let removed = self
+            .conn
+            .execute("DELETE FROM oversize WHERE path = ?1", [path.as_str()])?;
+        Ok(removed > 0)
+    }
+
+    pub fn is_oversize(&self, path: &RepoPath) -> Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT 1 FROM oversize WHERE path = ?1")?;
+        Ok(stmt
+            .query_row([path.as_str()], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// Drop every oversize record, so the next scan re-derives the set against
+    /// a limit that has just changed.
+    pub fn clear_all_oversize(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM oversize", [])?;
+        Ok(())
+    }
+
     // ------------------------------------------------------- publication journal
 
     pub fn put_publication_journal(
@@ -535,7 +606,7 @@ impl ClientStore {
     /// from a session that is still live.
     pub fn reset(&mut self) -> Result<()> {
         let tx = self.conn.transaction()?;
-        for table in ["replica", "pub_journal", "control_cache"] {
+        for table in ["replica", "pub_journal", "control_cache", "oversize"] {
             tx.execute(&format!("DELETE FROM {table}"), [])?;
         }
         tx.commit()?;

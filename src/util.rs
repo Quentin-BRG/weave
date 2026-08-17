@@ -167,3 +167,174 @@ pub fn short_id(prefix: char, id: &uuid::Uuid) -> String {
 pub fn short_oid(oid: &str) -> String {
     oid.chars().take(7).collect()
 }
+
+// ---------------------------------------------------------------------------
+// Sizes
+// ---------------------------------------------------------------------------
+
+/// Human form of a byte count, in the binary units people actually mean.
+///
+/// Deliberately short: this appears inside sentences a user reads once, not in
+/// a table to be aligned.
+pub fn format_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        let value = bytes as f64 / GIB as f64;
+        return format!("{value:.1} GiB");
+    }
+    if bytes >= MIB {
+        let value = bytes as f64 / MIB as f64;
+        if value >= 10.0 {
+            return format!("{} MiB", value.round() as u64);
+        }
+        return format!("{value:.1} MiB");
+    }
+    if bytes >= KIB {
+        return format!("{} KiB", bytes / KIB);
+    }
+    format!("{bytes} bytes")
+}
+
+/// Parse a size a person typed: `134217728`, `128MiB`, `128 MB`, `2g`.
+///
+/// Both spellings of every unit mean the binary one. Nobody typing `128MB` at a
+/// file-size limit means 128,000,000, and quietly giving them 2.4% less than
+/// they asked for would be worse than the pedantry it avoids.
+pub fn parse_size(text: &str) -> Result<u64> {
+    let raw = text.trim();
+    let lower = raw.to_ascii_lowercase();
+    let digits_end = lower
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(lower.len());
+    let (number, unit) = lower.split_at(digits_end);
+    let unit = unit.trim();
+    let multiplier: u64 = match unit {
+        "" | "b" | "byte" | "bytes" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        other => {
+            return Err(crate::error::usage(format!("Unknown size unit `{other}`."))
+                .with_detail("Use bytes, or a size like 64MiB, 256MB or 2GiB."))
+        }
+    };
+    let value: f64 = number.parse().map_err(|_| {
+        crate::error::usage(format!("`{raw}` is not a size."))
+            .with_detail("Give a size like 128MiB, 512MB or a plain number of bytes.")
+    })?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(crate::error::usage(format!("`{raw}` is not a size.")));
+    }
+    let bytes = value * multiplier as f64;
+    if bytes > u64::MAX as f64 {
+        return Err(crate::error::usage(format!("`{raw}` is too large.")));
+    }
+    Ok(bytes as u64)
+}
+
+/// Free space on the filesystem holding `path`, when the platform will say.
+///
+/// `None` means "not known", never "none left": every caller treats an unknown
+/// answer as permission to continue. A check that cannot be made must not
+/// become a refusal.
+pub fn available_space(path: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        // Declared here rather than pulled in as a dependency: one call, one
+        // signature, stable since Windows 2000.
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetDiskFreeSpaceExW(
+                directory: *const u16,
+                free_bytes_available_to_caller: *mut u64,
+                total_bytes: *mut u64,
+                total_free_bytes: *mut u64,
+            ) -> i32;
+        }
+        let directory = existing_ancestor(path)?;
+        let mut wide: Vec<u16> = directory.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let mut free: u64 = 0;
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        Some(free)
+    }
+    #[cfg(not(windows))]
+    {
+        // `statvfs` would need a libc dependency for a struct whose layout
+        // differs across the platforms Weave supports. `df` is POSIX, and this
+        // runs at most once per check rather than per file.
+        let directory = existing_ancestor(path)?;
+        let out = std::process::Command::new("df")
+            .arg("-Pk")
+            .arg(&directory)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text.lines().nth(1)?;
+        let available_kib: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
+        Some(available_kib.saturating_mul(1024))
+    }
+}
+
+/// The nearest ancestor of `path` that exists, so the probe can be aimed at a
+/// directory Weave is about to create files in but has not created yet.
+fn existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut cursor = Some(path);
+    while let Some(candidate) = cursor {
+        if candidate.exists() {
+            return Some(candidate.to_path_buf());
+        }
+        cursor = candidate.parent();
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_parse_the_way_people_write_them() {
+        assert_eq!(parse_size("128MiB").unwrap(), 128 * 1024 * 1024);
+        assert_eq!(parse_size("128 mb").unwrap(), 128 * 1024 * 1024);
+        assert_eq!(parse_size("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("1048576").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("1.5MiB").unwrap(), 1024 * 1024 + 512 * 1024);
+        assert!(parse_size("many").is_err());
+        assert!(parse_size("12 furlongs").is_err());
+    }
+
+    #[test]
+    fn sizes_are_formatted_for_a_sentence() {
+        assert_eq!(format_size(128 * 1024 * 1024), "128 MiB");
+        assert_eq!(format_size(1024 * 1024 + 512 * 1024), "1.5 MiB");
+        assert_eq!(format_size(4096), "4 KiB");
+        assert_eq!(format_size(12), "12 bytes");
+    }
+
+    /// Whatever the platform answers, it must be an answer we can act on: a
+    /// number, or an honest "not known".
+    #[test]
+    fn free_space_is_either_known_or_unknown() {
+        let here = std::env::temp_dir();
+        if let Some(bytes) = available_space(&here) {
+            assert!(bytes > 0, "a writable temp directory with no space at all");
+        }
+    }
+}

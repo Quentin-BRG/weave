@@ -333,9 +333,18 @@ machine-readable result on stdout, diagnostics on stderr, meaningful exit codes.
 Weave V1 rejects repositories using Git submodules, Git LFS, sparse checkouts,
 secondary worktrees, tracked symlinks, gitlinks, custom clean/smudge filters or
 `working-tree-encoding`. It enforces a portable filename subset so Windows, macOS
-and Linux participants can hold the same working tree, and it refuses files above
-10 MiB. `weave host` and `weave join` refuse such a repository before starting, and
-`weave doctor` lists everything at once.
+and Linux participants can hold the same working tree. `weave host` and
+`weave join` refuse such a repository before starting, and `weave doctor` lists
+everything at once.
+
+A session also carries a file size limit — 128 MiB by default, set with
+`weave host --max-file-size <size>` and changed later with `weave limit set
+<size>`. It is a resource budget, not a protocol constraint: the host uploads
+every change to every participant over one uplink. A repository already holding a
+file above it will not start a session, and a file that goes above it during one
+is left exactly as it is, shown to everybody, and blocks Git publication until it
+is shrunk, deleted, or the limit is raised. Nothing is ever partially
+synchronized.
 
 ---
 

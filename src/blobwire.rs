@@ -183,6 +183,7 @@ impl BlobReceiver {
                 "Weave blob transfer {transfer_id} is already open."
             )));
         }
+        self.blobs.ensure_room_for(size)?;
         let mut writer = match self.blobs.resume_writer(hash)? {
             Some(writer) => writer,
             // Another receiver in this process is already fetching this

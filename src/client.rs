@@ -162,6 +162,19 @@ pub struct ClientEngine {
     scan_cache: scan::ScanCache,
     /// Large files seen mid-write, and what they looked like at the time.
     unstable: HashMap<RepoPath, Observation>,
+    /// The session's file size limit, as of the last control snapshot.
+    ///
+    /// Cached out of `control` because it is consulted on every capture,
+    /// including before the first snapshot of a session arrives: the durable
+    /// value from the last connection is a far better answer there than the
+    /// compiled-in default.
+    max_file_size: u64,
+    /// The oversize set as the host was last told it, so an unchanged
+    /// situation does not produce a message every tick.
+    reported_oversize: Option<Vec<OversizeReport>>,
+    /// Set when a first join cannot proceed: the daemon exits with this rather
+    /// than starting a session it cannot represent.
+    fatal: Option<tokio::sync::mpsc::Sender<WeaveError>>,
 
     last_rescan_ms: i64,
     last_presence_ms: i64,
@@ -224,6 +237,9 @@ impl ClientEngine {
             expected_head,
             scan_cache: scan::ScanCache::new(),
             unstable: HashMap::new(),
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
+            reported_oversize: None,
+            fatal: None,
             last_rescan_ms: 0,
             last_presence_ms: 0,
             last_heartbeat_ms: 0,
@@ -237,6 +253,22 @@ impl ClientEngine {
             materialization_blocked: false,
             shutdown: false,
         }
+    }
+
+    /// Where to report a condition that must end the session rather than
+    /// degrade it. Set by the participant daemon before the engine starts.
+    pub fn set_fatal_channel(&mut self, tx: tokio::sync::mpsc::Sender<WeaveError>) {
+        self.fatal = Some(tx);
+    }
+
+    /// The session limit this replica last learned, so the very first scan of
+    /// a reconnecting daemon judges files against the session's value and not
+    /// against the default.
+    pub fn load_cached_limit(&mut self) -> Result<()> {
+        if let Some(control) = self.store.control_cache()? {
+            self.max_file_size = control.max_file_size;
+        }
+        Ok(())
     }
 
     pub fn spawn(self) -> (ClientHandle, std::thread::JoinHandle<()>) {
@@ -356,6 +388,7 @@ impl ClientEngine {
             &previous,
             &self.blobs,
             &mut self.scan_cache,
+            self.max_file_size,
         )?;
         self.rejected_paths = result.rejected;
         for (path, entry) in result.entries {
@@ -393,6 +426,11 @@ impl ClientEngine {
         // A full rescan on (re)connect is mandatory (specification section 32):
         // anything edited while Weave was not watching is captured here.
         self.full_rescan()?;
+        // The host rebuilds its picture of this replica from this replica, so
+        // an oversize file found while offline is announced on arrival rather
+        // than waiting for something to change.
+        self.reported_oversize = None;
+        self.sync_oversize_report()?;
         Ok(())
     }
 
@@ -452,6 +490,9 @@ impl ClientEngine {
         if now - self.last_retry_ms >= RETRY_INTERVAL_MS {
             self.last_retry_ms = now;
             self.flush_outbox()?;
+            // Whatever produced a change - a watcher batch, a rescan, a limit
+            // that moved - the host hears about it from one place.
+            self.sync_oversize_report()?;
             if self.materialization_blocked {
                 self.sync_working_tree()?;
             }
@@ -648,10 +689,23 @@ impl ClientEngine {
         }
         let root = self.paths.repo_root.clone();
         let previous = self.store.replica_manifest()?;
-        let result = scan::scan_repository(&root, &previous, &self.blobs, &mut self.scan_cache)?;
+        let result = scan::scan_repository(
+            &root,
+            &previous,
+            &self.blobs,
+            &mut self.scan_cache,
+            self.max_file_size,
+        )?;
         self.rejected_paths = result.rejected;
 
-        let seen: HashSet<RepoPath> = result.entries.keys().cloned().collect();
+        let mut seen: HashSet<RepoPath> = result.entries.keys().cloned().collect();
+        // Above the limit: present, untouched, and recorded as the reason the
+        // session cannot be published. Marked seen so the vanished-path pass
+        // below does not read a file it deliberately did not read.
+        for (path, size) in &result.oversize {
+            seen.insert(path.clone());
+            self.record_oversize(path, *size)?;
+        }
         for path in result.entries.keys() {
             if let Err(e) = self.capture_path(path) {
                 self.note_rejected(path.as_str(), &e.message);
@@ -779,6 +833,12 @@ impl ClientEngine {
             .get(path)
             .map(|seen| (seen.base_revision, seen.base_entry.clone()));
         if !self.has_settled(path) {
+            return Ok(false);
+        }
+        // Judged from the filesystem's own size, before anything is read: a
+        // file the session cannot carry must not be hashed into the blob store
+        // on its way to being refused.
+        if self.check_oversize(path)? {
             return Ok(false);
         }
         let mut state = self.store.path_state(path)?;
@@ -958,6 +1018,154 @@ impl ClientEngine {
         self.submit_path(path)
     }
 
+    // -------------------------------------------------------- the size limit
+
+    /// Is `path` above the session limit, and record the answer either way.
+    ///
+    /// The whole state machine of `docs/BLOB-PLANE.md` section 4 turns on this
+    /// one question being asked before anything is read, on every capture
+    /// attempt. Nothing here touches the file: an oversize file is preserved
+    /// exactly, never hashed, never copied, never rewritten.
+    fn check_oversize(&mut self, path: &RepoPath) -> Result<bool> {
+        let fs_path = path.to_fs_path(&self.paths.repo_root);
+        let size = match std::fs::symlink_metadata(&fs_path) {
+            Ok(meta) if meta.is_file() => meta.len(),
+            // Gone, or not a file at all: whatever this path was, it is not an
+            // oversize file now. Deleting is one of the two ways out.
+            _ => {
+                self.forget_oversize(path)?;
+                return Ok(false);
+            }
+        };
+        if size <= self.max_file_size {
+            self.forget_oversize(path)?;
+            return Ok(false);
+        }
+        self.record_oversize(path, size)?;
+        Ok(true)
+    }
+
+    /// Durably record that `path` is being held back, and say so once.
+    fn record_oversize(&mut self, path: &RepoPath, size: u64) -> Result<()> {
+        let state = self.store.path_state(path)?;
+        let canonical = state.confirmed.is_some();
+        let known = self.store.is_oversize(path)?;
+        self.store.put_oversize(path, size, canonical)?;
+        if !known {
+            let limit = crate::util::format_size(self.max_file_size);
+            let actual = crate::util::format_size(size);
+            self.note(if canonical {
+                format!(
+                    "{path} has grown to {actual}, above the session limit of {limit}. Your copy \
+                     is preserved and untouched, the session still holds the previous content, \
+                     and Git publication is blocked until this is resolved. Shrink the file, or \
+                     raise the limit with `weave limit set <size>`."
+                )
+            } else {
+                format!(
+                    "{path} is {actual}, above the session limit of {limit}. It stays exactly as \
+                     it is on this machine and is not synchronized, and Git publication is \
+                     blocked until this is resolved. Shrink or delete the file, or raise the \
+                     limit with `weave limit set <size>`."
+                )
+            });
+        }
+        Ok(())
+    }
+
+    /// Drop any oversize record for `path`, and say so once when there was one.
+    fn forget_oversize(&mut self, path: &RepoPath) -> Result<()> {
+        if self.store.clear_oversize(path)? {
+            self.note(format!(
+                "{path} is within the session file size limit again and is synchronized normally."
+            ));
+        }
+        Ok(())
+    }
+
+    /// Tell the host what this replica is holding back, when that has changed.
+    ///
+    /// Sent as a whole set rather than as deltas: the host's picture of one
+    /// participant is replaced by the participant's own, so there is no way for
+    /// the two to drift apart.
+    fn sync_oversize_report(&mut self) -> Result<()> {
+        if !self.connected {
+            return Ok(());
+        }
+        let current = self.store.oversize()?;
+        if self.reported_oversize.as_ref() == Some(&current) {
+            return Ok(());
+        }
+        self.reported_oversize = Some(current.clone());
+        self.send(ClientMessage::ReportOversize { paths: current });
+        // A file blocking publication is the sort of thing a barrier is
+        // waiting to hear about.
+        self.check_barrier_ready()
+    }
+
+    /// The authoritative check a join cannot make before it connects.
+    ///
+    /// `weave join` compares against the default beforehand, but only the
+    /// session knows its own limit, and it arrives with `Welcome`. A machine
+    /// that cannot represent the session's state from its first moment does not
+    /// enter it half-way: the daemon exits and says why. Once a replica is
+    /// established, the same situation is the ordinary oversize condition -
+    /// reported, visible, blocking publication - because there is then a
+    /// session to be part of and work not to throw away.
+    fn verify_join_against_limit(&mut self) -> Result<()> {
+        let mine = self.store.oversize()?;
+        let Some(first) = mine.first() else {
+            return Ok(());
+        };
+        let list: Vec<String> = mine
+            .iter()
+            .map(|item| format!("{} — {}", item.path, crate::util::format_size(item.size)))
+            .collect();
+        let error = crate::error::unsupported(format!(
+            "Cannot join this Weave session: {} is above the session file size limit of {}.",
+            first.path,
+            crate::util::format_size(self.max_file_size)
+        ))
+        .with_detail(format!(
+            "{}\n\nRemove these files from the repository, or ask the host to raise the limit \
+             with `weave limit set <size>`, then join again.",
+            list.join("\n")
+        ));
+        match &self.fatal {
+            Some(tx) => {
+                let _ = tx.try_send(error);
+                self.shutdown = true;
+            }
+            None => {
+                // No channel to end on - the host's own replica, which was
+                // checked before the session started. Refuse to run degraded.
+                self.local_state = SyncState::Degraded {
+                    reason: error.message.clone(),
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn oversize_detail(&self) -> Result<Option<String>> {
+        let mine = self.store.oversize()?;
+        if mine.is_empty() {
+            return Ok(None);
+        }
+        let list: Vec<String> = mine
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} is {}, above the session limit of {}",
+                    item.path,
+                    crate::util::format_size(item.size),
+                    crate::util::format_size(self.max_file_size)
+                )
+            })
+            .collect();
+        Ok(Some(list.join("; ")))
+    }
+
     fn note_rejected(&mut self, path: &str, reason: &str) {
         let entry = RejectedPath {
             path: path.to_string(),
@@ -991,12 +1199,18 @@ impl ClientEngine {
                 pending_publications,
                 host_state_hash,
             } => {
+                // Read before the manifest is installed, which is what makes a
+                // replica stop being new.
+                let first_join = !self.store.has_manifest()?;
                 self.session = session.clone();
                 self.store.set_session(&session)?;
                 if let Some(manifest) = manifest {
                     self.apply_manifest(snapshot_revision, manifest, &host_state_hash)?;
                 }
                 self.apply_control(*control)?;
+                if first_join {
+                    self.verify_join_against_limit()?;
+                }
                 if !pending_publications.is_empty() {
                     tracing::info!(
                         "{} Git publication(s) to install",
@@ -1241,6 +1455,8 @@ impl ClientEngine {
 
     fn apply_control(&mut self, control: ControlSnapshot) -> Result<()> {
         self.store.set_control_cache(&control)?;
+        let limit_changed = control.max_file_size != self.max_file_size;
+        self.max_file_size = control.max_file_size;
         let previous_open: HashSet<Uuid> = self
             .control
             .as_ref()
@@ -1278,6 +1494,20 @@ impl ClientEngine {
                 }
             }
             self.sync_working_tree()?;
+        }
+
+        // A new limit re-decides every path, in both directions: what was too
+        // large may now be ordinary work to capture, and what was ordinary may
+        // now be held back. The set is discarded rather than filtered so the
+        // rescan derives it afresh from the files themselves.
+        if limit_changed {
+            self.note(format!(
+                "The session file size limit is now {}.",
+                crate::util::format_size(self.max_file_size)
+            ));
+            self.store.clear_all_oversize()?;
+            self.full_rescan()?;
+            self.sync_oversize_report()?;
         }
         Ok(())
     }
@@ -1356,6 +1586,14 @@ impl ClientEngine {
         // may never do. The path is re-examined every tick and materialized as
         // soon as it settles, one way or the other.
         if self.unstable.contains_key(path) {
+            return Ok(());
+        }
+        // Or it declined because the local file is above the session limit.
+        // Its content was never captured, so canonical content written over it
+        // would be a silent deletion of bytes only this machine holds. The
+        // session keeps the previous content and refuses to publish; this
+        // working file is left exactly as its author last wrote it.
+        if self.store.is_oversize(path)? {
             return Ok(());
         }
         self.write_canonical(path)
@@ -1789,19 +2027,25 @@ impl ClientEngine {
         let has_conflict = self.barrier.as_ref().map(|b| b.conflicted).unwrap_or(false)
             || !open_conflicts.is_empty();
 
-        let detail = if has_conflict {
+        let mut blockers: Vec<String> = Vec::new();
+        if has_conflict {
             if open_conflicts.is_empty() {
-                "unresolved conflict from pre-barrier work".to_string()
+                blockers.push("unresolved conflict from pre-barrier work".to_string());
             } else {
-                open_conflicts.join("; ")
+                blockers.push(open_conflicts.join("; "));
             }
-        } else {
-            String::new()
-        };
+        }
+        // A file this replica is holding back is state the session cannot
+        // reproduce here. Answering "ready" would let a publication commit a
+        // tree this machine's disk does not match.
+        if let Some(detail) = self.oversize_detail()? {
+            blockers.push(detail);
+        }
+
         self.send(ClientMessage::BarrierReady {
             barrier_id,
-            ok: !has_conflict,
-            detail,
+            ok: blockers.is_empty(),
+            detail: blockers.join("; "),
         });
         if let Some(barrier) = &mut self.barrier {
             barrier.ready_sent = true;
@@ -2312,5 +2556,94 @@ mod tests {
         let gone = RepoPath::new("removed.bin").unwrap();
         assert!(f.engine.has_settled(&gone));
         assert!(f.engine.unstable.is_empty());
+    }
+
+    // ------------------------------------------------------- the size limit
+
+    /// A file above the limit is noticed without being read.
+    ///
+    /// Proved through the blob store: nothing about the file's content may
+    /// reach it, because Weave promises to leave an oversize file entirely
+    /// alone rather than hash it on its way to refusing it.
+    #[test]
+    fn a_file_above_the_limit_is_recorded_without_being_read() {
+        let mut f = fixture();
+        f.engine.max_file_size = 4096;
+        let path = RepoPath::new("huge.bin").unwrap();
+        let fs_path = f.engine.paths.repo_root.join("huge.bin");
+        let bytes = vec![5u8; 16 * 1024];
+        std::fs::write(&fs_path, &bytes).unwrap();
+
+        let (before, _) = f.engine.blobs.stats().unwrap();
+        assert!(!f.engine.capture_path(&path).unwrap(), "it was captured");
+        let (after, _) = f.engine.blobs.stats().unwrap();
+        assert_eq!(after, before, "an oversize file was read into the store");
+
+        let held = f.engine.store.oversize().unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].path, path);
+        assert_eq!(held[0].size, bytes.len() as u64);
+        assert_eq!(std::fs::read(&fs_path).unwrap(), bytes, "the file changed");
+
+        // Back under the limit, it is ordinary work again, with nothing to undo.
+        std::fs::write(&fs_path, vec![5u8; 128]).unwrap();
+        assert!(f.engine.capture_path(&path).unwrap());
+        assert!(f.engine.store.oversize().unwrap().is_empty());
+    }
+
+    /// The one divergence Weave tolerates must not become a lost edit.
+    ///
+    /// A path that is already canonical and then grows past the limit holds
+    /// bytes no replica has. Writing canonical content over it would delete the
+    /// only copy of them, so the write waits - and the barrier refuses, so the
+    /// divergence cannot be published while it lasts.
+    #[test]
+    fn canonical_content_never_overwrites_a_file_that_grew_past_the_limit() {
+        let mut f = fixture();
+        f.engine.max_file_size = 4096;
+        let path = RepoPath::new("cut.mov").unwrap();
+        let fs_path = f.engine.paths.repo_root.join("cut.mov");
+
+        // Canonical content, present and ready to be written out.
+        let canonical = vec![1u8; 64];
+        let hash = f.engine.blobs.put(&canonical).unwrap();
+        let state = PathState {
+            confirmed: Some(FileEntry {
+                blob_hash: hash,
+                size: canonical.len() as u64,
+                git_mode: GitMode::Regular,
+                file_kind: FileKind::Binary,
+            }),
+            confirmed_revision: 2,
+            ..PathState::default()
+        };
+        f.engine.store.put_path_state(&path, &state).unwrap();
+
+        let local = vec![9u8; 16 * 1024];
+        std::fs::write(&fs_path, &local).unwrap();
+
+        f.engine.materialize_if_safe(&path).unwrap();
+        assert_eq!(
+            std::fs::read(&fs_path).unwrap(),
+            local,
+            "canonical content overwrote a file Weave never captured"
+        );
+        let held = f.engine.store.oversize().unwrap();
+        assert_eq!(held.len(), 1);
+        assert!(
+            held[0].canonical,
+            "the session was not told it already holds content for this path"
+        );
+
+        // And publication is refused for as long as that is true.
+        open_barrier(&mut f.engine);
+        assert!(f.engine.oversize_detail().unwrap().is_some());
+
+        // Shrinking resolves it, and the canonical content the replica was owed
+        // is written out on the next sweep.
+        std::fs::write(&fs_path, &canonical).unwrap();
+        f.engine.materialize_if_safe(&path).unwrap();
+        assert!(f.engine.store.oversize().unwrap().is_empty());
+        assert!(f.engine.oversize_detail().unwrap().is_none());
     }
 }
