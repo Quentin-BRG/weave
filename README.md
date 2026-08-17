@@ -292,26 +292,26 @@ It never overwrites unrelated instructions.
 
 ## Command reference
 
-| Command                                             | Purpose                                                   |
-| --------------------------------------------------- | --------------------------------------------------------- | ---------------------------------- | ------------------------- | ---------------------------------- | ------- | -------------------- |
-| `weave host [--lan                                  | --local]`                                                 | Host a session (long-lived daemon) |
-| `weave join [--invite-file                          | --invite-stdin]`                                          | Join a session (long-lived daemon) |
-| `weave resume`                                      | Resume this repository's session after a crash or restart |
-| `weave leave`                                       | Leave the session and forget its local record             |
-| `weave stop`                                        | Stop the daemon, keeping the session record               |
-| `weave status [--json]`                             | Live session state                                        |
-| `weave peers [--json]`                              | Participants and presence                                 |
-| `weave invite [--json]`                             | Reprint the invite (host)                                 |
-| `weave rescan [--json]`                             | Force a full repository rescan                            |
-| `weave task start                                   | list                                                      | show                               | update                    | complete                           | cancel` | Tasks and soft locks |
-| `weave conflict list                                | show                                                      | resolve                            | dismiss`                  | Conflict inspection and resolution |
-| `weave commit prepare` / `weave commit create <id>` | Git publication                                           |
-| `weave push`                                        | Ask the host to push                                      |
-| `weave tunnel restart`                              | Replace a dead Quick Tunnel, same session                 |
-| `weave agent bootstrap`                             | Manage the `AGENTS.md` block                              |
-| `weave doctor [--install]`                          | Troubleshooting: environment, installation, repository    |
-| `weave recover [--rebuild] [--export DIR]`          | Integrity diagnostics and safe recovery                   |
-| `weave config list                                  | get                                                       | set`                               | Local Weave configuration |
+| Command | Purpose |
+| --- | --- |
+| `weave host [--lan \| --local]` | Host a session (long-lived daemon) |
+| `weave join [--invite-file \| --invite-stdin]` | Join a session (long-lived daemon) |
+| `weave resume` | Resume this repository's session after a crash or restart |
+| `weave leave` | Leave the session and forget its local record |
+| `weave stop` | Stop the daemon, keeping the session record |
+| `weave status [--json]` | Live session state |
+| `weave peers [--json]` | Participants and presence |
+| `weave invite [--json]` | Reprint the invite (host) |
+| `weave rescan [--json]` | Force a full repository rescan |
+| `weave task start \| list \| show \| update \| complete \| cancel` | Tasks and soft locks |
+| `weave conflict list \| show \| resolve \| dismiss` | Conflict inspection and resolution |
+| `weave commit prepare` / `weave commit create <id>` | Git publication |
+| `weave push` | Ask the host to push |
+| `weave tunnel restart` | Replace a dead Quick Tunnel, same session |
+| `weave agent bootstrap` | Manage the `AGENTS.md` block |
+| `weave doctor [--install]` | Troubleshooting: environment, installation, repository |
+| `weave recover [--rebuild] [--export DIR]` | Integrity diagnostics and safe recovery |
+| `weave config list \| get \| set` | Local Weave configuration |
 
 Every command an agent drives supports `--json`: stable field names, no prompts,
 machine-readable result on stdout, diagnostics on stderr, meaningful exit codes.
@@ -356,6 +356,8 @@ so it is opt-in:
 ```bash
 cargo test --test remote_tunnel -- --ignored --test-threads=1 --nocapture
 ```
+
+---
 
 ## Documentation
 
