@@ -156,7 +156,12 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
             // The scan streams every file into the blob store as it hashes it,
             // so the base manifest is durable content-addressed state without
             // the repository ever being held in memory.
-            let scan = crate::scan::scan_repository(&paths.repo_root, &BTreeMap::new(), &blobs)?;
+            let scan = crate::scan::scan_repository(
+                &paths.repo_root,
+                &BTreeMap::new(),
+                &blobs,
+                &mut crate::scan::ScanCache::new(),
+            )?;
             report_rejected(&scan.rejected);
             host_store.install_base_manifest(&scan.entries)?;
             let session = SessionInfo {

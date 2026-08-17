@@ -15,6 +15,7 @@
 mod common;
 
 use common::*;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Comfortably past the 10 MiB ceiling the old control plane imposed.
@@ -136,6 +137,69 @@ fn wait_for_agreement(session: &Session, timeout: Duration) -> String {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// Every partially received blob a participant is currently holding.
+///
+/// These are hash-named, so a transfer that is interrupted leaves behind
+/// something the next attempt can recognize and continue from.
+fn partials(participant: &Participant) -> Vec<(PathBuf, u64)> {
+    let dir = participant
+        .repo
+        .join(".git")
+        .join("weave")
+        .join("blobs")
+        .join(".partial");
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            // Not `entry.metadata()`: on Windows that reports the directory
+            // entry as it stood when the directory was enumerated, and the size
+            // recorded there does not move while the file is open. Asking for
+            // the path opens the file and reports what is really in it.
+            let len = std::fs::metadata(entry.path())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            found.push((entry.path(), len));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Block until a transfer into `participant` is genuinely in flight.
+///
+/// Sleeping a fixed time instead would be a race against the sender: a large
+/// file has to be observed as stable, hashed and submitted before a single byte
+/// moves, so a fixed delay tends to interrupt the receiver before the transfer
+/// it was meant to interrupt has even started.
+fn wait_for_transfer(participant: &Participant, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if partials(participant).iter().any(|(_, len)| *len > 0) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no transfer ever started on this participant"
+        );
+        participant.assert_daemon_healthy();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The offset a resumed download restarted from, as the receiver logged it.
+///
+/// The log is the only place this is observable from outside: the offset is
+/// negotiated inside the encrypted data plane and never reaches the working
+/// tree. `start_daemon` truncates the log, so a line found after a restart
+/// belongs to the run that restarted.
+fn resumed_offset(participant: &Participant) -> Option<u64> {
+    participant.daemon_output().lines().find_map(|line| {
+        let rest = line.split("resuming blob ").nth(1)?;
+        let rest = rest.split("at offset ").nth(1)?;
+        rest.split_whitespace().next()?.parse().ok()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -338,10 +402,14 @@ fn a_large_binary_conflict_keeps_both_candidates() {
     let guest_version = blob_bytes(42, LARGE);
     write_bytes(&session.guests[0].repo, "assets/poster.psd", &guest_version);
 
+    // Wait for the host's own edit to become canonical, and specifically for a
+    // *new* revision: a large file is captured only once it has held still, so
+    // "the outbox is empty" is also true in the moment before it is captured.
+    let before = session.host.status()["live_revision"].as_u64().unwrap_or(0);
     let host_version = blob_bytes(43, LARGE);
     write_bytes(&session.host.repo, "assets/poster.psd", &host_version);
     session.host.wait_for_status("the host edit", LONG, |v| {
-        v["outbox_pending"] == 0 && v["live_revision"].as_u64().unwrap_or(0) >= 1
+        v["outbox_pending"] == 0 && v["live_revision"].as_u64().unwrap_or(0) > before
     });
 
     session.guests[0].start_daemon(&["resume"]);
@@ -421,4 +489,257 @@ fn a_publication_containing_a_large_file_reaches_participants() {
     );
 
     session.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 8. Reconnecting resumes a transfer instead of restarting it
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_interrupted_transfer_resumes_from_a_non_zero_offset() {
+    let mut session = start_session("blob-resume", 1);
+
+    let bytes = blob_bytes(61, HUGE);
+    write_bytes(&session.host.repo, "video/resumed.mov", &bytes);
+
+    // Crash the guest while the transfer is in flight. No graceful stop: the
+    // partial is abandoned exactly where it stood, with no chance to record
+    // anything about it.
+    wait_for_transfer(&session.guests[0], LONG);
+    session.guests[0].kill_daemon();
+
+    let held = partials(&session.guests[0]);
+    assert_eq!(
+        held.len(),
+        1,
+        "expected exactly one partially received blob, found {held:?}"
+    );
+    let held = held[0].1;
+    assert!(
+        held > 0 && held < bytes.len() as u64,
+        "the interruption landed outside the transfer: {held} of {} bytes",
+        bytes.len()
+    );
+
+    // Nothing partial is visible anywhere: installation is the only path into
+    // the store, and materialization only follows installation.
+    assert!(
+        !session.guests[0].repo.join("video/resumed.mov").exists(),
+        "an unfinished transfer appeared in the working tree"
+    );
+
+    session.guests[0].start_daemon(&["resume"]);
+    session.guests[0].wait_online(LONG);
+    session.guests[0].wait_for_bytes("video/resumed.mov", &bytes, LONG);
+
+    // The property under test: the second attempt continued from the bytes
+    // already on disk rather than paying for them again.
+    let offset = resumed_offset(&session.guests[0]).unwrap_or_else(|| {
+        panic!(
+            "the guest never resumed a transfer:\n{}",
+            session.guests[0].daemon_output()
+        )
+    });
+    assert_eq!(
+        offset, held,
+        "the transfer resumed from the wrong offset (holding {held} bytes)"
+    );
+
+    // And a completed transfer leaves nothing behind to recover.
+    assert!(
+        partials(&session.guests[0]).is_empty(),
+        "a partial survived a completed transfer: {:?}",
+        partials(&session.guests[0])
+    );
+
+    wait_for_agreement(&session, LONG);
+    session.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 9. A partial that is no longer a prefix of the content is thrown away
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_damaged_partial_is_discarded_rather_than_installed() {
+    let mut session = start_session("blob-damaged", 1);
+
+    let bytes = blob_bytes(62, HUGE);
+    write_bytes(&session.host.repo, "video/damaged.mov", &bytes);
+
+    wait_for_transfer(&session.guests[0], LONG);
+    session.guests[0].kill_daemon();
+
+    // Damage what was received without changing its length, which is the one
+    // case resumption could get wrong: the offset still looks right, the
+    // remaining bytes are the right ones, and only the hash of the whole
+    // content can tell that the result is not the file that was announced.
+    let mut held = partials(&session.guests[0]);
+    let (path, len) = held.pop().expect("a partially received blob");
+    assert!(len > 0 && len < bytes.len() as u64);
+    let mut damaged = std::fs::read(&path).unwrap();
+    for byte in damaged.iter_mut().take(64 * 1024) {
+        *byte ^= 0xff;
+    }
+    std::fs::write(&path, &damaged).unwrap();
+
+    session.guests[0].start_daemon(&["resume"]);
+    session.guests[0].wait_online(LONG);
+
+    // This is the one case that deliberately pays for the content twice: the
+    // resumed tail is transferred, rejected on the whole-content hash, and the
+    // file is then fetched again from zero. With the whole suite running in
+    // parallel that does not fit in the budget a single transfer gets.
+    let patient = LONG * 3;
+
+    // The mismatch is caught when the transfer completes, the partial is
+    // destroyed rather than installed, and the content is fetched again from
+    // zero. Converging on the correct bytes is what proves all three.
+    session.guests[0].wait_for_bytes("video/damaged.mov", &bytes, patient);
+    assert!(
+        partials(&session.guests[0]).is_empty(),
+        "a rejected partial was left behind: {:?}",
+        partials(&session.guests[0])
+    );
+
+    wait_for_agreement(&session, patient);
+    session.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 10. Publication waits for a participant that cannot yet reproduce the state
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_publication_waits_for_a_participant_still_receiving_content() {
+    let mut session = start_session("blob-barrier", 1);
+
+    // Large enough that the transfer is still running when the barrier opens,
+    // and small enough to finish well inside the host's 20 second barrier
+    // timeout, which is the backstop this test must not be measuring.
+    let bytes = blob_bytes(63, LARGE);
+    write_bytes(&session.host.repo, "assets/master.psd", &bytes);
+
+    // Prepare while the guest demonstrably cannot yet reproduce the state it
+    // has been told about: its copy is a partial file in the blob store and
+    // nothing is in its working tree.
+    wait_for_transfer(&session.guests[0], LONG);
+    let prepare = session.host.json(&["commit", "prepare"]);
+
+    let disconnected = prepare["disconnected_participants"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        disconnected.is_empty(),
+        "the guest was written off as disconnected instead of waited for: {prepare}"
+    );
+
+    // A barrier that answered "ready" as soon as it was asked would let this
+    // return with the guest still half way through the transfer. It cannot
+    // answer until materialization is unblocked, which means the bytes are on
+    // disk before `prepare` comes back.
+    assert_eq!(
+        std::fs::read(session.guests[0].repo.join("assets/master.psd")).unwrap(),
+        bytes,
+        "the publication barrier did not wait for the guest to finish receiving"
+    );
+
+    // And the publication itself still completes for everybody.
+    let id = prepare["prepare_id"].as_str().unwrap().to_string();
+    let publication = session.host.json(&[
+        "commit",
+        "create",
+        &id,
+        "--message",
+        "assets: add the master",
+    ]);
+    let commit_oid = publication["descriptor"]["commit_oid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    session.guests[0].wait_for_git(&["rev-parse", "HEAD"], &commit_oid, LONG);
+
+    wait_for_agreement(&session, LONG);
+    session.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 11. Collection removes only what nothing refers to any more
+// ---------------------------------------------------------------------------
+
+#[test]
+fn collecting_garbage_never_removes_content_the_session_still_needs() {
+    let mut session = start_session("blob-gc", 1);
+
+    // One file that stays as it is, and one that is superseded. The superseded
+    // content is what makes this test non-vacuous: on a replica nothing refers
+    // to it any more, so a sweep that collects nothing at all would prove
+    // nothing about a sweep that collects too much.
+    let keep = blob_bytes(71, LARGE);
+    write_bytes(&session.host.repo, "assets/keep.bin", &keep);
+    session.guests[0].wait_for_bytes("assets/keep.bin", &keep, LONG);
+
+    let first = blob_bytes(72, LARGE);
+    write_bytes(&session.host.repo, "assets/moving.bin", &first);
+    session.guests[0].wait_for_bytes("assets/moving.bin", &first, LONG);
+    let second = blob_bytes(73, LARGE);
+    write_bytes(&session.host.repo, "assets/moving.bin", &second);
+    session.guests[0].wait_for_bytes("assets/moving.bin", &second, LONG);
+    wait_for_agreement(&session, LONG);
+    session.stop();
+
+    // Sweep each participant with the live set the daemon itself derives, and
+    // with no age guard at all — far more aggressive than the daemon ever is.
+    let sweep = |participant: &Participant| -> weave::blobs::GcReport {
+        let weave_dir = participant.repo.join(".git").join("weave");
+        let blobs = weave::blobs::BlobStore::open(weave_dir.join("blobs")).unwrap();
+        let store =
+            weave::store_client::ClientStore::open(&weave_dir.join("state.sqlite")).unwrap();
+        let mut live = store.referenced_blobs().unwrap();
+        live.extend(
+            weave::store_host::referenced_blobs_at(&weave_dir.join("host.sqlite")).unwrap(),
+        );
+        let report = blobs.collect_garbage(&live, 0).unwrap();
+
+        // Everything this replica has been told to hold is still here.
+        for (path, entry) in store.replica_manifest().unwrap() {
+            assert!(
+                blobs.has(&entry.blob_hash),
+                "collection removed live content for {}",
+                path.as_str()
+            );
+        }
+        report
+    };
+
+    let guest_report = sweep(&session.guests[0]);
+    assert!(
+        guest_report.blobs > 0,
+        "nothing was collectable on the guest, so this proves nothing"
+    );
+    sweep(&session.host);
+
+    // The host keeps more than its current manifest: every revision it can
+    // still describe names content that has to remain readable.
+    let weave_dir = session.host.repo.join(".git").join("weave");
+    let blobs = weave::blobs::BlobStore::open(weave_dir.join("blobs")).unwrap();
+    let host_store = weave::store_host::HostStore::open(&weave_dir.join("host.sqlite")).unwrap();
+    let missing = host_store.verify_blob_references(&blobs).unwrap();
+    assert!(
+        missing.is_empty(),
+        "collection broke the host's revision history: {missing:?}"
+    );
+
+    // Both copies of the working tree still reproduce from what survived.
+    for participant in session.everyone() {
+        assert_eq!(
+            std::fs::read(participant.repo.join("assets/keep.bin")).unwrap(),
+            keep
+        );
+        assert_eq!(
+            std::fs::read(participant.repo.join("assets/moving.bin")).unwrap(),
+            second
+        );
+    }
 }

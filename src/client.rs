@@ -48,6 +48,16 @@ const GIT_GUARD_INTERVAL_MS: i64 = 3_000;
 const RETRY_INTERVAL_MS: i64 = 2_000;
 /// An in-flight operation with no durable result after this long is resent.
 const RESEND_AFTER_MS: i64 = 20_000;
+/// How often unreachable blob-store content is swept up. Rare on purpose: the
+/// pass walks the store, and nothing depends on it running promptly.
+const GC_INTERVAL_MS: i64 = 15 * 60 * 1000;
+/// Files this size and above are captured only once they have stopped
+/// changing. Below it, a file is written in one go often enough that waiting
+/// would cost more than the occasional wasted hash.
+const STABILITY_THRESHOLD: u64 = 8 * 1024 * 1024;
+/// How long a large file has to hold still - same size, same modification time
+/// - before Weave believes whoever was writing it has finished.
+const STABILITY_WINDOW_MS: i64 = 1_000;
 
 pub struct IpcCall {
     pub command: IpcCommand,
@@ -85,6 +95,20 @@ struct BarrierLocal {
     watermark: u64,
     ready_sent: bool,
     conflicted: bool,
+}
+
+/// What a large file looked like when it was last checked for stability.
+#[derive(Debug, Clone)]
+struct Observation {
+    size: u64,
+    mtime_ms: i64,
+    at_ms: i64,
+    /// The canonical state this local change is based on, as it stood when the
+    /// file was first seen changing. Waiting for a large file to settle must
+    /// not turn a concurrent edit into a sequential one: whatever canonical
+    /// state arrives while it is still being written is competing with it.
+    base_revision: u64,
+    base_entry: Option<FileEntry>,
 }
 
 /// A request forwarded to the host whose answer completes a CLI command.
@@ -133,11 +157,18 @@ pub struct ClientEngine {
     notices: Vec<String>,
     expected_head: String,
 
+    /// Metadata cache in front of the hash, so a rescan of an unchanged
+    /// repository costs a stat per file rather than a read.
+    scan_cache: scan::ScanCache,
+    /// Large files seen mid-write, and what they looked like at the time.
+    unstable: HashMap<RepoPath, Observation>,
+
     last_rescan_ms: i64,
     last_presence_ms: i64,
     last_heartbeat_ms: i64,
     last_git_check_ms: i64,
     last_retry_ms: i64,
+    last_gc_ms: i64,
     heartbeat_nonce: u64,
 
     /// A Git-guard problem seen once and awaiting confirmation.
@@ -191,11 +222,16 @@ impl ClientEngine {
             rejected_paths: Vec::new(),
             notices: Vec::new(),
             expected_head,
+            scan_cache: scan::ScanCache::new(),
+            unstable: HashMap::new(),
             last_rescan_ms: 0,
             last_presence_ms: 0,
             last_heartbeat_ms: 0,
             last_git_check_ms: 0,
             last_retry_ms: 0,
+            // Not zero: the first sweep waits a full interval, by which time
+            // this replica has its manifest and knows what it is keeping.
+            last_gc_ms: crate::util::now_ms(),
             heartbeat_nonce: 0,
             git_problem_pending: false,
             materialization_blocked: false,
@@ -315,7 +351,12 @@ impl ClientEngine {
     /// (specification section 11).
     pub fn seed_materialized_from_disk(&mut self) -> Result<()> {
         let previous = BTreeMap::new();
-        let result = scan::scan_repository(&self.paths.repo_root, &previous, &self.blobs)?;
+        let result = scan::scan_repository(
+            &self.paths.repo_root,
+            &previous,
+            &self.blobs,
+            &mut self.scan_cache,
+        )?;
         self.rejected_paths = result.rejected;
         for (path, entry) in result.entries {
             let mut state = self.store.path_state(&path)?;
@@ -392,12 +433,33 @@ impl ClientEngine {
         if now - self.last_rescan_ms >= SAFETY_RESCAN_MS {
             self.full_rescan()?;
         }
+        // A file that was still being written when it was last looked at gets
+        // looked at again, rather than waiting for the next full rescan.
+        if !self.unstable.is_empty() && !self.paused() {
+            let watched: Vec<RepoPath> = self.unstable.keys().cloned().collect();
+            for path in &watched {
+                if let Err(e) = self.capture_path(path) {
+                    self.unstable.remove(path);
+                    self.note_rejected(path.as_str(), &e.message);
+                }
+            }
+            // Anything that settled may have been holding canonical content out
+            // of the working tree while it did.
+            if watched.iter().any(|p| !self.unstable.contains_key(p)) {
+                self.sync_working_tree()?;
+            }
+        }
         if now - self.last_retry_ms >= RETRY_INTERVAL_MS {
             self.last_retry_ms = now;
             self.flush_outbox()?;
             if self.materialization_blocked {
                 self.sync_working_tree()?;
             }
+            // A barrier held open by outstanding work of any kind - an
+            // unanswered operation, or content still in transit - is answered
+            // as soon as that work is done, without waiting for the event that
+            // finished it to remember to ask.
+            self.check_barrier_ready()?;
         }
         if self.connected && now - self.last_presence_ms >= PRESENCE_INTERVAL_MS {
             self.last_presence_ms = now;
@@ -421,6 +483,66 @@ impl ClientEngine {
             self.heartbeat_nonce += 1;
             let nonce = self.heartbeat_nonce;
             self.send(ClientMessage::Ping { nonce });
+        }
+        if now - self.last_gc_ms >= GC_INTERVAL_MS {
+            self.last_gc_ms = now;
+            // Reclaiming space is never worth failing a session over.
+            if let Err(e) = self.collect_garbage() {
+                tracing::warn!("blob collection failed: {}", e.message);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reclaim blob-store content nothing can reach any more.
+    ///
+    /// Runs on the replica because there is exactly one per daemon, whatever
+    /// its role. On a host machine the coordinator shares this blob store, and
+    /// keeps content the replica has no name for - the far side of every
+    /// revision, entries from conflicts, the manifest a late joiner will be
+    /// sent - so its half of the live set is read from the host database
+    /// rather than guessed at.
+    ///
+    /// Publication packs are deliberately not in anyone's live set. They are
+    /// derived from Git objects the repository still holds, and the host
+    /// rebuilds one whenever it announces a publication, including to a
+    /// participant reconnecting after being away.
+    fn collect_garbage(&mut self) -> Result<()> {
+        let mut live = self.store.referenced_blobs()?;
+        live.extend(crate::store_host::referenced_blobs_at(
+            &self.paths.host_db(),
+        )?);
+        if let Some(control) = &self.control {
+            for conflict in &control.conflicts {
+                for entry in [
+                    &conflict.base_entry,
+                    &conflict.canonical_entry,
+                    &conflict.incoming_entry,
+                    &conflict.latest_local_candidate,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    live.insert(entry.blob_hash.clone());
+                }
+            }
+        }
+        // A pack that has arrived but whose publication is still queued behind
+        // an earlier one.
+        for (hash, _) in &self.awaiting_pack {
+            live.insert(hash.clone());
+        }
+        let report = self
+            .blobs
+            .collect_garbage(&live, crate::blobs::GC_GRACE_MS)?;
+        if !report.is_empty() {
+            tracing::info!(
+                "reclaimed {} blob(s) ({} bytes), {} partial(s), {} temporary file(s)",
+                report.blobs,
+                report.bytes,
+                report.partials,
+                report.temps
+            );
         }
         Ok(())
     }
@@ -526,7 +648,7 @@ impl ClientEngine {
         }
         let root = self.paths.repo_root.clone();
         let previous = self.store.replica_manifest()?;
-        let result = scan::scan_repository(&root, &previous, &self.blobs)?;
+        let result = scan::scan_repository(&root, &previous, &self.blobs, &mut self.scan_cache)?;
         self.rejected_paths = result.rejected;
 
         let seen: HashSet<RepoPath> = result.entries.keys().cloned().collect();
@@ -566,6 +688,83 @@ impl ClientEngine {
         Ok(())
     }
 
+    /// True when `path` is in a state worth capturing.
+    ///
+    /// A large file exists on disk long before it is finished: an editor
+    /// flushing 40 MiB, a download, a copy across a network share. Hashing it
+    /// mid-write would capture a prefix, publish it to everyone as canonical
+    /// state, and then be superseded seconds later by the real thing - having
+    /// moved the prefix across the network first. So a large file has to hold
+    /// still, which it does either by not having been touched for a whole
+    /// window, or - for timestamps too coarse or too skewed for that to mean
+    /// anything - by being seen twice with the same size and time, a window
+    /// apart.
+    ///
+    /// Small files skip this entirely. They are written in one go often enough
+    /// that a spurious capture is rare, and cheap when it happens.
+    ///
+    /// A path that has disappeared settles immediately: a deletion is not
+    /// something to wait out.
+    fn has_settled(&mut self, path: &RepoPath) -> bool {
+        let fs_path = path.to_fs_path(&self.paths.repo_root);
+        let Ok(meta) = std::fs::symlink_metadata(&fs_path) else {
+            self.unstable.remove(path);
+            return true;
+        };
+        if !meta.is_file() || meta.len() < STABILITY_THRESHOLD {
+            self.unstable.remove(path);
+            return true;
+        }
+        let Some(mtime_ms) = scan::mtime_ms(&meta) else {
+            // Without a usable timestamp there is nothing to compare, so this
+            // degrades to the old behaviour rather than waiting forever.
+            self.unstable.remove(path);
+            return true;
+        };
+        let now = crate::util::now_ms();
+        // Nothing has written to it for a whole window: it is finished, and no
+        // second observation is needed to say so. Without this, every check of
+        // a quiescent large file would look like a first sighting again and the
+        // file would never be treated as settled twice running.
+        if now - mtime_ms >= STABILITY_WINDOW_MS {
+            self.unstable.remove(path);
+            return true;
+        }
+        match self.unstable.get(path) {
+            Some(seen) if seen.size == meta.len() && seen.mtime_ms == mtime_ms => {
+                // Unchanged since it was first seen this way. The window is
+                // measured from that first sighting, not from this one.
+                if now - seen.at_ms >= STABILITY_WINDOW_MS {
+                    self.unstable.remove(path);
+                    return true;
+                }
+                false
+            }
+            other => {
+                // The base is frozen at the first sighting of this episode and
+                // carried across every later one: a canonical revision that
+                // arrives while the file is still changing is concurrent with
+                // what is being written, not a base for it.
+                let base = other.map(|seen| (seen.base_revision, seen.base_entry.clone()));
+                let (base_revision, base_entry) = base.unwrap_or_else(|| {
+                    let state = self.store.path_state(path).unwrap_or_default();
+                    (state.confirmed_revision, state.confirmed)
+                });
+                self.unstable.insert(
+                    path.clone(),
+                    Observation {
+                        size: meta.len(),
+                        mtime_ms,
+                        at_ms: now,
+                        base_revision,
+                        base_entry,
+                    },
+                );
+                false
+            }
+        }
+    }
+
     /// Durably capture the current on-disk state of `path` if it differs from
     /// what Weave last materialized.
     ///
@@ -574,6 +773,14 @@ impl ClientEngine {
     /// what makes a Weave-written file not echo back as a local edit, and it
     /// does so by content rather than by timer.
     fn capture_path(&mut self, path: &RepoPath) -> Result<bool> {
+        // Read before `has_settled`, which clears the entry once it settles.
+        let frozen = self
+            .unstable
+            .get(path)
+            .map(|seen| (seen.base_revision, seen.base_entry.clone()));
+        if !self.has_settled(path) {
+            return Ok(false);
+        }
         let mut state = self.store.path_state(path)?;
         let previous = state
             .materialized
@@ -581,7 +788,13 @@ impl ClientEngine {
             .or_else(|| state.confirmed.clone());
         // Reading the path also stores its content, so by the time the entry
         // exists the blob it names is durable.
-        let entry = scan::read_path(&self.paths.repo_root, path, previous.as_ref(), &self.blobs)?;
+        let entry = scan::read_path(
+            &self.paths.repo_root,
+            path,
+            previous.as_ref(),
+            &self.blobs,
+            &mut self.scan_cache,
+        )?;
 
         if FileEntry::same_as(entry.as_ref(), state.materialized.as_ref()) {
             return Ok(false);
@@ -618,10 +831,12 @@ impl ClientEngine {
         }
 
         let operation_id = Uuid::new_v4();
+        let (base_revision, base_entry) =
+            frozen.unwrap_or_else(|| (state.confirmed_revision, state.confirmed.clone()));
         state.in_flight = Some(InFlight {
             operation_id,
-            base_revision: state.confirmed_revision,
-            base_entry: state.confirmed.clone(),
+            base_revision,
+            base_entry,
             desired: entry.clone(),
             local_seq: seq,
             task_id,
@@ -1005,8 +1220,23 @@ impl ClientEngine {
                 self.restore_canonical_for_conflict(&path)?;
             }
             self.sync_working_tree()?;
+            // The last blob a barrier was waiting for may have just arrived.
+            self.check_barrier_ready()?;
         }
         Ok(())
+    }
+
+    /// True while anything this replica needs is still in transit.
+    ///
+    /// Three separate queues, one question. A blob the working tree is waiting
+    /// for, a Git pack a publication cannot be applied without, and a canonical
+    /// file that has to overwrite a conflict draft all mean the same thing: the
+    /// replica cannot currently reproduce the state it has been told about.
+    fn waiting_for_content(&self) -> bool {
+        self.materialization_blocked
+            || self.traffic.waiting_for_content()
+            || !self.awaiting_pack.is_empty()
+            || !self.awaiting_restore.is_empty()
     }
 
     fn apply_control(&mut self, control: ControlSnapshot) -> Result<()> {
@@ -1118,6 +1348,14 @@ impl ClientEngine {
         }
         // Capture-before-overwrite: inspect the real filesystem entry first.
         if self.capture_path(path)? {
+            return Ok(());
+        }
+        // Capture may have declined because the file is large and has not held
+        // still yet. Nothing has been recorded from it, so overwriting it here
+        // would discard whatever is being written into it - the one thing Weave
+        // may never do. The path is re-examined every tick and materialized as
+        // soon as it settles, one way or the other.
+        if self.unstable.contains_key(path) {
             return Ok(());
         }
         self.write_canonical(path)
@@ -1512,6 +1750,16 @@ impl ClientEngine {
         let barrier_id = barrier.barrier_id;
         let watermark = barrier.watermark;
 
+        // Content still on its way is unfinished work like any other. A
+        // participant whose working tree is waiting for blobs has not converged
+        // on canonical state, so answering the barrier would let a publication
+        // commit a tree this replica cannot yet reproduce. Say nothing and wait:
+        // `emit` re-checks on every install, and the retry tick re-checks
+        // anyway, so readiness follows the last byte rather than a timeout.
+        if self.waiting_for_content() {
+            return Ok(());
+        }
+
         let mut outstanding = 0usize;
         for (_, state) in self.store.all_states()? {
             if state.max_local_seq() > 0
@@ -1803,5 +2051,266 @@ fn find_by_id<T: Clone>(
             "`{needle_trim}` matches {} {label}s; use the full identifier.",
             matches.len()
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store_client::PathState;
+
+    /// A replica engine over a scratch directory, with no transport attached.
+    /// `send` is a no-op without one, so what a decision produced is read off
+    /// the engine's own state rather than off the wire.
+    struct Fixture {
+        dir: std::path::PathBuf,
+        engine: ClientEngine,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fixture() -> Fixture {
+        let dir = std::env::temp_dir().join(format!("weave-client-{}", crate::util::random_hex(6)));
+        let repo_root = dir.join("repo");
+        let git_dir = repo_root.join(".git");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let paths = Paths {
+            weave_dir: git_dir.join("weave"),
+            git_dir,
+            repo_root,
+        };
+        paths.ensure().unwrap();
+        let store = ClientStore::open(&paths.client_db()).unwrap();
+        let blobs = BlobStore::open(paths.blobs()).unwrap();
+        let actor_id = Uuid::new_v4();
+        let session = SessionInfo {
+            session_id: Uuid::new_v4(),
+            repo_name: "repo".into(),
+            branch: "main".into(),
+            base_commit: "0".repeat(40),
+            host_actor_id: Uuid::new_v4(),
+            host_display_name: "Host".into(),
+            created_at_ms: crate::util::now_ms(),
+        };
+        let engine = ClientEngine::new(
+            paths,
+            store,
+            blobs,
+            actor_id,
+            "Tester".into(),
+            "Tester".into(),
+            "tester@example.com".into(),
+            Role::Participant,
+            session,
+            "main".into(),
+            "0".repeat(40),
+        );
+        Fixture { dir, engine }
+    }
+
+    fn open_barrier(engine: &mut ClientEngine) {
+        engine.barrier = Some(BarrierLocal {
+            barrier_id: Uuid::new_v4(),
+            watermark: 0,
+            ready_sent: false,
+            conflicted: false,
+        });
+    }
+
+    fn answered(engine: &ClientEngine) -> bool {
+        engine
+            .barrier
+            .as_ref()
+            .map(|b| b.ready_sent)
+            .unwrap_or(false)
+    }
+
+    /// A replica that is still receiving content has not converged on
+    /// canonical state, whichever queue is holding it up. Answering the
+    /// barrier would let a publication commit a tree this replica cannot yet
+    /// reproduce.
+    #[test]
+    fn a_barrier_is_not_answered_while_content_is_still_arriving() {
+        type Blocker = fn(&mut ClientEngine);
+        let blockers: Vec<(&str, Blocker)> = vec![
+            ("materialization waiting on a blob", |e| {
+                e.materialization_blocked = true
+            }),
+            ("a publication pack still in transit", |e| {
+                e.awaiting_pack.push(("f".repeat(64), sample_publication()))
+            }),
+            ("canonical content owed to a conflict", |e| {
+                e.awaiting_restore.push(RepoPath::new("notes.md").unwrap())
+            }),
+        ];
+        for (what, block) in blockers {
+            let mut f = fixture();
+            open_barrier(&mut f.engine);
+            block(&mut f.engine);
+            f.engine.check_barrier_ready().unwrap();
+            assert!(!answered(&f.engine), "barrier answered despite {what}");
+        }
+    }
+
+    /// And it is answered as soon as the last of it arrives.
+    #[test]
+    fn a_barrier_is_answered_once_the_content_has_arrived() {
+        let mut f = fixture();
+        open_barrier(&mut f.engine);
+        f.engine.materialization_blocked = true;
+        f.engine.check_barrier_ready().unwrap();
+        assert!(!answered(&f.engine));
+
+        f.engine.materialization_blocked = false;
+        f.engine.check_barrier_ready().unwrap();
+        assert!(answered(&f.engine), "nothing was outstanding any more");
+    }
+
+    fn sample_publication() -> GitPublication {
+        GitPublication {
+            descriptor: CommitDescriptor {
+                prepare_id: Uuid::new_v4(),
+                target_revision: 1,
+                parent_commit_oid: "0".repeat(40),
+                tree_oid: "1".repeat(40),
+                commit_oid: "2".repeat(40),
+                author_name: "Tester".into(),
+                author_email: "tester@example.com".into(),
+                committer_name: "Tester".into(),
+                committer_email: "tester@example.com".into(),
+                timestamp: 0,
+                timezone: "+0000".into(),
+                message: "commit".into(),
+                contributing_task_ids: Vec::new(),
+                branch: "main".into(),
+            },
+            stage: PublicationStage::Pending,
+            push_status: PushStatus::NotAttempted,
+            push_error: None,
+            created_at_ms: 0,
+            sequence: 1,
+        }
+    }
+
+    // ------------------------------------------------------------ stability
+
+    #[test]
+    fn a_large_file_is_captured_only_once_it_stops_changing() {
+        let mut f = fixture();
+        let path = RepoPath::new("asset.bin").unwrap();
+        let fs_path = f.engine.paths.repo_root.join("asset.bin");
+        let size = STABILITY_THRESHOLD as usize;
+
+        std::fs::write(&fs_path, vec![7u8; size]).unwrap();
+        assert!(
+            !f.engine.has_settled(&path),
+            "first sighting proves nothing"
+        );
+        assert!(
+            !f.engine.has_settled(&path),
+            "the window has not elapsed yet"
+        );
+
+        // Still being written: the clock starts again.
+        std::fs::write(&fs_path, vec![7u8; size + 4096]).unwrap();
+        assert!(!f.engine.has_settled(&path));
+
+        std::thread::sleep(Duration::from_millis(STABILITY_WINDOW_MS as u64 + 200));
+        assert!(
+            f.engine.has_settled(&path),
+            "unchanged for a full window, so it is finished"
+        );
+        assert!(f.engine.unstable.is_empty());
+    }
+
+    /// Settling is not a one-shot event.
+    ///
+    /// Every path that materialization touches is checked for stability first,
+    /// so a file that has finished must answer "settled" every time it is
+    /// asked, not once. Answering "first sighting" again on the next check
+    /// would defer materialization for that path forever, one tick at a time.
+    #[test]
+    fn a_file_that_has_finished_stays_settled() {
+        let mut f = fixture();
+        let path = RepoPath::new("asset.bin").unwrap();
+        std::fs::write(
+            f.engine.paths.repo_root.join("asset.bin"),
+            vec![3u8; STABILITY_THRESHOLD as usize],
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(STABILITY_WINDOW_MS as u64 + 200));
+        for round in 0..3 {
+            assert!(
+                f.engine.has_settled(&path),
+                "an untouched file stopped being settled on check {round}"
+            );
+            assert!(f.engine.unstable.is_empty());
+        }
+    }
+
+    /// Waiting to capture must never become licence to overwrite.
+    ///
+    /// A large file that has not settled has nothing recorded from it yet, so
+    /// materializing canonical content over it would discard whatever is being
+    /// written into it — no local work would exist to rebase, and the bytes
+    /// would simply be gone. The write waits instead.
+    #[test]
+    fn a_file_that_is_still_being_written_is_not_overwritten_by_canonical_content() {
+        let mut f = fixture();
+        let path = RepoPath::new("asset.bin").unwrap();
+        let fs_path = f.engine.paths.repo_root.join("asset.bin");
+
+        // Canonical content that is present and ready to be written out, so a
+        // materialization here would certainly succeed.
+        let canonical = vec![1u8; 64];
+        let hash = f.engine.blobs.put(&canonical).unwrap();
+        let state = PathState {
+            confirmed: Some(FileEntry {
+                blob_hash: hash,
+                size: canonical.len() as u64,
+                git_mode: GitMode::Regular,
+                file_kind: FileKind::Binary,
+            }),
+            confirmed_revision: 1,
+            ..PathState::default()
+        };
+        f.engine.store.put_path_state(&path, &state).unwrap();
+
+        // And a large local file that has only just been seen.
+        let local = vec![9u8; STABILITY_THRESHOLD as usize];
+        std::fs::write(&fs_path, &local).unwrap();
+
+        f.engine.materialize_if_safe(&path).unwrap();
+        assert_eq!(
+            std::fs::read(&fs_path).unwrap().len(),
+            local.len(),
+            "canonical content overwrote a file that was still being written"
+        );
+        assert!(f.engine.unstable.contains_key(&path));
+
+        // Once it holds still it is captured as local work, and still not
+        // overwritten.
+        std::thread::sleep(Duration::from_millis(STABILITY_WINDOW_MS as u64 + 200));
+        f.engine.materialize_if_safe(&path).unwrap();
+        assert_eq!(std::fs::read(&fs_path).unwrap().len(), local.len());
+        assert!(f.engine.store.path_state(&path).unwrap().has_local_work());
+    }
+
+    /// Waiting is only worth it for content large enough to be written in
+    /// pieces. Everything else - and every deletion - is captured at once.
+    #[test]
+    fn small_files_and_deletions_never_wait() {
+        let mut f = fixture();
+        let small = RepoPath::new("notes.md").unwrap();
+        std::fs::write(f.engine.paths.repo_root.join("notes.md"), b"a line\n").unwrap();
+        assert!(f.engine.has_settled(&small));
+
+        let gone = RepoPath::new("removed.bin").unwrap();
+        assert!(f.engine.has_settled(&gone));
+        assert!(f.engine.unstable.is_empty());
     }
 }

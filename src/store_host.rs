@@ -15,7 +15,7 @@ use crate::model::*;
 use crate::path::RepoPath;
 use crate::proto::SessionInfo;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -855,6 +855,67 @@ impl HostStore {
         Ok(missing)
     }
 
+    /// Every blob canonical state can still reach.
+    ///
+    /// The live set for garbage collection. It is the whole revision history
+    /// rather than only the current manifest, because a participant that joins
+    /// late, or reconnects after being away, catches up through revisions and
+    /// must be able to fetch the content each one names. Both sides of every
+    /// revision count: `before_entry` is what a rebase or a conflict is
+    /// resolved against.
+    ///
+    /// Publication packs are deliberately absent. A pack is derived state,
+    /// reproducible from the Git objects it was built from, and once every
+    /// participant has applied it nothing will ask for it again.
+    pub fn referenced_blobs(&self) -> Result<HashSet<String>> {
+        let mut live = HashSet::new();
+        let mut add = |json: Option<String>| -> Result<()> {
+            if let Some(json) = json {
+                let entry: FileEntry = serde_json::from_str(&json)?;
+                live.insert(entry.blob_hash);
+            }
+            Ok(())
+        };
+        for table in ["manifest", "base_manifest"] {
+            let mut stmt = self.conn.prepare(&format!("SELECT entry FROM {table}"))?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for row in rows {
+                add(Some(row?))?;
+            }
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT before_entry, after_entry FROM revisions")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            ))
+        })?;
+        for row in rows {
+            let (before, after) = row?;
+            add(before)?;
+            add(after)?;
+        }
+        let mut stmt = self.conn.prepare("SELECT data FROM conflicts")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let conflict: Conflict = serde_json::from_str(&row?)?;
+            for entry in [
+                &conflict.base_entry,
+                &conflict.canonical_entry,
+                &conflict.incoming_entry,
+                &conflict.latest_local_candidate,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                live.insert(entry.blob_hash.clone());
+            }
+        }
+        Ok(live)
+    }
+
     pub fn integrity_check(&self) -> Result<Vec<String>> {
         db::integrity_check(&self.conn)
     }
@@ -880,6 +941,23 @@ impl HostStore {
         tx.commit()?;
         Ok(rebuilt.len() as u64)
     }
+}
+
+/// The coordinator's live blob set, read from its database without owning it.
+///
+/// A daemon that hosts a session runs a coordinator and a replica over one blob
+/// store, so neither half alone knows what is reachable. Collection happens on
+/// the replica side - there is exactly one replica per daemon, whatever its
+/// role - and this is how it sees the other half. `Ok(empty)` when there is no
+/// host database, which is every participant.
+pub fn referenced_blobs_at(path: &Path) -> Result<HashSet<String>> {
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let store = HostStore {
+        conn: db::open(path)?,
+    };
+    store.referenced_blobs()
 }
 
 fn parse_uuid(text: &str) -> Result<Uuid> {

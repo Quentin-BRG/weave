@@ -476,6 +476,7 @@ impl ClientEngine {
                     &conflict.path,
                     previous.as_ref(),
                     &self.blobs,
+                    &mut self.scan_cache,
                 )
             }
         }

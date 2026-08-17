@@ -16,7 +16,7 @@ use crate::path::RepoPath;
 use crate::proto::{ControlSnapshot, SessionInfo};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -346,6 +346,36 @@ impl ClientStore {
             );
         }
         Ok(out)
+    }
+
+    /// Every blob this replica can still reach through its durable state.
+    ///
+    /// The live set for garbage collection, so it errs towards keeping: an
+    /// entry counts whether it is canonical, merely materialized, in flight, a
+    /// base this replica may have to rebase against, or a conflict draft it has
+    /// not resolved yet. Content is cheap to keep and expensive to lose.
+    pub fn referenced_blobs(&self) -> Result<HashSet<String>> {
+        let mut live = HashSet::new();
+        let mut add = |entry: Option<&FileEntry>| {
+            if let Some(entry) = entry {
+                live.insert(entry.blob_hash.clone());
+            }
+        };
+        for state in self.all_states()?.values() {
+            add(state.confirmed.as_ref());
+            add(state.materialized.as_ref());
+            if let Some(flight) = &state.in_flight {
+                add(flight.base_entry.as_ref());
+                add(flight.desired.as_ref());
+            }
+            if let Some(pending) = &state.pending_local {
+                add(pending.desired.as_ref());
+            }
+            if let Some(draft) = &state.conflict_draft {
+                add(draft.entry.as_ref());
+            }
+        }
+        Ok(live)
     }
 
     /// The confirmed canonical manifest as this replica knows it.

@@ -144,17 +144,60 @@ No whole file is ever held in memory:
 
 ### Resumption
 
-Blobs are immutable and content-addressed, so resumption is a byte offset:
-`RequestBlob { hash, from_offset }`, with the `.part` file carrying the state and
-the full hash verified at installation regardless. Without it a flaky link can
-livelock, restarting a large transfer from zero on every reconnect.
+Blobs are immutable and content-addressed, so resumption is a byte offset. The
+**receiver** decides it: a partial lives at `<blobs>/.partial/<hash>`, named after
+the content it will hold, and accepting an offer re-hashes what is already there
+and answers with that length as `from_offset`. Nothing about a transfer needs to
+survive a crash except the bytes themselves — there is no journal to corrupt, and
+an interrupted daemon resumes from whatever reached the disk.
+
+Three properties make that safe:
+
+- **The prefix is re-hashed, never trusted.** A torn write, a truncation or a
+  deliberately damaged partial produces a hash mismatch at the end of the
+  transfer, which destroys the partial and re-fetches from zero. A partial that
+  is not a prefix of the announced content can delay a transfer; it can never
+  install the wrong bytes.
+- **A partial is opened for append**, so a stray write can never land before what
+  has already been hashed, and a partial longer than the offer restarts at zero.
+- **One writer per partial**, enforced by a process-wide claim set keyed on the
+  absolute path. Several `BlobStore` handles are open in one daemon (the
+  coordinator, the local replica, the IPC surface); a second writer for the same
+  hash falls back to an anonymous temporary file, which is slower and always
+  correct.
+
+### Collection
+
+Content becomes unreachable in ordinary use: a superseded file, a resolved
+conflict, an abandoned transfer. `BlobStore::collect_garbage` takes a live set
+and an age guard, and removes only what is in neither. It is conservative by
+construction — the live set is derived from durable state (`ClientStore` and
+`HostStore`), not from memory, and anything younger than the guard is kept
+whatever the live set says, so a blob that has been ingested but not yet
+committed to a store cannot be collected out from under its own operation.
+
+It runs on the **replica** engine only, once every 15 minutes, because a host
+machine has one blob store shared by its coordinator and its replica: collecting
+from either alone would delete the other's content. The replica reads the
+coordinator's live set directly from `host.sqlite`, so the union is swept once.
+
+Publication packs are deliberately absent from the live set. They are derived
+state; `send_publication` rebuilds the same pack, with the same hash, on every
+announcement including to a reconnecting participant, so a collected pack
+self-heals.
 
 ### One new barrier precondition
 
-A participant may not report ready while a materialization is blocked on a
-missing blob. Otherwise `git read-tree` moves the index onto the published tree
-while the working file is still absent, and `git status` shows a phantom
-modification.
+A participant may not report ready while it cannot reproduce the state it has
+been told about — a blob still in transit, a publication pack that has not
+arrived, or a conflict whose canonical side has still to be restored. Otherwise
+`git read-tree` moves the index onto the published tree while the working file is
+still absent, and `git status` shows a phantom modification.
+
+The participant stays silent rather than answering `BarrierReady { ok: false }`,
+which is how outstanding local work is already handled: the host's 20 second
+barrier timeout is the backstop, and a transfer that finishes inside it lets the
+publication succeed with everybody included.
 
 ## 4. The canonical session limit
 
@@ -244,7 +287,7 @@ the places where `content_b64` appears.
 | **0 — Local streaming** | streaming blob store, scanner hashing into it, streaming materialization, `gitx` from files | low | done |
 | **1 — Transport** | frame class, priority writer, waiting data queue | medium | done |
 | **2 — Protocol v3** | `content_b64` removed everywhere, pull-based broadcast, upload-before-submit, conflict blobs, publication pack | **high** | done |
-| **3 — Robustness** | offset resumption, barrier precondition, blob GC | medium | |
+| **3 — Robustness** | offset resumption, barrier precondition, blob GC, fast rescan, stability detection | medium | done |
 | **4 — Policy** | canonical session limit and its state machine, startup refusal, disk checks, docs | low | |
 
 Phase 0 stands alone and ships value without a protocol change: it removes the
@@ -253,24 +296,49 @@ protocol message: it builds the plane and leaves it unused, and a peer that
 sends on it early is dropped rather than silently ignored.
 
 Two supporting pieces belong to this work rather than to a later one, because
-they are what make large files bearable in practice:
+they are what make large files bearable in practice. Both landed with phase 3:
 
 - **Fast rescan.** The mandatory full rescan on every reconnect is O(total
-  repository bytes) and rehashes everything. Size, mtime and inode become a cache
-  in front of the hash, as Git's index does — the hash stays the only truth, the
-  metadata only decides whether to recompute it.
+  repository bytes) and rehashes everything. Size and mtime become a cache in
+  front of the hash, as Git's index does — the hash stays the only truth, the
+  metadata only decides whether to recompute it. `scan::ScanCache` records the
+  metadata *observed before the read*, so a write that races the read advances
+  the mtime past what was recorded and forces a rehash; it refuses to answer for
+  an entry whose blob is no longer in the store; it recomputes the file mode on
+  every hit, because `chmod` need not move the mtime; and it declines to cache an
+  entry written within Git's two-second "racily clean" window at all. The cache
+  is in memory only — it is an optimization, and rebuilding it costs exactly the
+  full scan that would otherwise have happened anyway.
 - **Stability detection.** A tool writing a large file for tens of seconds
   outlives the debounce window, so Weave would hash a partial state, transfer it,
-  and transfer again once it settles. A large file is captured only after two
-  consecutive observations of identical size and mtime.
+  and transfer again once it settles. A file of 8 MiB or more is captured only
+  once it has held still: primarily because nothing has written to it for a whole
+  window (`now - mtime >= STABILITY_WINDOW_MS`), and failing that — coarse or
+  skewed timestamps, a clock behind the filesystem — because two observations a
+  window apart agree on size and mtime. Anything smaller is captured
+  immediately, since re-transferring it is cheaper than delaying it.
+
+  Waiting has two consequences that matter more than the wait itself. The
+  canonical state the local change is based on is frozen at the *first* sighting
+  of the file changing, not at the moment it settles: a revision that arrives
+  while the file is still being written is competing with that edit, and
+  recording it as the base would silently turn a concurrent edit into a
+  sequential one and lose the conflict. And canonical content is never written
+  over a file that has not settled — materialization first tries to capture, and
+  if capture declines because the file is still moving, the write is deferred to
+  a later tick rather than overwriting bytes Weave has not recorded. Every
+  unsettled path is re-examined each tick, and the working tree is
+  re-synchronized as soon as one of them settles.
 
 ## 7. Test matrix
 
 End-to-end, driving the real binary, as everything in `tests/` does. The
 blob-plane cases live in `tests/blob_plane.rs`; the framing and installation
-invariants they rest on are unit-tested in `src/blobwire.rs`, where a corrupt or
-truncated transfer can actually be constructed — on the wire, Noise
-authentication fails long before a hash check would.
+invariants they rest on are unit-tested in `src/blobwire.rs` and `src/blobs.rs`,
+where a corrupt or truncated transfer can actually be constructed — on the wire,
+Noise authentication fails long before a hash check would. The one exception is a
+damaged *partial*, which is local state rather than wire state and so can be
+corrupted end-to-end, between a crash and the restart that resumes from it.
 
 | Test | What it defends | |
 | --- | --- | --- |
@@ -281,5 +349,8 @@ authentication fails long before a hash check would.
 | concurrent binary edit on a large file | conflict with both candidates preserved whole, and resolution uploading a large candidate back | phase 2 |
 | publication including a large file | pack over the data plane, and the published tree equals the parent tree modified only where revisions exist | phase 2 |
 | small edits during a large transfer | **control-plane starvation** — the regression that turns a healthy session into an apparently frozen one | phase 2 |
-| disconnect mid-transfer | resumption from offset, no restart from zero | phase 3 |
+| crash mid-transfer, then reconnect | resumption from a **non-zero** offset, proved against the bytes held at the moment of the crash, and nothing left behind afterwards | phase 3 |
+| a damaged partial recovered after a crash | a partial that is no longer a prefix is destroyed rather than installed, and the content is fetched again | phase 3 |
+| publication prepared while a participant is still receiving | the barrier waits: `prepare` cannot return before that participant can reproduce the state, and it is not written off as disconnected | phase 3 |
+| collection with no age guard at all | live content survives on both replicas, the host's whole revision history still resolves, and unreachable content is actually removed | phase 3 |
 | file created above the session limit | preserved locally, publication blocked, both remedies, and the raise propagating as a control version | phase 4 |

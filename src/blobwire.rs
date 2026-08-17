@@ -161,8 +161,12 @@ impl BlobReceiver {
     /// should start from.
     ///
     /// The receiver chooses the offset because only it knows what it already
-    /// holds. Today that is always zero; resumption changes this function and
-    /// nothing else on the wire.
+    /// holds. A previous attempt at the same content - cut short by a
+    /// disconnection, a crash, or a peer that went away - leaves a partial file
+    /// named after that content, and this is where it is picked up again. The
+    /// offset is what the writer has re-hashed off the disk, never what a
+    /// previous run claimed to have written, so resuming can only ever install
+    /// bytes this side has verified end to end.
     pub fn accept_offer(&mut self, transfer_id: u64, hash: &str, size: u64) -> Result<u64> {
         if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(protocol(format!("Malformed blob reference: {hash}")));
@@ -179,15 +183,36 @@ impl BlobReceiver {
                 "Weave blob transfer {transfer_id} is already open."
             )));
         }
+        let mut writer = match self.blobs.resume_writer(hash)? {
+            Some(writer) => writer,
+            // Another receiver in this process is already fetching this
+            // content. Falling back to an anonymous writer is always correct,
+            // merely not resumable, and it keeps the two transfers from
+            // appending into one file.
+            None => self.blobs.writer()?,
+        };
+        let mut from_offset = writer.written();
+        if from_offset > size {
+            // Longer than what is on offer, so it cannot be a prefix of it,
+            // whatever it is. Continuing could only produce a mismatch.
+            writer.reset()?;
+            from_offset = 0;
+        }
+        if from_offset > 0 {
+            tracing::info!(
+                "resuming blob {} at offset {from_offset} of {size}",
+                crate::util::short_oid(hash)
+            );
+        }
         self.open.insert(
             transfer_id,
             Transfer {
                 hash: hash.to_string(),
-                remaining: size,
-                writer: self.blobs.writer()?,
+                remaining: size - from_offset,
+                writer,
             },
         );
-        Ok(0)
+        Ok(from_offset)
     }
 
     /// Apply one decoded data frame.
@@ -250,7 +275,9 @@ impl BlobReceiver {
     }
 
     fn fail(&mut self, transfer_id: u64, reason: &str) -> Delivered {
-        // Removing drops the writer, which removes the partial file.
+        // Removing drops the writer. Nothing is installed either way; a
+        // resumable partial keeps the prefix it verified, an anonymous one is
+        // deleted.
         let hash = self
             .open
             .remove(&transfer_id)
@@ -271,8 +298,9 @@ impl BlobReceiver {
     /// Abandon every open transfer, installing nothing.
     ///
     /// Used when the connection they were negotiated on ends: transfer ids mean
-    /// nothing across sockets, and a partial file that no sender will finish is
-    /// only a way to install the wrong bytes later.
+    /// nothing across sockets, so every transfer has to be renegotiated. The
+    /// bytes are not thrown away with the ids - each partial is named after its
+    /// content, and the transfer that replaces it resumes from there.
     pub fn clear(&mut self) {
         self.open.clear();
     }
@@ -314,14 +342,28 @@ mod tests {
             BlobStore::open(self.0.join("blobs")).unwrap()
         }
 
-        /// Temporary files live directly in the blob root; a clean store has
-        /// none of them.
+        /// Anonymous temporaries live directly in the blob root; a clean store
+        /// has none of them.
         fn parts(&self) -> usize {
             std::fs::read_dir(self.0.join("blobs"))
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().is_file())
                 .count()
+        }
+
+        /// Resumable partials, and how much each holds.
+        fn partials(&self) -> Vec<u64> {
+            let dir = self.0.join("blobs").join(".partial");
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return Vec::new();
+            };
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .collect()
         }
     }
 
@@ -336,6 +378,11 @@ mod tests {
         receiver
             .accept_offer(id, &hash, bytes.len() as u64)
             .unwrap();
+        send_open(receiver, id, bytes)
+    }
+
+    /// Same, for a transfer whose offer the caller has already made.
+    fn send_open(receiver: &mut BlobReceiver, id: u64, bytes: &[u8]) -> Delivered {
         for slice in bytes.chunks(WIRE_CHUNK).filter(|s| !s.is_empty()) {
             let frame = chunk_frame(id, slice);
             let outcome = receiver.accept(decode(&frame).unwrap());
@@ -512,22 +559,105 @@ mod tests {
         assert_eq!(scratch.parts(), 0);
     }
 
+    /// An interrupted transfer installs nothing, and keeps exactly the prefix
+    /// it verified so the next attempt does not pay for it again.
     #[test]
-    fn an_interrupted_connection_leaves_no_partial_behind() {
+    fn an_interrupted_connection_is_resumed_rather_than_restarted() {
         let scratch = Scratch::new();
         let store = scratch.store();
-        let bytes = vec![9u8; WIRE_CHUNK * 2];
+        let bytes: Vec<u8> = (0..(WIRE_CHUNK * 3)).map(|i| (i % 241) as u8).collect();
         let hash = sha256_hex(&bytes);
         {
             let mut receiver = BlobReceiver::new(store.clone());
             receiver.accept_offer(1, &hash, bytes.len() as u64).unwrap();
             let f = chunk_frame(1, &bytes[..WIRE_CHUNK]);
             receiver.accept(decode(&f).unwrap());
-            assert_eq!(scratch.parts(), 1);
             // Dropping the receiver is what a lost connection does.
         }
+        assert!(!store.has(&hash), "a partial transfer must not install");
+        assert_eq!(scratch.parts(), 0, "no anonymous temporary");
+        assert_eq!(scratch.partials(), vec![WIRE_CHUNK as u64]);
+
+        // A fresh connection: new receiver, new transfer id, same content.
+        let mut receiver = BlobReceiver::new(store.clone());
+        let from_offset = receiver.accept_offer(7, &hash, bytes.len() as u64).unwrap();
+        assert_eq!(from_offset, WIRE_CHUNK as u64, "resumed, not restarted");
+        for slice in bytes[WIRE_CHUNK..].chunks(WIRE_CHUNK) {
+            let f = chunk_frame(7, slice);
+            assert_eq!(receiver.accept(decode(&f).unwrap()), Delivered::More);
+        }
+        let end = end_frame(7);
+        assert_eq!(
+            receiver.accept(decode(&end).unwrap()),
+            Delivered::Installed {
+                transfer_id: 7,
+                hash: hash.clone()
+            }
+        );
+        assert_eq!(store.get(&hash).unwrap(), bytes);
+        assert!(scratch.partials().is_empty(), "the partial became the blob");
+    }
+
+    /// A resumed transfer must still be verified over its whole length: the
+    /// prefix the last connection left is re-hashed, so a peer that resumes
+    /// with the wrong tail installs nothing.
+    #[test]
+    fn a_resumed_transfer_that_ends_wrong_installs_nothing() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let bytes = vec![3u8; WIRE_CHUNK * 2];
+        let hash = sha256_hex(&bytes);
+        {
+            let mut receiver = BlobReceiver::new(store.clone());
+            receiver.accept_offer(1, &hash, bytes.len() as u64).unwrap();
+            let f = chunk_frame(1, &bytes[..WIRE_CHUNK]);
+            receiver.accept(decode(&f).unwrap());
+        }
+        let mut receiver = BlobReceiver::new(store.clone());
+        assert_eq!(
+            receiver.accept_offer(2, &hash, bytes.len() as u64).unwrap(),
+            WIRE_CHUNK as u64
+        );
+        let f = chunk_frame(2, &vec![0xFFu8; WIRE_CHUNK]);
+        receiver.accept(decode(&f).unwrap());
+        let end = end_frame(2);
+        match receiver.accept(decode(&end).unwrap()) {
+            Delivered::Failed { transfer_id, .. } => assert_eq!(transfer_id, 2),
+            other => panic!("a mismatched resume was accepted: {other:?}"),
+        }
         assert!(!store.has(&hash));
-        assert_eq!(scratch.parts(), 0);
+        // The bad prefix goes too, or every later attempt would fail the same
+        // way.
+        assert!(scratch.partials().is_empty());
+    }
+
+    /// A partial longer than the content now on offer cannot be a prefix of
+    /// it, so it is thrown away rather than resumed from.
+    #[test]
+    fn a_partial_longer_than_the_offer_restarts_from_zero() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let short = vec![5u8; 32];
+        let hash = sha256_hex(&short);
+        {
+            let mut receiver = BlobReceiver::new(store.clone());
+            receiver.accept_offer(1, &hash, 4096).unwrap();
+            let f = chunk_frame(1, &[5u8; 4096]);
+            receiver.accept(decode(&f).unwrap());
+        }
+        let mut receiver = BlobReceiver::new(store.clone());
+        assert_eq!(
+            receiver.accept_offer(2, &hash, short.len() as u64).unwrap(),
+            0
+        );
+        assert_eq!(
+            send_open(&mut receiver, 2, &short),
+            Delivered::Installed {
+                transfer_id: 2,
+                hash: hash.clone()
+            }
+        );
+        assert_eq!(store.get(&hash).unwrap(), short);
     }
 
     #[test]

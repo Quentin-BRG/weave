@@ -25,7 +25,10 @@ pub fn weave_command(repo: &Path, home: &Path) -> Command {
     let mut cmd = Command::new(weave_bin());
     cmd.env("WEAVE_HOME", home);
     cmd.env("WEAVE_LAN_ADDRESS", "127.0.0.1");
-    cmd.env("WEAVE_LOG", "weave=info");
+    cmd.env(
+        "WEAVE_LOG",
+        std::env::var("WEAVE_LOG").unwrap_or_else(|_| "weave=info".into()),
+    );
     cmd.arg("--repo").arg(repo);
     cmd
 }
