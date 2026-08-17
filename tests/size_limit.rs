@@ -526,3 +526,114 @@ fn a_canonical_file_that_grows_oversize_is_never_overwritten() {
 
     session.stop();
 }
+
+// ---------------------------------------------------------------------------
+// 8. The session's limit decides a join, never the compiled default
+// ---------------------------------------------------------------------------
+
+/// Comfortably above `DEFAULT_MAX_FILE_SIZE` (128 MiB), and comfortably below
+/// the 256 MiB this session runs at.
+const ABOVE_DEFAULT: usize = 130 * 1024 * 1024;
+
+/// Big, but cheap for Git to store and clone: the limit is a question about
+/// bytes on disk, and nothing here depends on them being incompressible.
+fn bulk_bytes(len: usize) -> Vec<u8> {
+    let mut out = vec![b'w'; len];
+    out[0] = 0; // binary, as far as the classifier is concerned
+    out
+}
+
+/// A repository holding a file above Weave's default limit joins a session
+/// whose limit is larger, and is accepted without the default being mentioned.
+///
+/// The default is where a new host session starts, not a rule a joiner may
+/// apply. A joiner cannot know the session's limit before `Welcome` carries it,
+/// so it says nothing about size until then — no refusal, and no warning
+/// either, because a note about 128 MiB in a 256 MiB session is a rule nobody
+/// set being read out to the person joining.
+#[test]
+fn a_join_is_decided_by_the_session_limit_and_not_by_the_default() {
+    let sandbox = Sandbox::new("limit-join-default");
+    let mut host = Participant::new(&sandbox, "alpha");
+    init_repo(&host.repo, "Quentin", "quentin@example.com");
+
+    // Committed before the clone, so the guest already holds it and the join
+    // turns on the limit alone rather than on a transfer.
+    write_bytes(&host.repo, "media/feature.mov", &bulk_bytes(ABOVE_DEFAULT));
+    git(&host.repo, &["add", "-A"]);
+    git(&host.repo, &["commit", "-q", "-m", "Add the feature reel"]);
+
+    let mut guest = Participant::new(&sandbox, "beta");
+    let out = std::process::Command::new("git")
+        .args(["clone", "-q", "-c", "core.autocrlf=false"])
+        .arg(&host.repo)
+        .arg(&guest.repo)
+        .output()
+        .expect("git clone");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    git(&guest.repo, &["config", "user.name", "Alice"]);
+    git(&guest.repo, &["config", "user.email", "alice@example.com"]);
+    git(&guest.repo, &["config", "commit.gpgsign", "false"]);
+
+    host.start_daemon(&["host", "--lan", "--max-file-size", "256MiB"]);
+    host.wait_online(LONG);
+    assert_eq!(
+        host.json(&["status"])["max_file_size"].as_u64(),
+        Some(256 * 1024 * 1024)
+    );
+
+    let invite = host.json(&["invite"]);
+    let invite_path = host.repo.parent().unwrap().join("invite.txt");
+    std::fs::write(&invite_path, invite["invite"].as_str().unwrap()).unwrap();
+
+    guest.start_daemon(&["join", "--invite-file", invite_path.to_str().unwrap()]);
+    guest.wait_online(LONG);
+
+    // Accepted, and running under the session's limit rather than its own idea
+    // of one.
+    let status = guest.wait_for_status("the guest to receive canonical state", LONG, |v| {
+        v["file_count"].as_u64().unwrap_or(0) >= 4
+    });
+    assert_eq!(status["max_file_size"].as_u64(), Some(256 * 1024 * 1024));
+    assert_eq!(
+        status["oversize"].as_array().map(|list| list.len()),
+        Some(0),
+        "a file the session can hold was reported as too large:\n{status:#}"
+    );
+
+    // And the default was never mentioned. Everything the join printed — its
+    // own output and the daemon's, which share this log — is checked for the
+    // number, in any spelling.
+    let said = guest.daemon_output();
+    for spelling in ["128 MiB", "128MiB", "134217728"] {
+        assert!(
+            !said.contains(spelling),
+            "the join told the user about the {spelling} default, which is not this \
+             session's limit:\n{said}"
+        );
+    }
+
+    let mut session = Session {
+        _sandbox: sandbox,
+        host,
+        guests: vec![guest],
+    };
+
+    // And the session works: the file is ordinary content on both sides, and
+    // nothing is blocking publication.
+    wait_for_agreement(&session, LONG);
+    write_file(&session.guests[0].repo, "slides/02-cut.md", "A\nB\n");
+    session
+        .host
+        .wait_for_status("the guest's edit to arrive", LONG, |v| {
+            v["file_count"].as_u64().unwrap_or(0) >= 5
+        });
+    wait_for_agreement(&session, LONG);
+    session.host.json(&["commit", "prepare"]);
+
+    session.stop();
+}

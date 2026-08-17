@@ -74,6 +74,13 @@ Weave-published commit). Weave does not clone.
 Without a flag, the invite is read from a hidden prompt, because it contains the
 session secret.
 
+The session's file size limit decides whether a repository can be joined, and it
+is only known once the host answers, so `weave join` says nothing about file
+sizes before then. The `128MiB` default belongs to `weave host`, not to a join: a
+session running at `512MiB` accepts a repository holding a 200 MiB file without
+comment. If the session's own limit is genuinely too small, the join is refused
+once the host has said so, naming the files.
+
 ### `weave resume`
 
 Restarts this repository's session after a crash or a `weave stop`, using the stored

@@ -285,11 +285,26 @@ pub fn available_space(path: &Path) -> Option<u64> {
         if !out.status.success() {
             return None;
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let line = text.lines().nth(1)?;
-        let available_kib: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
-        Some(available_kib.saturating_mul(1024))
+        parse_df_available(&String::from_utf8_lossy(&out.stdout))
     }
+}
+
+/// The "Available" column of POSIX `df -Pk` output, in bytes.
+///
+/// `-P` is what makes this parseable: it fixes the six columns and forbids the
+/// line splitting that plain `df` does for long device names. Compiled
+/// everywhere so the parsing can be tested on any machine, not only the one the
+/// probe runs on.
+#[cfg_attr(windows, allow(dead_code))]
+fn parse_df_available(text: &str) -> Option<u64> {
+    let line = text.lines().nth(1)?;
+    // From the right: `Filesystem` may contain spaces, `Mounted on` may too,
+    // but `Capacity` and `Available` are the fifth and fourth fields and the
+    // capacity is the last one ending in `%`.
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let capacity = fields.iter().position(|f| f.ends_with('%'))?;
+    let available_kib: u64 = fields.get(capacity.checked_sub(1)?)?.parse().ok()?;
+    Some(available_kib.saturating_mul(1024))
 }
 
 /// The nearest ancestor of `path` that exists, so the probe can be aimed at a
@@ -336,5 +351,43 @@ mod tests {
         if let Some(bytes) = available_space(&here) {
             assert!(bytes > 0, "a writable temp directory with no space at all");
         }
+    }
+
+    /// Real `df -Pk` output from the platforms Weave runs on. The Unix probe is
+    /// only as good as this parsing, and it is the one part of the free space
+    /// check that cannot be exercised by building on Windows.
+    #[test]
+    fn the_unix_free_space_probe_reads_the_available_column() {
+        // Linux (coreutils), from WSL Ubuntu.
+        assert_eq!(
+            parse_df_available(
+                "Filesystem     1024-blocks     Used Available Capacity Mounted on\n\
+                 /dev/sdd        1055762868 21527364 980532032       3% /\n"
+            ),
+            Some(980_532_032 * 1024)
+        );
+        // macOS, whose columns are spaced differently and whose device names
+        // are longer.
+        assert_eq!(
+            parse_df_available(
+                "Filesystem   1024-blocks      Used Available Capacity  Mounted on\n\
+                 /dev/disk3s1s1  971350180  10037624  50122140    17%    /\n"
+            ),
+            Some(50_122_140 * 1024)
+        );
+        // A device name with a space in it, which `-P` keeps on one line.
+        assert_eq!(
+            parse_df_available(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                 //host/my share 104857600 4857600 100000000 5% /mnt/share\n"
+            ),
+            Some(100_000_000 * 1024)
+        );
+        // Nothing usable is "not known", never zero.
+        assert_eq!(parse_df_available(""), None);
+        assert_eq!(
+            parse_df_available("df: /nope: No such file or directory\n"),
+            None
+        );
     }
 }

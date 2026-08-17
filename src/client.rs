@@ -165,10 +165,21 @@ pub struct ClientEngine {
     /// The session's file size limit, as of the last control snapshot.
     ///
     /// Cached out of `control` because it is consulted on every capture,
-    /// including before the first snapshot of a session arrives: the durable
-    /// value from the last connection is a far better answer there than the
-    /// compiled-in default.
+    /// including before the first snapshot of *this* connection arrives: the
+    /// durable value from the last one is the session's own number and is the
+    /// right answer there.
+    ///
+    /// Meaningless while `limit_known` is false.
     max_file_size: u64,
+    /// Whether this replica has ever been told the session's limit.
+    ///
+    /// False on a first join, until `Welcome`. The compiled default is where a
+    /// new host session starts, not a provisional limit a joiner may apply, so
+    /// while this is false no file is judged by size at all — not held back,
+    /// not reported, not mentioned. A session running at 512 MiB is entitled to
+    /// hold a 200 MiB file, and the person joining it should never hear a
+    /// number that is not theirs.
+    limit_known: bool,
     /// The oversize set as the host was last told it, so an unchanged
     /// situation does not produce a message every tick.
     reported_oversize: Option<Vec<OversizeReport>>,
@@ -238,6 +249,7 @@ impl ClientEngine {
             scan_cache: scan::ScanCache::new(),
             unstable: HashMap::new(),
             max_file_size: DEFAULT_MAX_FILE_SIZE,
+            limit_known: false,
             reported_oversize: None,
             fatal: None,
             last_rescan_ms: 0,
@@ -264,9 +276,14 @@ impl ClientEngine {
     /// The session limit this replica last learned, so the very first scan of
     /// a reconnecting daemon judges files against the session's value and not
     /// against the default.
+    ///
+    /// A replica with no cached snapshot has never been told a limit, and the
+    /// compiled default is not a substitute for one: it stays unknown until
+    /// `Welcome` says otherwise, and nothing is judged by size in the meantime.
     pub fn load_cached_limit(&mut self) -> Result<()> {
         if let Some(control) = self.store.control_cache()? {
             self.max_file_size = control.max_file_size;
+            self.limit_known = true;
         }
         Ok(())
     }
@@ -425,7 +442,15 @@ impl ClientEngine {
         self.emit(emitted)?;
         // A full rescan on (re)connect is mandatory (specification section 32):
         // anything edited while Weave was not watching is captured here.
-        self.full_rescan()?;
+        //
+        // Unless this replica has never been told the session's file size
+        // limit, in which case it waits for `Welcome`, milliseconds away. A
+        // scan is where size is judged, and judging it against the compiled
+        // default would hold back — and announce — files under a limit that is
+        // not this session's. `apply_control` performs the deferred scan.
+        if self.limit_known {
+            self.full_rescan()?;
+        }
         // The host rebuilds its picture of this replica from this replica, so
         // an oversize file found while offline is announced on arrival rather
         // than waiting for something to change.
@@ -694,7 +719,14 @@ impl ClientEngine {
             &previous,
             &self.blobs,
             &mut self.scan_cache,
-            self.max_file_size,
+            // Until the session has named a limit there is none to apply, and
+            // the scanner must not fall back on the default: it would skip
+            // files this session may well be able to hold.
+            if self.limit_known {
+                self.max_file_size
+            } else {
+                u64::MAX
+            },
         )?;
         self.rejected_paths = result.rejected;
 
@@ -1027,6 +1059,10 @@ impl ClientEngine {
     /// attempt. Nothing here touches the file: an oversize file is preserved
     /// exactly, never hashed, never copied, never rewritten.
     fn check_oversize(&mut self, path: &RepoPath) -> Result<bool> {
+        // No limit has been named yet, so there is nothing to be above.
+        if !self.limit_known {
+            return Ok(false);
+        }
         let fs_path = path.to_fs_path(&self.paths.repo_root);
         let size = match std::fs::symlink_metadata(&fs_path) {
             Ok(meta) if meta.is_file() => meta.len(),
@@ -1103,10 +1139,13 @@ impl ClientEngine {
         self.check_barrier_ready()
     }
 
-    /// The authoritative check a join cannot make before it connects.
+    /// The only file size check a join ever makes.
     ///
-    /// `weave join` compares against the default beforehand, but only the
-    /// session knows its own limit, and it arrives with `Welcome`. A machine
+    /// `weave join` says nothing about size beforehand - not a refusal, not a
+    /// warning, not a note. The compiled default is where a *new host session*
+    /// starts; it is not this session's rule, and a session running at 512 MiB
+    /// is entitled to hold a 200 MiB file. Only the session knows its own
+    /// limit, and it arrives with `Welcome`, which is where this runs. A machine
     /// that cannot represent the session's state from its first moment does not
     /// enter it half-way: the daemon exits and says why. Once a replica is
     /// established, the same situation is the ordinary oversize condition -
@@ -1455,8 +1494,14 @@ impl ClientEngine {
 
     fn apply_control(&mut self, control: ControlSnapshot) -> Result<()> {
         self.store.set_control_cache(&control)?;
-        let limit_changed = control.max_file_size != self.max_file_size;
+        // Learning the limit for the first time counts as a change even when
+        // the number happens to equal the default: it is the first time this
+        // replica may judge a file by size at all, and the scan it deferred on
+        // connect happens here.
+        let limit_changed = !self.limit_known || control.max_file_size != self.max_file_size;
+        let first_limit = !self.limit_known;
         self.max_file_size = control.max_file_size;
+        self.limit_known = true;
         let previous_open: HashSet<Uuid> = self
             .control
             .as_ref()
@@ -1501,10 +1546,15 @@ impl ClientEngine {
         // now be held back. The set is discarded rather than filtered so the
         // rescan derives it afresh from the files themselves.
         if limit_changed {
-            self.note(format!(
-                "The session file size limit is now {}.",
-                crate::util::format_size(self.max_file_size)
-            ));
+            // Learning the session's limit is not a change to it, and saying so
+            // to somebody who has just joined would be reporting news about a
+            // number they never had.
+            if !first_limit {
+                self.note(format!(
+                    "The session file size limit is now {}.",
+                    crate::util::format_size(self.max_file_size)
+                ));
+            }
             self.store.clear_all_oversize()?;
             self.full_rescan()?;
             self.sync_oversize_report()?;
@@ -2560,6 +2610,14 @@ mod tests {
 
     // ------------------------------------------------------- the size limit
 
+    /// Put the engine in the state a replica reaches once the session has told
+    /// it the limit. Both halves matter: a replica that has not been told one
+    /// judges nothing by size, whatever `max_file_size` happens to hold.
+    fn session_limit(engine: &mut ClientEngine, bytes: u64) {
+        engine.max_file_size = bytes;
+        engine.limit_known = true;
+    }
+
     /// A file above the limit is noticed without being read.
     ///
     /// Proved through the blob store: nothing about the file's content may
@@ -2568,7 +2626,7 @@ mod tests {
     #[test]
     fn a_file_above_the_limit_is_recorded_without_being_read() {
         let mut f = fixture();
-        f.engine.max_file_size = 4096;
+        session_limit(&mut f.engine, 4096);
         let path = RepoPath::new("huge.bin").unwrap();
         let fs_path = f.engine.paths.repo_root.join("huge.bin");
         let bytes = vec![5u8; 16 * 1024];
@@ -2600,7 +2658,7 @@ mod tests {
     #[test]
     fn canonical_content_never_overwrites_a_file_that_grew_past_the_limit() {
         let mut f = fixture();
-        f.engine.max_file_size = 4096;
+        session_limit(&mut f.engine, 4096);
         let path = RepoPath::new("cut.mov").unwrap();
         let fs_path = f.engine.paths.repo_root.join("cut.mov");
 

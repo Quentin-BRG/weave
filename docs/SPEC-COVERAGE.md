@@ -162,7 +162,7 @@ loopback. `tests/remote_tunnel.rs` covers what only the public path can:
 | Requirement | Covered by |
 | --- | --- |
 | §52 one long-lived WebSocket per participant, over the tunnel | the whole test |
-| §53 base64 file content, including binary, across the wire | 40 KiB binary asset |
+| §53 file content, including binary, across the wire | 12 MiB binary asset on the data plane |
 | §56–57 invite reaches and authenticates a remote participant | join from the invite alone |
 | §58 TLS transport; `wss://…trycloudflare.com`, never loopback | `assert_public_endpoint` |
 | §58 the Noise session survives a real TLS-terminating intermediary | every assertion in the test runs inside it |

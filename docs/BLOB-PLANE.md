@@ -238,14 +238,27 @@ never started. The check reads sizes from the filesystem rather than from the
 scan, so a repository holding a 4 GiB file is refused in milliseconds instead of
 after hashing it.
 
-`weave join` cannot know the canonical limit before connecting, so its preflight
-checks against the default as a hint and the authoritative check runs on
-`Welcome`. Failing it ends the join with a clear error instead of starting a
+`weave join` cannot know the canonical limit before connecting, so it says
+nothing about size until it does — no refusal, and no warning either. The
+default is where a **new host session** starts; it is not a rule a joiner may
+apply, and a session running at 512 MiB is entitled to hold a 200 MiB file.
+Mentioning 128 MiB to someone joining that session would be reading out a rule
+nobody set. The only check runs on `Welcome`, against the value the host
+actually holds. Failing it ends the join with a clear error instead of starting a
 degraded session: the daemon exits, and the local session record is discarded so
 nothing later tries to resume what never started. That fatal path applies only to
 a **first** join. Once a replica is established, the same situation is the
 ordinary oversize condition below — there is then a session to be part of, and
 local work not to throw away.
+
+The replica enforces this by having no limit at all until it is told one. A
+scan is where size is judged, so a replica that has never received a control
+snapshot defers the mandatory connect-time rescan until `Welcome` arrives
+milliseconds later, and performs it against the session's value. Nothing is held
+back, reported or announced in between, and no number the session did not choose
+ever reaches the person joining. A **reconnecting** replica is in a different
+position: it has the session's own limit cached durably, so its first scan uses
+that rather than waiting.
 
 ### A file created above the limit during a session
 
@@ -437,4 +450,5 @@ corrupted end-to-end, between a crash and the restart that resumes from it.
 | the limit lowered under canonical content | refused, naming the file, with the old value still in force everywhere | phase 4 |
 | an oversize condition across a restart | the record is durable in the participant's own store, re-reported on reconnect, and still blocking | phase 4 |
 | a canonical file grown past the limit | canonical content is **never** written over bytes Weave has not captured, the divergence is reported as such, publication is blocked, and the owed content arrives once it is resolved | phase 4 |
+| joining with a file above the default into a session whose limit is larger | the join is decided by the session's limit and not by the compiled default: the repository is accepted, the file is ordinary content, and the default is never mentioned in any spelling | phase 4 |
 | file created above the session limit | preserved locally, publication blocked, both remedies, and the raise propagating as a control version | phase 4 |

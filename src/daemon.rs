@@ -439,11 +439,12 @@ pub fn run_join(start_dir: &Path, opts: JoinOptions) -> Result<()> {
 
     if !rejoining {
         verify_clean_working_tree(&paths)?;
-        // A hint, not the authority: only the session knows its own limit, and
-        // it arrives with `Welcome`. Checking the default here catches the
-        // common case before a secret is pasted, and the engine repeats the
-        // check against the real value the moment it knows it.
-        verify_repository_within_limit(&paths, DEFAULT_MAX_FILE_SIZE)?;
+        // No file size judgement is made here, not even an advisory one. The
+        // compiled default is what a *new host session* starts at; it is not
+        // this session's limit and has no standing in a join. A session running
+        // at 512 MiB is entitled to hold a 200 MiB file, and mentioning 128 MiB
+        // to the person joining it would be inventing a rule nobody set. The
+        // only limit that exists here arrives with `Welcome`.
         if head != payload.base_commit {
             return Err(
                 repository("Cannot join Weave session.").with_detail(format!(
@@ -1645,6 +1646,10 @@ pub fn verify_file_limit_bounds(bytes: u64) -> Result<()> {
 /// Sizes come from the filesystem rather than from a scan: this runs before
 /// anything is hashed, so a repository with a 4 GiB file in it is refused in
 /// milliseconds instead of after reading it.
+///
+/// Only `weave host` reaches this. A join makes no size judgement of its own:
+/// the limit is the session's, it arrives with `Welcome`, and the replica
+/// checks against it there.
 fn verify_repository_within_limit(paths: &Paths, max_file_size: u64) -> Result<()> {
     let mut too_large: Vec<(String, u64)> = Vec::new();
     for raw in gitx::list_repository_paths(&paths.repo_root)? {

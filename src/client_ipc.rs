@@ -466,28 +466,35 @@ impl ClientEngine {
                 previews.insert(label.into(), serde_json::Value::Null);
                 continue;
             };
-            let Ok(bytes) = self.blobs.get(&entry.blob_hash) else {
-                previews.insert(label.into(), serde_json::Value::Null);
-                continue;
-            };
             let name = format!(
                 "{label}-{}",
                 conflict.path.as_str().rsplit('/').next().unwrap_or("file")
             );
             let out_path = dir.join(&name);
-            crate::util::write_atomic(&out_path, &bytes)?;
+            // Streamed: a conflict on a 2 GiB binary lays its three sides out
+            // for the user without any of them passing through memory.
+            if self.blobs.copy_out(&entry.blob_hash, &out_path).is_err() {
+                previews.insert(label.into(), serde_json::Value::Null);
+                continue;
+            }
             files.insert(
                 label.into(),
                 serde_json::Value::String(out_path.display().to_string()),
             );
-            if entry.file_kind == FileKind::Text && entry.size <= 256 * 1024 {
-                previews.insert(
-                    label.into(),
-                    serde_json::Value::String(String::from_utf8_lossy(&bytes).to_string()),
-                );
+            // The preview is the only thing read into memory, and only when it
+            // is text small enough to show.
+            let preview = if entry.file_kind == FileKind::Text && entry.size <= 256 * 1024 {
+                self.blobs
+                    .get(&entry.blob_hash)
+                    .ok()
+                    .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
             } else {
-                previews.insert(label.into(), serde_json::Value::Null);
-            }
+                None
+            };
+            previews.insert(
+                label.into(),
+                preview.map(serde_json::Value::String).unwrap_or_default(),
+            );
         }
 
         let task = conflict
