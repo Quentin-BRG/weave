@@ -494,27 +494,57 @@ impl Participant {
     }
 
     /// Wait until at least one open conflict exists, returning its detail.
+    /// Wait for an open conflict, and for its candidates to be readable.
+    ///
+    /// Two moments, not one. A conflict is announced on the control plane; the
+    /// bytes behind its candidates travel on the data plane and land shortly
+    /// afterwards. `weave conflict show` reports whatever is there at the time,
+    /// so a caller that asks the instant the conflict appears can legitimately
+    /// find a candidate it names but does not yet hold. Every candidate the
+    /// record has an entry for is waited for here, which is what the assertions
+    /// downstream are actually about.
     pub fn wait_for_conflict(&self, timeout: Duration) -> Value {
         let deadline = Instant::now() + timeout;
+        let mut last = Value::Null;
         loop {
             if let Ok(list) = self.json_allow_failure(&["conflict", "list"]) {
                 if let Some(conflicts) = list["conflicts"].as_array() {
                     if let Some(open) = conflicts.iter().find(|c| c["status"] == "open") {
                         let id = open["id"].as_str().unwrap().to_string();
-                        return self.json(&["conflict", "show", &id]);
+                        let shown = self.json(&["conflict", "show", &id]);
+                        if conflict_candidates_ready(&shown) {
+                            return shown;
+                        }
+                        last = shown;
                     }
                 }
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "timed out waiting for a conflict in {}\ndaemon log:\n{}",
+                    "timed out waiting for a conflict and its candidates in {}\nlast seen:\n{}\ndaemon log:\n{}",
                     self.repo.display(),
+                    serde_json::to_string_pretty(&last).unwrap_or_default(),
                     self.daemon_output()
                 );
             }
             std::thread::sleep(Duration::from_millis(150));
         }
     }
+}
+
+/// Whether every candidate the conflict record names has its content on this
+/// machine, judged by the files `conflict show` writes out.
+///
+/// The files rather than the previews: a preview is text-only and small-only by
+/// design, so a binary candidate has none even when its bytes are right there.
+fn conflict_candidates_ready(shown: &Value) -> bool {
+    ["base", "canonical", "incoming", "local"]
+        .iter()
+        .all(|side| {
+            let named = !shown["conflict"][format!("{side}_entry")].is_null()
+                || (*side == "local" && !shown["conflict"]["latest_local_candidate"].is_null());
+            !named || !shown["candidate_files"][side].is_null()
+        })
 }
 
 impl Drop for Participant {
