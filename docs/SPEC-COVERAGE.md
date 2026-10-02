@@ -220,3 +220,10 @@ participants, identity updates and schema migration. It also injects interruptio
 between durable adoption revisions and during join reference installation, checks
 staged recovery after Git garbage collection, and rejects unauthenticated endpoint
 replacements. `tests/encrypted_transport.rs` covers silent connection expiry.
+
+The reliability tests also exercise an offline outbox whose paths become ignored,
+verify that scoped recovery preserves its candidates without copying unrelated
+session blobs, and keep collaboration working through an npm-style watcher burst.
+`tests/git_subprocess.rs` guards large bidirectional Git pipe traffic against
+deadlock; the IPC timeout test distinguishes an unresponsive daemon from a
+filesystem failure or confirmed shutdown.

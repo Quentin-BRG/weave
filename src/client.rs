@@ -1642,19 +1642,18 @@ impl ClientEngine {
             .cloned()
             .collect();
         if !added.is_empty() {
-            let has_candidates = self.store.all_states()?.iter().any(|(p, s)| {
-                added.contains(&p.to_string()) && (s.has_local_work() || s.conflict_draft.is_some())
-            });
-            if has_candidates {
-                crate::backup::archive_session(&self.paths, "excluded-candidates")?;
-            }
+            crate::backup::archive_excluded_candidates(&self.paths, &self.store, &added)?;
+            let tx = self.store.conn().unchecked_transaction()?;
             for path in &added {
                 self.store
                     .conn()
                     .execute("DELETE FROM replica WHERE path = ?1", [path])?;
+                self.store.clear_oversize(&RepoPath::new(path)?)?;
+            }
+            tx.commit()?;
+            for path in &added {
                 self.op_index.retain(|_, p| p.as_str() != path);
                 self.rejected_paths.retain(|p| &p.path != path);
-                self.store.clear_oversize(&RepoPath::new(path)?)?;
             }
             self.note(format!(
                 "Excluded by shared Git ignore rules; local files preserved: {}",
@@ -2837,6 +2836,116 @@ mod tests {
             ready_sent: false,
             conflicted: false,
         });
+    }
+
+    #[test]
+    fn excluded_candidates_keep_all_versions_without_copying_unrelated_content() {
+        let mut f = fixture();
+        let path = RepoPath::new("node_modules/pkg/generated.js").unwrap();
+        let mut versions = Vec::new();
+        for text in ["base", "submitted", "newer pending", "conflict draft"] {
+            f.engine.blobs.put(text.as_bytes()).unwrap();
+            versions.push(FileEntry::from_bytes(text.as_bytes(), GitMode::Regular));
+        }
+        let unrelated = f.engine.blobs.put(&vec![7; 2 * 1024 * 1024]).unwrap();
+        let operation = Uuid::new_v4();
+        let conflict = Uuid::new_v4();
+        let state = PathState {
+            confirmed: Some(versions[0].clone()),
+            confirmed_revision: 17,
+            materialized: Some(versions[2].clone()),
+            in_flight: Some(InFlight {
+                operation_id: operation,
+                base_revision: 17,
+                base_entry: Some(versions[0].clone()),
+                desired: Some(versions[1].clone()),
+                local_seq: 18,
+                task_id: None,
+                sent: true,
+                sent_at_ms: 123,
+            }),
+            pending_local: Some(PendingLocal {
+                desired: Some(versions[2].clone()),
+                local_seq: 19,
+                task_id: None,
+            }),
+            conflict_draft: Some(ConflictDraft {
+                conflict_id: conflict,
+                entry: Some(versions[3].clone()),
+                local_seq: 20,
+            }),
+        };
+        f.engine.store.put_path_state(&path, &state).unwrap();
+        let disk = path.to_fs_path(&f.engine.paths.repo_root);
+        std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        std::fs::write(&disk, "working file preserved").unwrap();
+        f.engine.apply_exclusions(&[path.to_string()]).unwrap();
+        assert!(f.engine.store.path_state(&path).unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&disk).unwrap(),
+            "working file preserved"
+        );
+
+        let backups = crate::backup::list(&f.engine.paths).unwrap();
+        assert_eq!(backups.len(), 1);
+        let id = backups[0]["id"].as_str().unwrap();
+        assert_eq!(backups[0]["paths"], serde_json::json!([path]));
+        // Collection of the original blobs must not erase the recovery copy.
+        for version in &versions {
+            std::fs::remove_file(f.engine.blobs.path_of(&version.blob_hash).unwrap()).unwrap();
+        }
+        let exported = f.dir.join("recovery-export");
+        crate::backup::export(&f.engine.paths, id, &exported).unwrap();
+        let saved = ClientStore::open(&exported.join("state.sqlite")).unwrap();
+        let restored = saved.path_state(&path).unwrap();
+        assert_eq!(restored.in_flight.unwrap().operation_id, operation);
+        assert_eq!(restored.pending_local.unwrap().local_seq, 19);
+        assert_eq!(restored.conflict_draft.unwrap().conflict_id, conflict);
+        let blobs = BlobStore::open(exported.join("blobs")).unwrap();
+        for (version, text) in
+            versions
+                .iter()
+                .zip(["base", "submitted", "newer pending", "conflict draft"])
+        {
+            assert_eq!(
+                std::fs::read(blobs.path_of(&version.blob_hash).unwrap()).unwrap(),
+                text.as_bytes()
+            );
+        }
+        assert!(
+            !blobs.has(&unrelated),
+            "unrelated session content was duplicated"
+        );
+    }
+
+    #[test]
+    fn missing_excluded_candidate_keeps_its_pending_operation() {
+        let mut f = fixture();
+        let path = RepoPath::new("node_modules/pkg/generated.js").unwrap();
+        f.engine
+            .store
+            .put_path_state(
+                &path,
+                &PathState {
+                    pending_local: Some(PendingLocal {
+                        desired: Some(FileEntry::from_bytes(b"missing", GitMode::Regular)),
+                        local_seq: 1,
+                        task_id: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(f.engine.apply_exclusions(&[path.to_string()]).is_err());
+        assert!(f
+            .engine
+            .store
+            .path_state(&path)
+            .unwrap()
+            .pending_local
+            .is_some());
+        assert!(!f.engine.excluded_paths.contains(path.as_str()));
+        assert!(crate::backup::list(&f.engine.paths).unwrap().is_empty());
     }
 
     fn answered(engine: &ClientEngine) -> bool {

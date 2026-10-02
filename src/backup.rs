@@ -6,6 +6,120 @@
 use crate::{error::Result, session::Paths};
 use std::path::Path;
 
+/// Excluding a pending path must preserve its candidates, but must not copy
+/// every blob in the session again for each rejected dependency. Keep a scoped
+/// replica database and only its referenced content in the usual export layout.
+pub fn archive_excluded_candidates(
+    paths: &Paths,
+    source: &crate::store_client::ClientStore,
+    excluded: &[String],
+) -> Result<Option<String>> {
+    let mut states = std::collections::BTreeMap::new();
+    for name in excluded {
+        let path = crate::path::RepoPath::new(name)?;
+        let state = source.path_state(&path)?;
+        if state.has_local_work() || state.conflict_draft.is_some() {
+            states.insert(path, state);
+        }
+    }
+    if states.is_empty() {
+        return Ok(None);
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let dir = paths.weave_dir.join("backups").join(&id);
+    std::fs::create_dir_all(&dir)?;
+    restrict_directory(&dir)?;
+    let saved = crate::store_client::ClientStore::open(&dir.join("state.sqlite"))?;
+    let tx = saved.conn().unchecked_transaction()?;
+    if let Some(session) = source.session()? {
+        saved.set_session(&session)?;
+    }
+    if let Some(actor) = source.actor_id()? {
+        saved.set_actor_id(&actor)?;
+    }
+    if let Some(role) = source.role()? {
+        saved.set_role(role)?;
+    }
+    crate::db::set_u64(saved.conn(), "local_seq", source.local_seq()?)?;
+    saved.set_last_applied_revision(source.last_applied_revision()?)?;
+    for (path, state) in &states {
+        saved.put_path_state(path, state)?;
+    }
+    let mut control = source.control_cache()?;
+    if let Some(control) = &mut control {
+        control.conflicts.retain(|c| states.contains_key(&c.path));
+        control
+            .excluded_paths
+            .retain(|p| states.keys().any(|s| s.as_str() == p));
+        control.oversize.retain(|p| states.contains_key(&p.path));
+        saved.set_control_cache(control)?;
+    }
+    tx.commit()?;
+    let mut hashes = saved.referenced_blobs()?;
+    if let Some(control) = control {
+        for conflict in control.conflicts {
+            for entry in [
+                conflict.base_entry,
+                conflict.canonical_entry,
+                conflict.incoming_entry,
+                conflict.latest_local_candidate,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                hashes.insert(entry.blob_hash);
+            }
+        }
+    }
+    let blobs = crate::blobs::BlobStore::open(paths.blobs())?;
+    // Locally captured candidates must be durable before their replica rows
+    // can be detached. Remote canonical/conflict content may not have arrived.
+    for state in states.values() {
+        for entry in [
+            state.in_flight.as_ref().and_then(|f| f.desired.as_ref()),
+            state
+                .pending_local
+                .as_ref()
+                .and_then(|p| p.desired.as_ref()),
+            state.conflict_draft.as_ref().and_then(|d| d.entry.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !blobs.has(&entry.blob_hash) {
+                return Err(crate::error::integrity(
+                    "An excluded local candidate is missing; its pending operation was preserved.",
+                ));
+            }
+        }
+    }
+    let mut missing = Vec::new();
+    for hash in hashes {
+        if !blobs.has(&hash) {
+            missing.push(hash);
+            continue;
+        }
+        let target = dir.join("blobs").join(&hash[..2]).join(&hash);
+        std::fs::create_dir_all(target.parent().unwrap())?;
+        copy_tree(&blobs.path_of(&hash)?, &target)?;
+    }
+    // Close/checkpoint the archive database before publishing its manifest.
+    drop(saved);
+    sync_tree_directories(&dir)?;
+    crate::util::write_atomic(
+        &dir.join("backup.json"),
+        &serde_json::to_vec_pretty(&serde_json::json!({
+            "id": id, "reason": "excluded-candidates",
+            "created_at_ms": crate::util::now_ms(),
+            "paths": states.keys().collect::<Vec<_>>(),
+            "missing_remote_blobs": missing,
+        }))?,
+    )?;
+    sync_directory(&dir)?;
+    sync_directory(dir.parent().unwrap())?;
+    Ok(Some(id))
+}
+
 pub fn archive_session(paths: &Paths, reason: &str) -> Result<String> {
     let id = uuid::Uuid::new_v4().to_string();
     let dir = paths.weave_dir.join("backups").join(&id);

@@ -93,16 +93,26 @@ pub fn run_stdin_env(
     let mut child = cmd
         .spawn()
         .map_err(|e| git_err(format!("Could not run git: {e}")))?;
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| git_err("Could not write to git stdin"))?;
-        stdin.write_all(input)?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| git_err("Could not write to git stdin"))?;
+    // Git may produce output before consuming all of its input (notably
+    // check-ignore during npm watcher bursts). Drain stdout/stderr while
+    // writing, otherwise two full pipes deadlock the synchronous engine.
+    // Only subprocess I/O runs on this thread; canonical state stays here.
+    let (output, written) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || stdin.write_all(input));
+        let output = child.wait_with_output();
+        (output, writer.join())
+    });
+    let out = output.map_err(|e| git_err(format!("git failed: {e}")))?;
+    let written = written.map_err(|_| git_err("The Git input writer stopped unexpectedly."))?;
+    // If Git rejected the command without consuming stdin, retain its exit
+    // status and diagnostic rather than reporting a misleading broken pipe.
+    if out.status.success() {
+        written.map_err(|e| git_err(format!("Could not write to git stdin: {e}")))?;
     }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| git_err(format!("git failed: {e}")))?;
     Ok(GitOutput {
         status: out.status.code().unwrap_or(-1),
         stdout: out.stdout,

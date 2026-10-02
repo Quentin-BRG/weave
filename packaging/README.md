@@ -118,9 +118,10 @@ Linux     /usr/bin/weave
 ```
 
 Discovery is anchored on the running executable — `<exe dir>`,
-`<exe dir>/../lib/weave`, `<exe dir>/../libexec/weave`, plus the absolute system
-locations — so the portable tarball works from any prefix and nothing depends on
-`PATH`. `WEAVE_CLOUDFLARED` overrides everything for development; if it points at
+`<exe dir>/../lib/weave`, `<exe dir>/../libexec/weave` — so the portable tarball
+works from any prefix. Another installation's absolute system location is never
+used to supply this package's manifest or bundled runtime. `WEAVE_CLOUDFLARED`
+overrides everything for development; if it points at
 something unusable, discovery reports that rather than silently falling back.
 
 ## The installer self-check
