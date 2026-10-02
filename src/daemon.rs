@@ -392,7 +392,11 @@ async fn host_async(
 ) -> Result<()> {
     let _watcher = start_watcher(&paths, client.clone())?;
     // The coordinator binds to loopback, or to all interfaces in LAN mode.
-    let address = if opts.lan { "0.0.0.0" } else { "127.0.0.1" };
+    let address = if opts.lan {
+        std::net::Ipv4Addr::UNSPECIFIED
+    } else {
+        std::net::Ipv4Addr::LOCALHOST
+    };
     let old_record = load_session_record(&paths)?;
     let previous_port = old_record
         .as_ref()
@@ -400,13 +404,17 @@ async fn host_async(
         .and_then(|r| r.endpoint.as_deref())
         .and_then(endpoint_port)
         .unwrap_or(0);
-    let listener = match tokio::net::TcpListener::bind((address, previous_port)).await {
+    let listener = match bind_coordinator(address, previous_port) {
         Ok(listener) => listener,
-        Err(e) if previous_port != 0 && e.kind() == std::io::ErrorKind::AddrInUse => {
+        Err(e)
+            if previous_port != 0
+                && (e.kind() == std::io::ErrorKind::AddrInUse
+                    || (cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied)) =>
+        {
             tracing::warn!(
                 "Previous LAN port {previous_port} is occupied; creating a new invitation."
             );
-            tokio::net::TcpListener::bind((address, 0)).await?
+            bind_coordinator(address, 0)?
         }
         Err(e) => {
             return Err(session_err(format!(
@@ -1704,15 +1712,42 @@ async fn authenticate_endpoint(url: &str, key: &PeerKey) -> Result<()> {
     let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(MAX_FRAME))
         .max_frame_size(Some(MAX_FRAME));
-    let (mut socket, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio_tungstenite::connect_async_with_config(url, Some(config), false),
-    )
-    .await
-    .map_err(|_| {
-        crate::error::network("Connecting to the new host timed out; keeping the previous address.")
-    })?
-    .map_err(describe_connect_failure)?;
+    // A freshly created tunnel can briefly lack DNS or answer 5xx before its
+    // route is ready. Retry only transport establishment, within the same
+    // ten-second budget; an authentication failure must still fail immediately.
+    let mut last_connect_error = None;
+    let connect = async {
+        let mut backoff = std::time::Duration::from_millis(250);
+        loop {
+            match tokio_tungstenite::connect_async_with_config(url, Some(config), false).await {
+                Ok(connection) => return Ok(connection),
+                Err(error) => {
+                    use tokio_tungstenite::tungstenite::Error;
+                    let transient = match &error {
+                        Error::Io(error) => error.kind() != std::io::ErrorKind::PermissionDenied,
+                        Error::Http(response) => response.status().is_server_error(),
+                        _ => false,
+                    };
+                    if !transient {
+                        return Err(describe_connect_failure(error));
+                    }
+                    last_connect_error = Some(error.to_string());
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+                }
+            }
+        }
+    };
+    let (mut socket, _) = tokio::time::timeout(std::time::Duration::from_secs(10), connect)
+        .await
+        .map_err(|_| {
+            crate::error::network(
+                "Connecting to the new host timed out; keeping the previous address.",
+            )
+            .with_detail(
+                last_connect_error.unwrap_or_else(|| "No transport response in 10 seconds.".into()),
+            )
+        })??;
     let exchange = async {
         let mut initiator = Initiator::new(&key.psk, key.session_id)?;
         socket
@@ -1737,6 +1772,47 @@ async fn authenticate_endpoint(url: &str, key: &PeerKey) -> Result<()> {
             crate::error::network("The new host address timed out; keeping the previous address.")
         })??;
     Ok(())
+}
+
+fn bind_coordinator(
+    address: std::net::Ipv4Addr,
+    port: u16,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    // Linux permits TIME_WAIT reuse without overlapping a live listener. On
+    // BSD/macOS SO_REUSEADDR can instead overlap a specific-address listener
+    // with our wildcard listener, advertising a port that reaches another app.
+    socket.set_reuseaddr(cfg!(target_os = "linux"))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            setsockopt, WSAGetLastError, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+        };
+        // Windows otherwise permits wildcard/specific-address overlap even
+        // without SO_REUSEADDR. Exclusivity must be enabled before bind.
+        // https://learn.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse
+        let enabled: i32 = 1;
+        // SAFETY: the socket is live, and the integer buffer remains valid for
+        // the synchronous call with its exact byte size.
+        let result = unsafe {
+            setsockopt(
+                socket.as_raw_socket() as _,
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                (&enabled as *const i32).cast(),
+                std::mem::size_of_val(&enabled) as _,
+            )
+        };
+        if result == SOCKET_ERROR {
+            // SAFETY: reads this thread's most recent Winsock error.
+            return Err(std::io::Error::from_raw_os_error(unsafe {
+                WSAGetLastError()
+            }));
+        }
+    }
+    socket.bind(std::net::SocketAddr::from((address, port)))?;
+    socket.listen(1024)
 }
 
 fn endpoint_port(url: &str) -> Option<u16> {

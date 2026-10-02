@@ -55,6 +55,7 @@ impl Capture {
 enum Sabotage {
     None,
     FlipBitInHostBoundFrame(usize),
+    HttpUnavailableOnce,
 }
 
 struct WireTap {
@@ -182,6 +183,17 @@ fn pump(
         }
     }
     record(&capture, direction, &head);
+    if matches!(sabotage, Sabotage::HttpUnavailableOnce)
+        && direction == Direction::ToHost
+        && counter.fetch_add(1, Ordering::Relaxed) == 0
+    {
+        from.write_all(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        let _ = from.shutdown(std::net::Shutdown::Both);
+        return;
+    }
     if to.write_all(&head).is_err() {
         return;
     }
@@ -691,6 +703,57 @@ fn every_reconnect_performs_a_fresh_handshake_with_new_ephemeral_keys() {
     assert_eq!(before, sorted.len(), "a ciphertext frame repeated verbatim");
     drop(capture);
 
+    guest.stop_daemon();
+    host.stop_daemon();
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint replacement must tolerate a route that is not ready immediately.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn replacing_an_endpoint_retries_transient_failure_before_authenticating() {
+    let sandbox = Sandbox::new("endpoint-not-ready");
+    let mut host = Participant::new(&sandbox, "alpha");
+    init_repo(&host.repo, "Quentin", "quentin@example.com");
+    let mut guest = clone_participant(&sandbox, &host, "beta", "Alice", "alice@example.com");
+    host.start_daemon(&["host", "--lan"]);
+    host.wait_online(SHORT);
+    let invite = host.wait_for_invite(SHORT);
+    let original = invite["invite"].as_str().unwrap();
+    let path = write_invite(&sandbox, "original.txt", original);
+    guest.start_daemon(&["join", "--invite-file", &path]);
+    guest.wait_online(SHORT);
+
+    for stopped in [true, false] {
+        if stopped {
+            guest.stop_daemon();
+        }
+        let tap = WireTap::start(
+            upstream_port(invite["endpoint"].as_str().unwrap()),
+            Sabotage::HttpUnavailableOnce,
+        );
+        let path = write_invite(
+            &sandbox,
+            "replacement.txt",
+            &invite_via(original, tap.url(), None),
+        );
+        if stopped {
+            guest.start_daemon(&["join", "--invite-file", &path]);
+        } else {
+            guest.expect(&["join", "--invite-file", &path]);
+        }
+        guest.wait_online(SHORT);
+        let content = format!("preserved through replacement: {stopped}\n");
+        write_file(&guest.repo, "replacement.md", &content);
+        host.wait_for_file("replacement.md", &content, SHORT);
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(guest.repo.join(".git/weave/session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["endpoint"], tap.url());
+        assert!(tap.capture.lock().unwrap().connections >= 3);
+    }
     guest.stop_daemon();
     host.stop_daemon();
 }

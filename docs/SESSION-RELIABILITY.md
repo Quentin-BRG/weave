@@ -77,7 +77,9 @@ discovery mechanism.
 
 Encrypted pings run every five seconds. Missing responses expire the connection
 after fifteen seconds. TCP/WebSocket connection establishment has a ten-second
-limit, separate from the Noise handshake limit. Reconnection backs off to at most
+limit, separate from the Noise handshake limit. Invitation replacement retries
+temporary DNS/network or server errors within that limit, before authentication;
+failure retains the previous invitation. Reconnection backs off to at most
 eight seconds. Status distinguishes transport connection, session admission and
 completed synchronization, and reports pending work and the last host response.
 The last response timestamp advances only on an authenticated heartbeat reply.
