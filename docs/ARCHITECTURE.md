@@ -209,6 +209,11 @@ auto-reconciled (§140).
 
 ## 8. Crash safety
 
+Protocol 4 also journals external Git adoption and negotiated client alignment.
+See [SESSION-RELIABILITY.md](SESSION-RELIABILITY.md) for recovery archives, schema
+migration, lifecycle confirmation and the ordered Git-state journal.
+
+
 - SQLite runs WAL with `synchronous = FULL`; an acknowledged operation survives an
   immediate power loss.
 - Blobs are written to a temporary sibling, flushed, then atomically installed

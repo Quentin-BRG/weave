@@ -207,3 +207,16 @@ Where the specification leaves a detail open, these are the choices made and why
 - **The network task is supervised.** It is an infinite loop, so if its task ends it
   ended abnormally; restarting is free because the outbox is durable and operations
   are idempotent, whereas not restarting strands the participant offline forever.
+
+## Protocol 4 session reliability amendment
+
+[SESSION-RELIABILITY.md](SESSION-RELIABILITY.md) updates sections 10–11, 14, 28–30,
+46, 54–57, 63, 67 and 131–150 for controlled adoption of external Git while stopped.
+`src/git_state.rs` owns adoption and the ordered Git-state journal; `src/backup.rs`
+owns recoverable archives; `src/db.rs` migrates schema 1 and rejects old metadata
+access. `tests/session_reliability.rs` covers offline leave, uncertain status,
+external commits and rewinds, negotiated joins, shared exclusions, offline
+participants, identity updates and schema migration. It also injects interruptions
+between durable adoption revisions and during join reference installation, checks
+staged recovery after Git garbage collection, and rejects unauthenticated endpoint
+replacements. `tests/encrypted_transport.rs` covers silent connection expiry.

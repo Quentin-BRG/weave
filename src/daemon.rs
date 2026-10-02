@@ -68,9 +68,19 @@ pub struct HostOptions {
     pub max_file_size: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(
+    clap::ValueEnum, serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalChanges {
+    Backup,
+    Discard,
+    Cancel,
+}
+
 pub struct JoinOptions {
     pub invite: String,
+    pub local_changes: Option<LocalChanges>,
     /// Set when the caller already ran the join preflight. The CLI does, before
     /// prompting: refusing a broken repository is worth doing *before* asking
     /// somebody to paste a session secret.
@@ -84,12 +94,12 @@ struct DaemonControl {
     ws_port: u16,
     shutdown: mpsc::Sender<ShutdownKind>,
     client: ClientHandle,
+    endpoint: Option<tokio::sync::watch::Sender<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownKind {
     Stop,
-    Leave,
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +127,11 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
         .map(|r| r.role == Role::Host)
         .unwrap_or(false);
 
+    if existing.as_ref().is_some_and(|r| r.role != Role::Host) {
+        return Err(session_err(
+            "Leave the participant session before hosting another session.",
+        ));
+    }
     if !resuming {
         verify_new_host_repository(&paths)?;
     } else {
@@ -124,6 +139,7 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
     }
 
     let lock = DaemonLock::acquire(&paths)?;
+    verify_supported_repository(&paths)?;
     let identity = load_or_create_identity()?;
     let git_id = git_identity(&paths.repo_root)?;
     let display_name = identity
@@ -135,7 +151,7 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
         repository("Weave needs a checked-out branch (HEAD is detached).")
             .with_detail("Run `git switch <branch>` and retry.")
     })?;
-    let head = gitx::head_oid(&paths.repo_root)?.ok_or_else(|| {
+    let mut head = gitx::head_oid(&paths.repo_root)?.ok_or_else(|| {
         repository("This repository has no commits yet.").with_detail(
             "Weave publishes on top of an existing commit. Make an initial commit and retry.",
         )
@@ -143,6 +159,38 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
 
     let mut host_store = HostStore::open(&paths.host_db())?;
     let blobs = BlobStore::open(paths.blobs())?;
+    if resuming {
+        if existing
+            .as_ref()
+            .is_some_and(|r| r.session.branch != branch)
+        {
+            return Err(repository(
+                "The branch changed. Leave this session before hosting on another branch.",
+            ));
+        }
+        if let Some(mut publication) = host_store.latest_publication()? {
+            if publication.stage != PublicationStage::Complete {
+                let backup = crate::backup::archive_session(&paths, "publication-recovery")?;
+                crate::backup::capture_worktree(&paths, &backup)?;
+                gitx::protect_commit(&paths.repo_root, &head, &backup)?;
+                let descriptor = &publication.descriptor;
+                if head != descriptor.commit_oid {
+                    gitx::update_ref_cas(
+                        &paths.repo_root,
+                        &format!("refs/heads/{}", descriptor.branch),
+                        &descriptor.commit_oid,
+                        Some(&descriptor.parent_commit_oid),
+                    )?;
+                }
+                gitx::read_tree_into_index(&paths.repo_root, &descriptor.tree_oid)?;
+                head = descriptor.commit_oid.clone();
+                publication.stage = PublicationStage::Complete;
+                host_store.put_publication(&publication)?;
+            }
+        }
+    } else if host_store.session()?.is_some() {
+        crate::backup::archive_session(&paths, "new-session")?;
+    }
 
     // The limit this session will run under, decided before anything is read.
     let max_file_size = match opts.max_file_size {
@@ -185,9 +233,8 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
             // never started. Checked from the filesystem's own sizes, before
             // the scan below reads a single byte of a file it would refuse.
             verify_repository_within_limit(&paths, max_file_size)?;
-            // A fresh session: r0 is the host working tree at creation. Any
-            // canonical state left by a previous, ended session is discarded so
-            // revision numbering starts from zero.
+            // A fresh session starts from the committed tree at r0. Adoption
+            // below records local edits as its first collaborative revisions.
             host_store.reset()?;
             host_store.set_max_file_size(max_file_size)?;
             // The scan streams every file into the blob store as it hashes it,
@@ -201,7 +248,11 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
                 max_file_size,
             )?;
             report_rejected(&scan.rejected);
-            host_store.install_base_manifest(&scan.entries)?;
+            host_store.install_base_manifest(&gitx::committed_manifest(
+                &paths.repo_root,
+                &head,
+                &blobs,
+            )?)?;
             let session = SessionInfo {
                 session_id: Uuid::new_v4(),
                 repo_name: paths.repo_name(),
@@ -216,21 +267,44 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
         }
     };
 
-    // The publication that local Git state should currently reflect.
-    let expected_head = host_store
-        .latest_publication()?
-        .map(|p| p.descriptor.commit_oid)
-        .unwrap_or_else(|| session.base_commit.clone());
-    if head != expected_head {
-        return Err(
-            repository("Git state changed outside Weave.").with_detail(format!(
-            "Expected Git commit:\n{}\n\nCurrent Git commit:\n{}\n\nRestore the expected state \
-             before resuming the session.",
-            crate::util::short_oid(&expected_head),
-            crate::util::short_oid(&head)
-        )),
-        );
+    if branch != session.branch {
+        return Err(repository(
+            "The branch changed. Leave this session before hosting on another branch.",
+        ));
     }
+    // A fresh clean checkout already is the installed Git base. Running an
+    // adoption would archive and hash its entire content several more times,
+    // even though there is no local work to reconcile or index to normalize.
+    let include_local = if resuming {
+        gitx::has_staged_changes(&paths.repo_root)?
+    } else {
+        !gitx::dirty_entries(&paths.repo_root)?.is_empty()
+    };
+    crate::git_state::adopt(&paths, &mut host_store, &blobs, &head, include_local)?;
+    let expected_head = crate::git_state::current(&host_store, &paths)?.commit;
+
+    // A failure to start the watcher or tunnel must leave this session
+    // resumable, including the canonical work already adopted above.
+    save_session_record(
+        &paths,
+        &SessionRecord {
+            role: Role::Host,
+            session: session.clone(),
+            secret: secret.clone(),
+            endpoint: existing.as_ref().and_then(|record| record.endpoint.clone()),
+            mode: if opts.local_only {
+                TransportMode::Local
+            } else if opts.lan {
+                TransportMode::Lan
+            } else {
+                TransportMode::Tunnel
+            },
+            created_at_ms: existing
+                .as_ref()
+                .map(|record| record.created_at_ms)
+                .unwrap_or_else(crate::util::now_ms),
+        },
+    )?;
 
     let remote_name = gitx::upstream_of(&paths.repo_root, &branch)?
         .and_then(|upstream| upstream.split('/').next().map(|s| s.to_string()));
@@ -246,7 +320,8 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
         git_id.email.clone(),
         remote_name,
     );
-    let (host_handle, _host_thread) = host_engine.spawn();
+    let (host_handle, host_thread) = host_engine.spawn();
+    let _host_guard = EngineGuard::Host(host_handle.clone(), Some(host_thread));
 
     let mut client_store = ClientStore::open(&paths.client_db())?;
     if client_store
@@ -254,6 +329,7 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
         .map(|s| s.session_id != session.session_id)
         .unwrap_or(false)
     {
+        crate::backup::archive_session(&paths, "previous-replica")?;
         client_store.reset()?;
     }
     client_store.set_actor_id(&identity.actor_id)?;
@@ -282,7 +358,8 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
     for line in repaired {
         println!("Recovered: {line}");
     }
-    let (client_handle, _client_thread) = client_engine.spawn();
+    let (client_handle, client_thread) = client_engine.spawn();
+    let _client_guard = EngineGuard::Client(client_handle.clone(), Some(client_thread));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -300,9 +377,13 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
         BlobStore::open(paths.blobs())?,
     ));
 
+    runtime.block_on(TUNNEL.shutdown());
+    drop(runtime);
+    drop(_client_guard);
+    drop(_host_guard);
+    let cleanup = clear_runtime(&paths);
     drop(lock);
-    let _ = clear_runtime(&paths);
-    result
+    result.and(cleanup)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -316,11 +397,38 @@ async fn host_async(
     display_name: String,
     blobs: BlobStore,
 ) -> Result<()> {
+    let _watcher = start_watcher(&paths, client.clone())?;
     // The coordinator binds to loopback, or to all interfaces in LAN mode.
-    let bind = if opts.lan { "0.0.0.0:0" } else { "127.0.0.1:0" };
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .map_err(|e| session_err(format!("Could not bind the Weave coordinator: {e}")))?;
+    let address = if opts.lan {
+        std::net::Ipv4Addr::UNSPECIFIED
+    } else {
+        std::net::Ipv4Addr::LOCALHOST
+    };
+    let old_record = load_session_record(&paths)?;
+    let previous_port = old_record
+        .as_ref()
+        .filter(|r| r.mode == TransportMode::Lan)
+        .and_then(|r| r.endpoint.as_deref())
+        .and_then(endpoint_port)
+        .unwrap_or(0);
+    let listener = match bind_coordinator(address, previous_port) {
+        Ok(listener) => listener,
+        Err(e)
+            if previous_port != 0
+                && (e.kind() == std::io::ErrorKind::AddrInUse
+                    || (cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied)) =>
+        {
+            tracing::warn!(
+                "Previous LAN port {previous_port} is occupied; creating a new invitation."
+            );
+            bind_coordinator(address, 0)?
+        }
+        Err(e) => {
+            return Err(session_err(format!(
+                "Could not bind the Weave coordinator: {e}"
+            )))
+        }
+    };
     let ws_port = listener
         .local_addr()
         .map_err(|e| session_err(format!("Could not read the coordinator address: {e}")))?
@@ -369,34 +477,45 @@ async fn host_async(
     };
     save_session_record(&paths, &record)?;
 
-    print_host_banner(&paths, &session, &record, ws_port, &display_name)?;
-
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<ShutdownKind>(4);
     let control = Arc::new(DaemonControl {
         paths: paths.clone(),
         role: Role::Host,
         ws_port,
+        endpoint: None,
         shutdown: shutdown_tx,
         client: client.clone(),
     });
     start_ipc(control.clone(), Role::Host, session.session_id).await?;
-    start_watcher(&paths, client.clone())?;
+    print_host_banner(&paths, &session, &record, ws_port, &display_name)?;
 
+    let monitor = control.clone();
+    let monitor_task = tokio::spawn(async move {
+        let mut last = String::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if let Ok(Some(record)) = load_session_record(&monitor.paths) {
+                let current = format!("ws://{}:{}{}", local_ip(), monitor.ws_port, WS_PATH);
+                if record.mode == TransportMode::Lan
+                    && record.endpoint.as_deref() != Some(current.as_str())
+                    && last != current
+                {
+                    tracing::warn!("LAN address changed to {current}. Run `weave invite refresh` and share the new invitation.");
+                    last = current;
+                }
+            }
+        }
+    });
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!("\nStopping Weave session.");
         }
-        kind = shutdown_rx.recv() => {
-            match kind {
-                Some(ShutdownKind::Leave) => {
-                    clear_session_record(&paths)?;
-                    println!("Weave session ended.");
-                }
-                _ => println!("Weave session stopped."),
-            }
+        _ = shutdown_rx.recv() => {
+            println!("Stopping Weave; the session is kept for resume.");
         }
     }
 
+    monitor_task.abort();
     host.send(HostInput::Shutdown);
     client.send(ClientInput::Shutdown);
     TUNNEL.shutdown().await;
@@ -437,27 +556,71 @@ pub fn run_join(start_dir: &Path, opts: JoinOptions) -> Result<()> {
         .map(|r| r.session.session_id == payload.session_id)
         .unwrap_or(false);
 
+    if existing.is_some() && !rejoining {
+        return Err(session_err(
+            "Leave the current session explicitly before joining another.",
+        ));
+    }
+    if let Some(record) = &existing {
+        if record.role != Role::Participant || record.secret != payload.secret {
+            return Err(session_err(
+                "The invitation must identify the same participant session and secret.",
+            ));
+        }
+    }
+    if rejoining && crate::ipc::daemon_state(&paths)? == crate::ipc::DaemonState::Active {
+        crate::ipc::call(
+            &paths,
+            IpcCommand::JoinEndpoint {
+                invite: opts.invite,
+            },
+        )?;
+        println!("Host address updated; reconnecting to the same session.");
+        return Ok(());
+    }
+    let lock = DaemonLock::acquire(&paths)?;
+    if existing
+        .as_ref()
+        .is_some_and(|record| record.endpoint.as_deref() != Some(&payload.url))
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let key = PeerKey::derive(&payload.secret, payload.session_id);
+        runtime.block_on(authenticate_endpoint(&payload.url, &key))?;
+    }
+    let mut policy = opts.local_changes;
     if !rejoining {
-        verify_clean_working_tree(&paths)?;
-        // No file size judgement is made here, not even an advisory one. The
-        // compiled default is what a *new host session* starts at; it is not
-        // this session's limit and has no standing in a join. A session running
-        // at 512 MiB is entitled to hold a 200 MiB file, and mentioning 128 MiB
-        // to the person joining it would be inventing a rule nobody set. The
-        // only limit that exists here arrives with `Welcome`.
-        if head != payload.base_commit {
-            return Err(
-                repository("Cannot join Weave session.").with_detail(format!(
-                "Session base:\n{}\n\nYour current Git commit:\n{}\n\nCheckout the expected base \
-                 commit and retry.",
-                crate::util::short_oid(&payload.base_commit),
-                crate::util::short_oid(&head)
-            )),
+        let dirty = gitx::dirty_entries(&paths.repo_root)?;
+        if !dirty.is_empty() {
+            eprintln!("Local changes before joining:\n{}", dirty.join("\n"));
+            if policy.is_none() {
+                use std::io::IsTerminal;
+                if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+                    eprintln!(
+                        "Choose [b] backup and join, [d] discard affected changes, [Enter] cancel:"
+                    );
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer)?;
+                    policy = Some(match answer.trim() {
+                        "b" => LocalChanges::Backup,
+                        "d" => LocalChanges::Discard,
+                        _ => LocalChanges::Cancel,
+                    });
+                }
+            }
+            if !matches!(policy, Some(LocalChanges::Backup | LocalChanges::Discard)) {
+                return Err(repository(
+                    "Join cancelled: choose --local-changes=backup|discard to handle local work.",
+                ));
+            }
+            let id = crate::backup::archive_session(&paths, "first-join-local-work")?;
+            crate::backup::capture_worktree(&paths, &id)?;
+            eprintln!(
+                "Local recovery archive: {id}. Affected files will be replaced by session content."
             );
         }
     }
-
-    let lock = DaemonLock::acquire(&paths)?;
     let identity = load_or_create_identity()?;
     let git_id = git_identity(&paths.repo_root)?;
     let display_name = identity
@@ -483,6 +646,7 @@ pub fn run_join(start_dir: &Path, opts: JoinOptions) -> Result<()> {
         .map(|s| s.session_id != payload.session_id)
         .unwrap_or(false)
     {
+        crate::backup::archive_session(&paths, "previous-replica")?;
         client_store.reset()?;
     }
     client_store.set_actor_id(&identity.actor_id)?;
@@ -498,7 +662,7 @@ pub fn run_join(start_dir: &Path, opts: JoinOptions) -> Result<()> {
     let expected_head = client_store
         .latest_journal_publication()?
         .map(|p| p.descriptor.commit_oid)
-        .unwrap_or_else(|| payload.base_commit.clone());
+        .unwrap_or_else(|| head.clone());
 
     let mut client_engine = ClientEngine::new(
         paths.clone(),
@@ -513,6 +677,7 @@ pub fn run_join(start_dir: &Path, opts: JoinOptions) -> Result<()> {
         branch.clone(),
         expected_head,
     );
+    client_engine.join_policy = policy;
     if first_run {
         client_engine.seed_materialized_from_disk()?;
     }
@@ -526,7 +691,8 @@ pub fn run_join(start_dir: &Path, opts: JoinOptions) -> Result<()> {
     for line in repaired {
         println!("Recovered: {line}");
     }
-    let (client_handle, _thread) = client_engine.spawn();
+    let (client_handle, client_thread) = client_engine.spawn();
+    let _client_guard = EngineGuard::Client(client_handle.clone(), Some(client_thread));
 
     let record = SessionRecord {
         role: Role::Participant,
@@ -556,9 +722,11 @@ pub fn run_join(start_dir: &Path, opts: JoinOptions) -> Result<()> {
         fatal_rx,
     ));
 
+    drop(runtime);
+    drop(_client_guard);
+    let cleanup = clear_runtime(&paths);
     drop(lock);
-    let _ = clear_runtime(&paths);
-    result
+    result.and(cleanup)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -571,6 +739,7 @@ async fn participant_async(
     display_name: String,
     mut fatal: mpsc::Receiver<crate::error::WeaveError>,
 ) -> Result<()> {
+    let _watcher = start_watcher(&paths, client.clone())?;
     println!("Weave — {}", paths.repo_name());
     println!();
     println!("Role: participant");
@@ -580,41 +749,42 @@ async fn participant_async(
     println!("Connecting to the Weave host...");
     println!();
     println!("Run `weave status` from another terminal at any time.");
-    println!("Press Ctrl-C to leave the live session.");
+    println!("Press Ctrl-C to stop; the session is kept for `weave resume`.");
     println!();
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<ShutdownKind>(4);
+    let (endpoint_tx, mut endpoint_rx) = tokio::sync::watch::channel(url.clone());
     let control = Arc::new(DaemonControl {
         paths: paths.clone(),
         role: Role::Participant,
         ws_port: 0,
+        endpoint: Some(endpoint_tx),
         shutdown: shutdown_tx,
         client: client.clone(),
     });
     start_ipc(control.clone(), Role::Participant, session.session_id).await?;
-    start_watcher(&paths, client.clone())?;
 
     let key = PeerKey::derive(&secret, session.session_id);
     drop(secret);
-    let connection = tokio::spawn(supervise_connection(
-        url,
-        key,
-        client.clone(),
-        BlobStore::open(paths.blobs())?,
-    ));
+    let connection_client = client.clone();
+    let connection_blobs = BlobStore::open(paths.blobs())?;
+    let connection = tokio::spawn(async move {
+        loop {
+            let url = endpoint_rx.borrow_and_update().clone();
+            tokio::select! {
+                _ = client_connection_loop(url, key.clone(), connection_client.clone(), connection_blobs.clone()) => {},
+                changed = endpoint_rx.changed() => { if changed.is_err() { break; } }
+            }
+        }
+    });
 
     let outcome = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            println!("\nLeaving the Weave session.");
+            println!("\nStopping Weave; the session is kept for resume.");
             Ok(())
         }
-        kind = shutdown_rx.recv() => {
-            if kind == Some(ShutdownKind::Leave) {
-                clear_session_record(&paths)?;
-                println!("Left the Weave session.");
-            } else {
-                println!("Weave stopped.");
-            }
+        _ = shutdown_rx.recv() => {
+            println!("Stopping Weave; the session is kept for resume.");
             Ok(())
         }
         // The session cannot be entered at all. The local session record is
@@ -684,6 +854,7 @@ pub fn run_resume(start_dir: &Path) -> Result<()> {
                 JoinOptions {
                     invite,
                     preflighted: false,
+                    local_changes: None,
                 },
             )
         }
@@ -762,11 +933,21 @@ async fn serve_socket(socket: WebSocket, state: WsState) {
 
     let writer = tokio::spawn(encrypt_to_sink(rx, queued, sink, channel.clone()));
     let pumping = tokio::spawn(run_pump(jobs, state.blobs.clone(), out.clone()));
+    let _tasks = AbortTasks(vec![writer.abort_handle(), pumping.abort_handle()]);
     // Inbound data is bounded here rather than in the engine's channel; see
     // [`MAX_INFLIGHT_DATA_FRAMES`].
     let slots = Arc::new(Semaphore::new(MAX_INFLIGHT_DATA_FRAMES));
 
-    while let Some(Ok(message)) = stream.next().await {
+    loop {
+        if out.is_closed() {
+            break;
+        }
+        let message =
+            match tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await {
+                Ok(Some(Ok(message))) => message,
+                Ok(_) => break,
+                Err(_) => continue,
+            };
         match message {
             Message::Binary(bytes) => match channel.decrypt(&bytes) {
                 // A partial application message; more frames follow.
@@ -1126,31 +1307,10 @@ fn ensure_crypto_provider() {
 /// with no path back, which is exactly the failure mode local editing must
 /// survive. Restarting costs nothing and cannot lose queued work: the outbox is
 /// durable and every operation is idempotent.
-async fn supervise_connection(url: String, key: PeerKey, client: ClientHandle, blobs: BlobStore) {
-    loop {
-        let task = tokio::spawn(client_connection_loop(
-            url.clone(),
-            key.clone(),
-            client.clone(),
-            blobs.clone(),
-        ));
-        match task.await {
-            Ok(()) => return,
-            Err(e) if e.is_cancelled() => return,
-            Err(e) => {
-                tracing::error!("connection task stopped unexpectedly: {e}; restarting");
-                client.send(ClientInput::Disconnected(
-                    "connection task restarted".into(),
-                ));
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        }
-    }
-}
-
 async fn client_connection_loop(url: String, key: PeerKey, client: ClientHandle, blobs: BlobStore) {
     ensure_crypto_provider();
     let mut backoff = 1u64;
+    let mut previous_error = String::new();
     loop {
         match connect_once(&url, &key, &client, &blobs).await {
             Ok(reason) => {
@@ -1159,7 +1319,10 @@ async fn client_connection_loop(url: String, key: PeerKey, client: ClientHandle,
             }
             Err(e) => {
                 client.send(ClientInput::Disconnected(e.message.clone()));
-                tracing::warn!("connection failed: {}", e.message);
+                if previous_error != e.message {
+                    tracing::warn!("host unreachable — reconnecting: {}", e.message);
+                    previous_error = e.message;
+                }
                 // Capped low on purpose: after `weave tunnel restart` the new
                 // hostname needs a moment to resolve, and a coarse backoff
                 // would add tens of seconds of avoidable downtime. One DNS
@@ -1188,9 +1351,13 @@ async fn connect_once(
     let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(MAX_FRAME))
         .max_frame_size(Some(MAX_FRAME));
-    let (socket, _) = tokio_tungstenite::connect_async_with_config(request, Some(config), false)
-        .await
-        .map_err(describe_connect_failure)?;
+    let (socket, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio_tungstenite::connect_async_with_config(request, Some(config), false),
+    )
+    .await
+    .map_err(|_| crate::error::network("Connecting to the host timed out after 10 seconds."))?
+    .map_err(describe_connect_failure)?;
 
     let (mut sink, mut stream) = socket.split();
 
@@ -1246,6 +1413,7 @@ async fn connect_once(
 
     let (pump, jobs) = blob_pump();
     let pumping = tokio::spawn(run_pump(jobs, blobs.clone(), out.clone()));
+    let _tasks = AbortTasks(vec![writer.abort_handle(), pumping.abort_handle()]);
     let slots = Arc::new(Semaphore::new(MAX_INFLIGHT_DATA_FRAMES));
 
     client.send(ClientInput::Connected {
@@ -1253,7 +1421,16 @@ async fn connect_once(
         pump,
     });
 
-    while let Some(message) = stream.next().await {
+    loop {
+        if out.is_closed() {
+            break;
+        }
+        let message =
+            match tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(_) => continue,
+            };
         let message = match message {
             Ok(m) => m,
             Err(e) => {
@@ -1459,13 +1636,24 @@ async fn serve_ipc_connection(
 async fn handle_ipc_command(control: &Arc<DaemonControl>, command: IpcCommand) -> IpcResponse {
     match command {
         IpcCommand::Stop => {
-            let _ = control.shutdown.send(ShutdownKind::Stop).await;
+            if control.shutdown.send(ShutdownKind::Stop).await.is_err() {
+                return IpcResponse::error(&session_err("Daemon shutdown is unavailable."));
+            }
             IpcResponse::ok(serde_json::json!({ "stopping": true }))
         }
         IpcCommand::Leave => {
-            let _ = control.shutdown.send(ShutdownKind::Leave).await;
-            IpcResponse::ok(serde_json::json!({ "leaving": true }))
+            IpcResponse::error(&session_err(
+                "Use the protocol 4 `weave leave` CLI: durable departure requires shutdown followed by an exclusive lock.",
+            ))
         }
+        IpcCommand::JoinEndpoint { invite } => match replace_endpoint(control, &invite).await {
+            Ok(()) => IpcResponse::ok(serde_json::json!({"reconnecting": true})),
+            Err(e) => IpcResponse::error(&e),
+        },
+        IpcCommand::InviteRefresh => match refresh_invite(control) {
+            Ok(value) => IpcResponse::ok(value),
+            Err(e) => IpcResponse::error(&e),
+        },
         IpcCommand::Invite => match invite_text(control) {
             Ok(value) => IpcResponse::ok(value),
             Err(e) => IpcResponse::error(&e),
@@ -1493,6 +1681,173 @@ async fn handle_ipc_command(control: &Arc<DaemonControl>, command: IpcCommand) -
             }
         }
     }
+}
+
+async fn replace_endpoint(control: &Arc<DaemonControl>, invite: &str) -> Result<()> {
+    let payload = decode_invite(invite)?;
+    let mut record =
+        load_session_record(&control.paths)?.ok_or_else(|| session_err("No saved session."))?;
+    if record.role != Role::Participant
+        || record.session.session_id != payload.session_id
+        || record.secret != payload.secret
+    {
+        return Err(session_err(
+            "The invitation must identify the same participant session and secret.",
+        ));
+    }
+    let key = PeerKey::derive(&record.secret, record.session.session_id);
+    authenticate_endpoint(&payload.url, &key).await?;
+    record.endpoint = Some(payload.url.clone());
+    record.mode = if payload.url.starts_with("wss://") {
+        TransportMode::Tunnel
+    } else {
+        TransportMode::Lan
+    };
+    save_session_record(&control.paths, &record)?;
+    control
+        .endpoint
+        .as_ref()
+        .ok_or_else(|| session_err("Only a participant can update its host address."))?
+        .send(payload.url)
+        .map_err(|_| session_err("The connection manager has stopped."))?;
+    Ok(())
+}
+
+async fn authenticate_endpoint(url: &str, key: &PeerKey) -> Result<()> {
+    use tokio_tungstenite::tungstenite::Message;
+    ensure_crypto_provider();
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME))
+        .max_frame_size(Some(MAX_FRAME));
+    // A freshly created tunnel can briefly lack DNS or answer 5xx before its
+    // route is ready. Retry only transport establishment, within the same
+    // ten-second budget; an authentication failure must still fail immediately.
+    let mut last_connect_error = None;
+    let connect = async {
+        let mut backoff = std::time::Duration::from_millis(250);
+        loop {
+            match tokio_tungstenite::connect_async_with_config(url, Some(config), false).await {
+                Ok(connection) => return Ok(connection),
+                Err(error) => {
+                    use tokio_tungstenite::tungstenite::Error;
+                    let transient = match &error {
+                        Error::Io(error) => error.kind() != std::io::ErrorKind::PermissionDenied,
+                        Error::Http(response) => response.status().is_server_error(),
+                        _ => false,
+                    };
+                    if !transient {
+                        return Err(describe_connect_failure(error));
+                    }
+                    last_connect_error = Some(error.to_string());
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+                }
+            }
+        }
+    };
+    let (mut socket, _) = tokio::time::timeout(std::time::Duration::from_secs(10), connect)
+        .await
+        .map_err(|_| {
+            crate::error::network(
+                "Connecting to the new host timed out; keeping the previous address.",
+            )
+            .with_detail(
+                last_connect_error.unwrap_or_else(|| "No transport response in 10 seconds.".into()),
+            )
+        })??;
+    let exchange = async {
+        let mut initiator = Initiator::new(&key.psk, key.session_id)?;
+        socket
+            .send(Message::Binary(initiator.first_message()?.into()))
+            .await
+            .map_err(|e| crate::error::network(e.to_string()))?;
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Binary(reply))) => {
+                    initiator.finish(&reply)?;
+                    break;
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                _ => return Err(crate::error::network("The new host did not authenticate.")),
+            }
+        }
+        Ok(())
+    };
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange)
+        .await
+        .map_err(|_| {
+            crate::error::network("The new host address timed out; keeping the previous address.")
+        })??;
+    Ok(())
+}
+
+fn bind_coordinator(
+    address: std::net::Ipv4Addr,
+    port: u16,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    // Linux permits TIME_WAIT reuse without overlapping a live listener. On
+    // BSD/macOS SO_REUSEADDR can instead overlap a specific-address listener
+    // with our wildcard listener, advertising a port that reaches another app.
+    socket.set_reuseaddr(cfg!(target_os = "linux"))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            setsockopt, WSAGetLastError, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+        };
+        // Windows otherwise permits wildcard/specific-address overlap even
+        // without SO_REUSEADDR. Exclusivity must be enabled before bind.
+        // https://learn.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse
+        let enabled: i32 = 1;
+        // SAFETY: the socket is live, and the integer buffer remains valid for
+        // the synchronous call with its exact byte size.
+        let result = unsafe {
+            setsockopt(
+                socket.as_raw_socket() as _,
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                (&enabled as *const i32).cast(),
+                std::mem::size_of_val(&enabled) as _,
+            )
+        };
+        if result == SOCKET_ERROR {
+            // SAFETY: reads this thread's most recent Winsock error.
+            return Err(std::io::Error::from_raw_os_error(unsafe {
+                WSAGetLastError()
+            }));
+        }
+    }
+    socket.bind(std::net::SocketAddr::from((address, port)))?;
+    socket.listen(1024)
+}
+
+fn endpoint_port(url: &str) -> Option<u16> {
+    url.strip_prefix("ws://")?
+        .split('/')
+        .next()?
+        .rsplit(':')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn refresh_invite(control: &Arc<DaemonControl>) -> Result<serde_json::Value> {
+    let mut record =
+        load_session_record(&control.paths)?.ok_or_else(|| session_err("No saved session."))?;
+    if record.role != Role::Host || record.mode != TransportMode::Lan {
+        return Err(crate::error::usage(
+            "Invite refresh requires a LAN host; use `weave tunnel restart` for a tunnel.",
+        ));
+    }
+    record.endpoint = Some(format!(
+        "ws://{}:{}{}",
+        local_ip(),
+        control.ws_port,
+        WS_PATH
+    ));
+    save_session_record(&control.paths, &record)?;
+    invite_text(control)
 }
 
 fn invite_text(control: &Arc<DaemonControl>) -> Result<serde_json::Value> {
@@ -1570,19 +1925,64 @@ async fn restart_tunnel(control: &Arc<DaemonControl>) -> Result<serde_json::Valu
 // Watcher plumbing
 // ---------------------------------------------------------------------------
 
-fn start_watcher(paths: &Paths, client: ClientHandle) -> Result<()> {
+enum EngineGuard {
+    Host(HostHandle, Option<std::thread::JoinHandle<()>>),
+    Client(ClientHandle, Option<std::thread::JoinHandle<()>>),
+}
+impl Drop for EngineGuard {
+    fn drop(&mut self) {
+        let thread = match self {
+            Self::Host(handle, thread) => {
+                handle.send(HostInput::Shutdown);
+                thread.take()
+            }
+            Self::Client(handle, thread) => {
+                handle.send(ClientInput::Shutdown);
+                thread.take()
+            }
+        };
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct AbortTasks(Vec<tokio::task::AbortHandle>);
+impl Drop for AbortTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+struct WatchBridge {
+    watcher: Option<watch::WatchHandle>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for WatchBridge {
+    fn drop(&mut self) {
+        self.watcher.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+fn start_watcher(paths: &Paths, client: ClientHandle) -> Result<WatchBridge> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let handle = watch::start(&paths.repo_root, tx)?;
-    std::thread::Builder::new()
+    let watcher = watch::start(&paths.repo_root, tx)?;
+    let thread = std::thread::Builder::new()
         .name("weave-watch-bridge".into())
         .spawn(move || {
-            let _keep_alive = handle;
             while let Ok(event) = rx.recv() {
                 client.send(ClientInput::Watch(event));
             }
         })
         .map_err(|e| session_err(format!("Could not start the watcher bridge: {e}")))?;
-    Ok(())
+    Ok(WatchBridge {
+        watcher: Some(watcher),
+        thread: Some(thread),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1698,7 +2098,7 @@ fn verify_new_host_repository(paths: &Paths) -> Result<()> {
         return Err(repository("HEAD is detached.")
             .with_detail("Weave needs one checked-out branch. Run `git switch <branch>`."));
     }
-    verify_clean_working_tree(paths)?;
+
     Ok(())
 }
 

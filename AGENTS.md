@@ -113,6 +113,9 @@ If a Weave session is active:
 A non-host may request a Weave commit, but only the host coordinator builds the canonical Git
 objects, updates the branch and pushes.
 
-If no Weave session is active, normal Git workflows apply.
+Normal Git workflows apply only after a successful status reports `daemon_state: "stopped"`.
+A saved session may still exist; the host can use Git on the same branch and then run `weave resume`.
+If status fails or the daemon state is unknown, do not perform raw Git writes. Diagnose local
+control access first. A disconnected participant still has an active daemon and a durable outbox.
 
 <!-- weave:end -->

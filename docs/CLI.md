@@ -45,9 +45,9 @@ on stdout.
 ### `weave host [--lan] [--local] [--max-file-size <SIZE>]`
 
 Starts the coordinator and this machine's replica. Requires a valid Git repository
-with a checked-out branch, at least one commit, no Git operation in progress, and —
-for a new session — a clean working tree. `r0` is the host working tree at session
-creation.
+with a checked-out branch, at least one commit and no Git operation in progress.
+The committed Git tree is `r0`; existing local changes become initial collaborative
+revisions, with the index backed up before normalization.
 
 - default: binds loopback and launches `cloudflared tunnel`
 - `--lan`: binds all interfaces, no Cloudflare process
@@ -65,11 +65,14 @@ with the same Noise handshake whether they arrive over `wss://` or over a plain 
 
 Prints the invite. Runs until Ctrl-C or `weave stop`.
 
-### `weave join [--invite-file <PATH>] [--invite-stdin]`
+### `weave join [--invite-file <PATH>] [--invite-stdin] [--local-changes backup|discard|cancel]`
 
-Joins an existing session. You must already have a checkout of the same repository,
-clean, on the session branch, at the session base commit (or at the latest
-Weave-published commit). Weave does not clone.
+Joins an existing session from a checkout on the same branch. The authenticated
+host supplies its current commit and any missing Git objects. Local changes require
+a terminal choice or an explicit `--local-changes` policy; cancel is the default.
+Backup preserves work separately, and all realignments protect local commits with
+a recovery reference. Weave does not clone. An updated invitation can replace the
+address of the same session while a participant daemon is running.
 
 Without a flag, the invite is read from a hidden prompt, because it contains the
 session secret.
@@ -88,12 +91,17 @@ session record. On the host this re-validates SQLite integrity, blob references,
 Git branch and any incomplete publication journal, then restarts the coordinator and
 the transport. A resumed remote session normally receives a new Quick Tunnel URL and
 prints a new invite; the logical session, its ID, its secret, its canonical state,
-its Tasks and its conflicts are unchanged.
+its Tasks and existing conflicts are preserved. On the same branch, a host commit
+changed by ordinary Git while stopped is adopted and unpublished work is reconciled.
+New conflicts retain every candidate. A different branch requires a new session.
+LAN resume reuses the previous port if available and advertises the current IP.
 
 ### `weave stop` / `weave leave`
 
 `stop` shuts the daemon down and keeps the session record so `weave resume` works.
-`leave` also forgets the record. Neither touches the working tree.
+`leave` waits for shutdown, archives session state and local work, then detaches
+the session under its lock. It also works without a daemon and is idempotent.
+Both commands confirm completion before reporting success; the working tree stays.
 
 ---
 
@@ -138,11 +146,19 @@ Conflicts:
 0
 ```
 
-JSON fields include `active`, `role`, `branch`, `base_commit`, `git_publication`,
+JSON fields include `daemon_state`, `session_saved`, `git_state`, `unpublished_changes`,
+`transport_connected`, `synchronized`, `last_host_response_ms`, `active`, `role`, `branch`, `base_commit`, `git_publication`,
 `published_revision`, `live_revision`, `revisions_ahead`, `state` (the deterministic
 replica hash), `connection`, `sync_state`, `participants`, `active_task`,
 `outbox_pending`, `conflicts_open`, `conflict_drafts`, `rejected_paths`, `notices`,
 `file_count`, `max_file_size`, `oversize` and `disk`.
+
+`git_state` is the current adopted Git state. `git_publication` is the last commit
+created through Weave. `unpublished_changes` reports whether canonical content
+differs from the adopted Git tree (null until that tree is known). The historical
+`revisions_ahead` count includes external adoption revisions; it is not a count of
+changes still requiring publication. `synchronized` also requires no local outbox,
+conflict draft, oversized local file or blocked materialization.
 
 `oversize` lists every path in the session that is above the file size limit,
 whoever owns it: `path`, `size`, `display_name`, `mine`, and `canonical` (true when
@@ -150,8 +166,9 @@ the session already holds earlier content for that path). It is empty in the
 ordinary case. `disk` carries `available_bytes` — absent, rather than zero, on a
 platform that will not report it.
 
-When no session is running, `weave status --json` prints `{"active": false, …}` and
-exits 0 — an agent can branch on it safely.
+After confirming the daemon lock is free, status reports `daemon_state: "stopped"`,
+`active: false` and whether a session is saved. An IPC, permission or runtime error
+exits nonzero and reports unknown state; it never authorizes raw Git writes.
 
 ### `weave peers [--json]`
 
@@ -292,7 +309,6 @@ editing continues and every change stays durably queued; each participant rejoin
 with the new invite:
 
 ```bash
-weave stop
 weave join --invite-file new-invite.txt
 ```
 
@@ -388,14 +404,22 @@ The outcome is graded, and only the successful path is quiet:
 A successful start prints no diagnostics. There is no doctor report on every
 `weave host`.
 
-### `weave recover [--rebuild] [--export <DIR>] [--json]`
+### `weave recover [--rebuild] [--export <DIR>] [--list] [--backup <ID>] [--json]`
 
 Verifies revision and blob references, detects an incomplete Git publication, and
 reports outbox state. `--rebuild` reconstructs the derived canonical manifest from
 the durable revision history. `--export` copies the latest recoverable canonical
 files to a safe directory. Recovery always prefers preserving data over automatic
-destructive repair.
+destructive repair. `--list` lists archives; `--backup <ID> --export <DIR>` exports
+one to a new directory. `--rebuild` requires a stopped daemon.
 
 ### `weave config list|get <KEY>|set <KEY> <VALUE> [--json]`
 
 `display_name` is writable; `actor_id` is read-only.
+
+### `weave invite refresh [--json]`
+
+On a LAN host, recalculate and durably save the advertised IP and port, retaining
+the session identity and secret. Print a new invitation for manual sharing.
+The periodic address check only signals changes; it does not distribute tokens.
+For a Quick Tunnel use `weave tunnel restart`.

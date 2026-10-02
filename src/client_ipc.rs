@@ -36,6 +36,18 @@ impl ClientEngine {
             };
         }
 
+        if matches!(
+            &command,
+            IpcCommand::CommitPrepare { .. } | IpcCommand::CommitCreate { .. }
+        ) {
+            let identity = attempt!(crate::session::git_identity(&self.paths.repo_root));
+            self.git_name = identity.name;
+            self.git_email = identity.email;
+            self.send(ClientMessage::UpdateIdentity {
+                git_name: self.git_name.clone(),
+                git_email: self.git_email.clone(),
+            });
+        }
         match command {
             IpcCommand::Status => {
                 let value = attempt!(self.status_json());
@@ -252,7 +264,9 @@ impl ClientEngine {
                     max_file_size,
                 });
             }
-            IpcCommand::Invite
+            IpcCommand::JoinEndpoint { .. }
+            | IpcCommand::InviteRefresh
+            | IpcCommand::Invite
             | IpcCommand::TunnelRestart
             | IpcCommand::Stop
             | IpcCommand::Leave => {
@@ -271,6 +285,8 @@ impl ClientEngine {
         let live_revision = self.store.last_applied_revision()?;
         let manifest = self.store.replica_manifest()?;
         let state_hash_value = state_hash(manifest.iter());
+        let unpublished_changes = crate::db::get_meta(self.store.conn(), "git_tree_state_hash")?
+            .map(|hash| hash != state_hash_value);
 
         let mut outbox_pending = 0usize;
         let mut conflict_drafts = Vec::new();
@@ -308,6 +324,8 @@ impl ClientEngine {
 
         Ok(serde_json::json!({
             "active": true,
+            "daemon_state": "active",
+            "session_saved": true,
             "repository": self.paths.repo_name(),
             "role": self.role.as_str(),
             "actor_id": self.actor_id,
@@ -316,6 +334,7 @@ impl ClientEngine {
             "host": self.session.host_display_name,
             "branch": self.branch,
             "base_commit": self.session.base_commit,
+            "git_state": crate::db::get_json::<crate::git_state::GitState>(self.store.conn(), "git_state")?,
             "git_publication": publication.as_ref().map(|p| serde_json::json!({
                 "commit": p.descriptor.commit_oid,
                 "short_commit": crate::util::short_oid(&p.descriptor.commit_oid),
@@ -327,9 +346,13 @@ impl ClientEngine {
             "published_revision": published_revision,
             "live_revision": live_revision,
             "revisions_ahead": live_revision.saturating_sub(published_revision),
+            "unpublished_changes": unpublished_changes,
             "state": state_hash_value,
             "connection": if self.connected { "online" } else { "offline" },
             "connection_note": self.connection_note,
+            "transport_connected": self.out.is_some(),
+            "last_host_response_ms": self.last_host_response_ms,
+            "synchronized": self.connected && outbox_pending == 0 && conflict_drafts.is_empty() && self.store.oversize()?.is_empty() && !self.waiting_for_content() && self.rejected_paths.is_empty() && sync_state.is_live(),
             "sync_state": sync_state,
             "participants": self.peers,
             "active_task": self.my_active_task(),

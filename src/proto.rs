@@ -135,6 +135,8 @@ pub struct OversizeReport {
 /// Current control state (specification sections 99, 100).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlSnapshot {
+    #[serde(default)]
+    pub excluded_paths: Vec<String>,
     pub control_version: u64,
     pub tasks: Vec<Task>,
     pub conflicts: Vec<Conflict>,
@@ -203,6 +205,10 @@ pub struct ConflictReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "message_type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    UpdateIdentity {
+        git_name: String,
+        git_email: String,
+    },
     Hello {
         session_id: Uuid,
         actor_id: Uuid,
@@ -327,6 +333,10 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "message_type", rename_all = "snake_case")]
 pub enum HostMessage {
+    GitState {
+        state: crate::git_state::GitState,
+        pack_hash: String,
+    },
     Welcome {
         session: SessionInfo,
         /// The consistent snapshot point (specification section 101).

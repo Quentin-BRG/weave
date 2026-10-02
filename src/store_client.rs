@@ -21,7 +21,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS meta (
+CREATE TABLE IF NOT EXISTS meta_v4 (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
@@ -161,7 +161,7 @@ impl ClientStore {
         let conn = db::open(path)?;
         conn.execute_batch(SCHEMA)?;
         if db::get_meta(&conn, K_SCHEMA)?.is_none() {
-            db::set_meta(&conn, K_SCHEMA, "1")?;
+            db::set_meta(&conn, K_SCHEMA, "2")?;
             db::set_u64(&conn, K_LOCAL_SEQ, 0)?;
             db::set_u64(&conn, K_LAST_APPLIED, 0)?;
             db::set_u64(&conn, K_CONTROL_VERSION, 0)?;
@@ -606,6 +606,7 @@ impl ClientStore {
     /// from a session that is still live.
     pub fn reset(&mut self) -> Result<()> {
         let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM meta_v4 WHERE key IN ('git_state','git_tree_oid','git_tree_state_hash','pending_adoption','git_alignment','excluded_paths','detached_files')", [])?;
         for table in ["replica", "pub_journal", "control_cache", "oversize"] {
             tx.execute(&format!("DELETE FROM {table}"), [])?;
         }

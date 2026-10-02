@@ -29,8 +29,17 @@ pub enum WatchEvent {
 }
 
 pub struct WatchHandle {
-    _watcher: notify::RecommendedWatcher,
-    _debouncer: std::thread::JoinHandle<()>,
+    watcher: Option<notify::RecommendedWatcher>,
+    debouncer: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for WatchHandle {
+    fn drop(&mut self) {
+        self.watcher.take();
+        if let Some(thread) = self.debouncer.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Start watching `root` recursively. Debounced batches are delivered on `out`.
@@ -55,7 +64,7 @@ pub fn start(root: &Path, out: Sender<WatchEvent>) -> Result<WatchHandle> {
 
     watcher
         .watch(root, RecursiveMode::Recursive)
-        .map_err(|e| persistence(format!("Could not watch {}: {e}", root.display())))?;
+        .map_err(|e| crate::doctor::watcher_error(root, &e.to_string()))?;
 
     let root_owned = root.to_path_buf();
     let debouncer = std::thread::Builder::new()
@@ -64,8 +73,8 @@ pub fn start(root: &Path, out: Sender<WatchEvent>) -> Result<WatchHandle> {
         .map_err(|e| persistence(format!("Could not start the watcher thread: {e}")))?;
 
     Ok(WatchHandle {
-        _watcher: watcher,
-        _debouncer: debouncer,
+        watcher: Some(watcher),
+        debouncer: Some(debouncer),
     })
 }
 

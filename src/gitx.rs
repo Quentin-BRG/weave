@@ -889,3 +889,165 @@ pub fn mode_for_disk_file(path: &Path, previous: Option<&FileEntry>) -> GitMode 
     }
     previous.map(|e| e.git_mode).unwrap_or(GitMode::Regular)
 }
+
+/// Read an exact committed tree independently of the index and working tree.
+pub fn committed_manifest(
+    root: &Path,
+    oid: &str,
+    blobs: &crate::blobs::BlobStore,
+) -> Result<BTreeMap<RepoPath, FileEntry>> {
+    let tree = require(root, &["ls-tree", "-r", "-z", oid])?;
+    let mut result = BTreeMap::new();
+    for row in tree.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let row =
+            std::str::from_utf8(row).map_err(|_| repository("Git contains a non-UTF-8 path."))?;
+        let (metadata, path) = row
+            .split_once('\t')
+            .ok_or_else(|| repository("Malformed Git tree."))?;
+        let fields: Vec<_> = metadata.split_whitespace().collect();
+        let mode = crate::model::GitMode::parse(fields[0])
+            .ok_or_else(|| repository(format!("Unsupported tracked mode for {path}.")))?;
+        let path = RepoPath::new(path)?;
+        let scratch = blobs
+            .root()
+            .join(format!("git-object-{}.tmp", uuid::Uuid::new_v4()));
+        let read = (|| -> Result<FileEntry> {
+            let output = std::fs::File::create(&scratch)?;
+            let status = base_command(root)
+                .args(["cat-file", "blob", fields[2]])
+                .stdout(output)
+                .status()?;
+            if !status.success() {
+                return Err(git_err("Could not read a committed Git blob."));
+            }
+            let ingested = blobs
+                .ingest_file(&scratch, crate::model::CLASSIFY_PREFIX)?
+                .ok_or_else(|| git_err("Git blob vanished."))?;
+            Ok(FileEntry::from_ingested(&ingested, mode))
+        })();
+        let _ = std::fs::remove_file(scratch);
+        result.insert(path, read?);
+    }
+    Ok(result)
+}
+
+pub fn protect_commit(root: &Path, oid: &str, id: &str) -> Result<()> {
+    if !oid.is_empty() {
+        require(
+            root,
+            &["update-ref", &format!("refs/weave/recovery/{id}"), oid],
+        )?;
+    }
+    Ok(())
+}
+
+/// An index file alone does not protect staged-only blobs from Git's garbage
+/// collector. Preserve each stage's bytes independently of the object database.
+pub fn archive_index_objects(root: &Path, destination: &Path) -> Result<()> {
+    std::fs::create_dir_all(destination)?;
+    let stages = require(root, &["ls-files", "--stage", "-z"])?;
+    for row in stages.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let metadata = row.split(|b| *b == b'\t').next().unwrap_or_default();
+        let metadata =
+            std::str::from_utf8(metadata).map_err(|_| repository("Malformed Git index entry."))?;
+        let oid = metadata
+            .split_whitespace()
+            .nth(1)
+            .filter(|oid| !oid.is_empty() && oid.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| repository("Malformed Git index object ID."))?;
+        let target = destination.join(oid);
+        if target.exists() {
+            continue;
+        }
+        let output = std::fs::File::create(&target)?;
+        let status = base_command(root)
+            .args(["cat-file", "blob", oid])
+            .stdout(output.try_clone()?)
+            .status()?;
+        if !status.success() {
+            return Err(git_err("Could not preserve a staged Git blob."));
+        }
+        output.sync_all()?;
+    }
+    crate::util::write_atomic(&destination.join("stages.z"), &stages.stdout)?;
+    crate::backup::sync_directory(destination)?;
+    Ok(())
+}
+
+/// Git evaluates only the session's canonical .gitignore files. Personal
+/// excludes and the host's unstaged rule edits cannot change admission policy.
+pub fn shared_ignored(
+    paths: &crate::session::Paths,
+    manifest: &BTreeMap<RepoPath, FileEntry>,
+    blobs: &crate::blobs::BlobStore,
+    commit: &str,
+    names: &[String],
+) -> Result<std::collections::BTreeSet<String>> {
+    let root = paths.scratch().join("ignore-policy");
+    std::fs::create_dir_all(&root)?;
+    if !root.join(".git").exists() {
+        require(&root, &["init", "-q"])?;
+    }
+    let rules: BTreeMap<_, _> = manifest
+        .iter()
+        .filter(|(p, _)| p.as_str() == ".gitignore" || p.as_str().ends_with("/.gitignore"))
+        .map(|(p, e)| (p.to_string(), e.blob_hash.clone()))
+        .collect();
+    let stamp = root.join(".git/weave-rules.json");
+    let old: BTreeMap<String, String> = std::fs::read(&stamp)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    if old != rules {
+        for name in old.keys().filter(|n| !rules.contains_key(*n)) {
+            let _ = std::fs::remove_file(root.join(name));
+        }
+        for (name, hash) in &rules {
+            if old.get(name) == Some(hash) {
+                continue;
+            }
+            let target = root.join(name);
+            std::fs::create_dir_all(target.parent().unwrap())?;
+            blobs.copy_out(hash, &target)?;
+        }
+        crate::util::write_atomic(&stamp, &serde_json::to_vec(&rules)?)?;
+    }
+    let tracked = require(
+        &paths.repo_root,
+        &["ls-tree", "-r", "--name-only", "-z", commit],
+    )?;
+    let tracked: std::collections::HashSet<_> = tracked
+        .stdout_str()
+        .split('\0')
+        .map(str::to_string)
+        .collect();
+    let input = names
+        .iter()
+        .filter(|n| !tracked.contains(*n))
+        .flat_map(|s| s.as_bytes().iter().copied().chain(std::iter::once(0)))
+        .collect::<Vec<_>>();
+    if input.is_empty() {
+        return Ok(Default::default());
+    }
+    let out = run_stdin(
+        &root,
+        &[
+            "-c",
+            "core.excludesFile=",
+            "check-ignore",
+            "--no-index",
+            "-z",
+            "--stdin",
+        ],
+        &input,
+    )?;
+    if out.status > 1 {
+        return Err(git_err("Cannot evaluate shared ignore rules.").with_detail(out.stderr));
+    }
+    Ok(out
+        .stdout_str()
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect())
+}

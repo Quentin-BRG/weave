@@ -55,12 +55,14 @@ impl Capture {
 enum Sabotage {
     None,
     FlipBitInHostBoundFrame(usize),
+    HttpUnavailableOnce,
 }
 
 struct WireTap {
     port: u16,
     capture: Arc<Mutex<Capture>>,
     stop: Arc<AtomicBool>,
+    blackhole: Arc<AtomicBool>,
 }
 
 impl WireTap {
@@ -71,12 +73,14 @@ impl WireTap {
 
         let capture = Arc::new(Mutex::new(Capture::default()));
         let stop = Arc::new(AtomicBool::new(false));
+        let blackhole = Arc::new(AtomicBool::new(false));
         let frame_counter = Arc::new(AtomicUsize::new(0));
 
         let tap = WireTap {
             port,
             capture: capture.clone(),
             stop: stop.clone(),
+            blackhole: blackhole.clone(),
         };
 
         std::thread::spawn(move || {
@@ -100,6 +104,7 @@ impl WireTap {
                         );
                         let to_client = (upstream, downstream);
                         let (cap, counter) = (capture.clone(), frame_counter.clone());
+                        let blocked = blackhole.clone();
                         std::thread::spawn(move || {
                             pump(
                                 to_host.0,
@@ -108,9 +113,11 @@ impl WireTap {
                                 Direction::ToHost,
                                 counter,
                                 sabotage,
+                                blocked,
                             )
                         });
                         let cap = capture.clone();
+                        let blocked = blackhole.clone();
                         std::thread::spawn(move || {
                             pump(
                                 to_client.0,
@@ -119,6 +126,7 @@ impl WireTap {
                                 Direction::ToClient,
                                 Arc::new(AtomicUsize::new(0)),
                                 Sabotage::None,
+                                blocked,
                             )
                         });
                     }
@@ -157,6 +165,7 @@ fn pump(
     direction: Direction,
     counter: Arc<AtomicUsize>,
     sabotage: Sabotage,
+    blackhole: Arc<AtomicBool>,
 ) {
     // The HTTP upgrade first, verbatim.
     let mut head = Vec::new();
@@ -174,6 +183,17 @@ fn pump(
         }
     }
     record(&capture, direction, &head);
+    if matches!(sabotage, Sabotage::HttpUnavailableOnce)
+        && direction == Direction::ToHost
+        && counter.fetch_add(1, Ordering::Relaxed) == 0
+    {
+        from.write_all(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        let _ = from.shutdown(std::net::Shutdown::Both);
+        return;
+    }
     if to.write_all(&head).is_err() {
         return;
     }
@@ -207,6 +227,9 @@ fn pump(
             }
         } else if frame.opcode == 0x1 {
             capture.lock().unwrap().text_frames += 1;
+        }
+        if direction == Direction::ToClient && blackhole.load(Ordering::Relaxed) {
+            continue;
         }
         record(&capture, direction, &raw);
         if to.write_all(&raw).is_err() {
@@ -685,6 +708,57 @@ fn every_reconnect_performs_a_fresh_handshake_with_new_ephemeral_keys() {
 }
 
 // ---------------------------------------------------------------------------
+// Endpoint replacement must tolerate a route that is not ready immediately.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn replacing_an_endpoint_retries_transient_failure_before_authenticating() {
+    let sandbox = Sandbox::new("endpoint-not-ready");
+    let mut host = Participant::new(&sandbox, "alpha");
+    init_repo(&host.repo, "Quentin", "quentin@example.com");
+    let mut guest = clone_participant(&sandbox, &host, "beta", "Alice", "alice@example.com");
+    host.start_daemon(&["host", "--lan"]);
+    host.wait_online(SHORT);
+    let invite = host.wait_for_invite(SHORT);
+    let original = invite["invite"].as_str().unwrap();
+    let path = write_invite(&sandbox, "original.txt", original);
+    guest.start_daemon(&["join", "--invite-file", &path]);
+    guest.wait_online(SHORT);
+
+    for stopped in [true, false] {
+        if stopped {
+            guest.stop_daemon();
+        }
+        let tap = WireTap::start(
+            upstream_port(invite["endpoint"].as_str().unwrap()),
+            Sabotage::HttpUnavailableOnce,
+        );
+        let path = write_invite(
+            &sandbox,
+            "replacement.txt",
+            &invite_via(original, tap.url(), None),
+        );
+        if stopped {
+            guest.start_daemon(&["join", "--invite-file", &path]);
+        } else {
+            guest.expect(&["join", "--invite-file", &path]);
+        }
+        guest.wait_online(SHORT);
+        let content = format!("preserved through replacement: {stopped}\n");
+        write_file(&guest.repo, "replacement.md", &content);
+        host.wait_for_file("replacement.md", &content, SHORT);
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(guest.repo.join(".git/weave/session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["endpoint"], tap.url());
+        assert!(tap.capture.lock().unwrap().connections >= 3);
+    }
+    guest.stop_daemon();
+    host.stop_daemon();
+}
+
+// ---------------------------------------------------------------------------
 // 5. What the encryption layer costs
 // ---------------------------------------------------------------------------
 
@@ -845,4 +919,37 @@ fn clone_participant(
     git(&guest.repo, &["config", "user.email", email]);
     git(&guest.repo, &["config", "commit.gpgsign", "false"]);
     guest
+}
+
+#[test]
+fn a_silent_connection_expires_and_recovers_without_losing_queued_work() {
+    let sandbox = Sandbox::new("heartbeat-blackhole");
+    let mut host = Participant::new(&sandbox, "host");
+    init_repo(&host.repo, "Host", "host@example.com");
+    let mut guest = clone_participant(&sandbox, &host, "guest", "Guest", "guest@example.com");
+    host.start_daemon(&["host", "--lan"]);
+    host.wait_online(SHORT);
+    let invite = host.wait_for_invite(SHORT);
+    let tap = WireTap::start(
+        upstream_port(invite["endpoint"].as_str().unwrap()),
+        Sabotage::None,
+    );
+    let rewritten = invite_via(invite["invite"].as_str().unwrap(), tap.url(), None);
+    let path = write_invite(&sandbox, "invite.txt", &rewritten);
+    guest.start_daemon(&["join", "--invite-file", &path]);
+    guest.wait_online(SHORT);
+    tap.blackhole.store(true, Ordering::Relaxed);
+    write_file(&guest.repo, "offline.md", "queued through silence\n");
+    guest.wait_for_status("heartbeat expiration", Duration::from_secs(22), |v| {
+        v["connection"] == "offline"
+    });
+    assert!(guest.status()["outbox_pending"].as_u64().unwrap_or(0) > 0);
+    tap.blackhole.store(false, Ordering::Relaxed);
+    guest.wait_online(Duration::from_secs(35));
+    host.wait_for_file("offline.md", "queued through silence\n", SHORT);
+    guest.wait_for_status("durable acknowledgement after reconnect", SHORT, |v| {
+        v["outbox_pending"] == 0
+    });
+    guest.stop_daemon();
+    host.stop_daemon();
 }

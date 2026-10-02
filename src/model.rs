@@ -48,7 +48,8 @@ pub const MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
 /// `content_b64` entirely. There is no compatibility mode and no downgrade
 /// path: a version 2 peer cannot take part in a version 3 session, and is told
 /// so rather than being served a session it would misread.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// Version 4 negotiates current Git state and supports controlled external adoption.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // File entries (specification sections 17-19)

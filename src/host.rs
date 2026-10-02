@@ -275,8 +275,21 @@ impl HostEngine {
 
     fn on_tick(&mut self) -> Result<()> {
         let now = crate::util::now_ms();
+        let expired: Vec<u64> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| now - c.last_seen_ms >= 15_000)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            if let Some(conn) = self.conns.get(&id) {
+                conn.out.close();
+            }
+            self.handle(HostInput::Disconnected { conn_id: id })?;
+        }
         if now - self.last_git_check_ms >= GIT_GUARD_INTERVAL_MS {
             self.last_git_check_ms = now;
+            self.refresh_exclusions(None)?;
             self.check_git_state()?;
         }
         if self.barrier.is_some() {
@@ -307,7 +320,7 @@ impl HostEngine {
             Some((
                 "Git state changed outside Weave.".to_string(),
                 format!(
-                    "Expected branch:\n{}\n\nCurrent branch:\n{}\n\nRestore the expected state or leave the session.",
+                    "Expected branch:\n{}\n\nCurrent branch:\n{}\n\nStop Weave, then resume to reconcile Git on the same branch. A different branch requires a new session.",
                     self.branch,
                     branch.clone().unwrap_or_else(|| "(detached HEAD)".into())
                 ),
@@ -316,7 +329,7 @@ impl HostEngine {
             Some((
                 "Git state changed outside Weave.".to_string(),
                 format!(
-                    "Expected Git commit:\n{}\n\nCurrent Git commit:\n{}\n\nRestore the expected state or leave the session.",
+                    "Expected Git commit:\n{}\n\nCurrent Git commit:\n{}\n\nStop Weave, then resume to reconcile Git on the same branch. A different branch requires a new session.",
                     crate::util::short_oid(&self.expected_head),
                     crate::util::short_oid(&head)
                 ),
@@ -325,7 +338,7 @@ impl HostEngine {
             Some((
                 "Git index changed outside Weave.".to_string(),
                 "Staged changes were found. Weave owns all Git-writing operations during a \
-                 session. Run `git reset` to unstage, or leave the session."
+                 session. Stop Weave before changing Git; resume preserves and reconciles local work."
                     .to_string(),
             ))
         } else {
@@ -432,7 +445,7 @@ impl HostEngine {
         display_name: String,
         git_name: String,
         git_email: String,
-        base_commit: String,
+        _base_commit: String,
         branch: String,
         resume: ClientResumeState,
     ) -> Result<()> {
@@ -467,29 +480,6 @@ impl HostEngine {
             );
             return Ok(());
         }
-        // A first-time joiner must sit at the session base commit or at a
-        // Weave-published commit (specification section 11).
-        if !resume.has_manifest {
-            let acceptable = self.acceptable_join_commits()?;
-            if !acceptable.iter().any(|c| c == &base_commit) {
-                self.send(
-                    conn_id,
-                    HostMessage::Error {
-                        request_id: None,
-                        class: ErrorClass::RepositoryError,
-                        message: "Cannot join Weave session.".into(),
-                        detail: Some(format!(
-                            "Session base:\n{}\n\nYour current Git commit:\n{}\n\nCheckout the \
-                             expected base commit and retry.",
-                            crate::util::short_oid(&self.session.base_commit),
-                            crate::util::short_oid(&base_commit)
-                        )),
-                    },
-                );
-                return Ok(());
-            }
-        }
-
         self.store.upsert_actor(&ActorRecord {
             actor_id,
             display_name: display_name.clone(),
@@ -522,6 +512,7 @@ impl HostEngine {
             conn.last_applied_revision = resume.last_applied_revision;
         }
 
+        self.refresh_exclusions(None)?;
         let current = self.store.current_revision()?;
         let manifest_all = self.store.manifest_all()?;
         let host_hash = state_hash(manifest_all.iter());
@@ -558,9 +549,16 @@ impl HostEngine {
         };
 
         let control = self.control_snapshot()?;
-        let pending_pubs = self
-            .store
-            .publications_after(resume.last_publication_sequence)?;
+        let pending_pubs = Vec::new();
+        let git_state = crate::git_state::current(&self.store, &self.paths)?;
+        let pack = self.git_state_pack(&git_state.commit)?;
+        self.send(
+            conn_id,
+            HostMessage::GitState {
+                state: git_state,
+                pack_hash: pack,
+            },
+        );
 
         self.send(
             conn_id,
@@ -603,20 +601,23 @@ impl HostEngine {
         Ok(())
     }
 
-    fn acceptable_join_commits(&self) -> Result<Vec<String>> {
-        let mut out = vec![self.session.base_commit.clone()];
-        if let Some(publication) = self.store.latest_publication()? {
-            out.push(publication.descriptor.commit_oid);
-        }
-        Ok(out)
-    }
-
     fn on_authenticated(&mut self, conn_id: u64, message: ClientMessage) -> Result<()> {
         let actor_id = match self.actor_of(conn_id) {
             Some(a) => a,
             None => return Ok(()),
         };
         match message {
+            ClientMessage::UpdateIdentity {
+                git_name,
+                git_email,
+            } => {
+                if let Some(mut actor) = self.store.actor(&actor_id)? {
+                    actor.git_name = git_name;
+                    actor.git_email = git_email;
+                    self.store.upsert_actor(&actor)?;
+                }
+                Ok(())
+            }
             ClientMessage::SubmitOperation { operation } => {
                 self.on_submit(conn_id, actor_id, *operation)
             }
@@ -905,6 +906,13 @@ impl HostEngine {
         payload_hash: &str,
     ) -> Result<()> {
         crate::path::validate(op.path.as_str())?;
+        let ignored = self.refresh_exclusions(Some(op.path.as_str()))?;
+        if ignored.contains(op.path.as_str()) {
+            return Err(crate::error::unsupported(format!(
+                "{} is excluded by the session's canonical Git ignore rules.",
+                op.path
+            )));
+        }
 
         if let Some(entry) = &op.desired_entry {
             let limit = self.store.max_file_size()?;
@@ -1678,6 +1686,10 @@ impl HostEngine {
         request_id: Uuid,
         allow_active_tasks: bool,
     ) -> Result<()> {
+        let identity = crate::session::git_identity(&self.paths.repo_root)?;
+        self.host_git_name = identity.name;
+        self.host_git_email = identity.email;
+        self.refresh_exclusions(None)?;
         if self.barrier.is_some() {
             self.send(
                 conn_id,
@@ -1855,10 +1867,7 @@ impl HostEngine {
             .as_ref()
             .map(|p| p.descriptor.target_revision)
             .unwrap_or(0);
-        let parent_commit_oid = latest
-            .as_ref()
-            .map(|p| p.descriptor.commit_oid.clone())
-            .unwrap_or_else(|| self.session.base_commit.clone());
+        let parent_commit_oid = crate::git_state::current(&self.store, &self.paths)?.commit;
 
         // Specification section 117: an active Task whose accepted revisions
         // are inside the target must not be silently published.
@@ -1957,7 +1966,8 @@ impl HostEngine {
             });
         }
 
-        let before = self.store.manifest_at(previous_published_revision)?;
+        let before =
+            gitx::committed_manifest(&self.paths.repo_root, &parent_commit_oid, &self.blobs)?;
         let after = self.store.manifest_at(target_revision)?;
         let diff_summary = diff_manifests(&before, &after);
 
@@ -2039,6 +2049,9 @@ impl HostEngine {
         prepare_id: Uuid,
         message: String,
     ) -> Result<GitPublication> {
+        let identity = crate::session::git_identity(&self.paths.repo_root)?;
+        self.host_git_name = identity.name;
+        self.host_git_email = identity.email;
         let Some(mut prep) = self.store.preparation(&prepare_id)? else {
             return Err(
                 crate::error::usage(format!("No Weave commit preparation {prepare_id}."))
@@ -2190,6 +2203,17 @@ impl HostEngine {
         }
         self.store.put_publication(&publication)?;
         self.store.bump_control_version()?;
+        crate::git_state::save(
+            &self.store,
+            &crate::git_state::GitState {
+                sequence: publication.sequence,
+                branch: publication.descriptor.branch.clone(),
+                commit: publication.descriptor.commit_oid.clone(),
+                tree: publication.descriptor.tree_oid.clone(),
+                origin: "weave".into(),
+                revision: publication.descriptor.target_revision,
+            },
+        )?;
         Ok(publication)
     }
 
@@ -2294,6 +2318,23 @@ impl HostEngine {
     ///
     /// Repeated calls are cheap: the pack is deterministic for a given commit
     /// pair, so the second participant to be served finds it already stored.
+    fn git_state_pack(&self, commit: &str) -> Result<String> {
+        let tmp = self
+            .paths
+            .scratch()
+            .join(format!("git-state-{}.pack", Uuid::new_v4()));
+        let result = (|| {
+            gitx::pack_objects_to(&self.paths.repo_root, commit, None, &tmp)?;
+            Ok(self
+                .blobs
+                .ingest_file(&tmp, 0)?
+                .ok_or_else(|| crate::error::integrity("Git pack vanished."))?
+                .hash)
+        })();
+        let _ = std::fs::remove_file(tmp);
+        result
+    }
+
     fn publication_pack(&self, publication: &GitPublication) -> Result<String> {
         let root = self.paths.repo_root.clone();
         let scratch = self.paths.scratch();
@@ -2481,8 +2522,75 @@ impl HostEngine {
 
     // -------------------------------------------------------------- broadcast
 
+    fn refresh_exclusions(
+        &mut self,
+        proposed: Option<&str>,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let manifest = self.store.manifest_all()?;
+        let previous: Vec<String> =
+            crate::db::get_json(self.store.conn(), "excluded_paths")?.unwrap_or_default();
+        let mut names: Vec<String> = manifest
+            .keys()
+            .map(ToString::to_string)
+            .chain(previous.iter().cloned())
+            .collect();
+        if let Some(path) = proposed {
+            names.push(path.into());
+        }
+        let ignored = gitx::shared_ignored(
+            &self.paths,
+            &manifest,
+            &self.blobs,
+            &self.expected_head,
+            &names,
+        )?;
+        let excluded: Vec<String> = ignored.iter().cloned().collect();
+        if excluded == previous && !manifest.keys().any(|p| ignored.contains(p.as_str())) {
+            return Ok(ignored);
+        }
+        if manifest.keys().any(|p| ignored.contains(p.as_str())) {
+            crate::backup::archive_session(&self.paths, "excluded-paths")?;
+        }
+        crate::db::set_json(self.store.conn(), "excluded_paths", &excluded)?;
+        self.store.conn().execute("DELETE FROM preparations", [])?;
+        for mut conflict in self.store.open_conflicts()? {
+            if ignored.contains(conflict.path.as_str()) {
+                conflict.status = ConflictStatus::Dismissed;
+                self.store.put_conflict(&conflict)?;
+            }
+        }
+        self.store.bump_control_version()?;
+        // Replicas learn that removal means exclusion before seeing the
+        // tombstone revision; local files must remain on disk.
+        self.broadcast_control()?;
+        for (path, entry) in &manifest {
+            if !ignored.contains(path.as_str()) {
+                continue;
+            }
+            let (_, revision) = self.store.commit_revision(
+                &Uuid::new_v4(),
+                &self.session.host_actor_id,
+                None,
+                "excluded-path",
+                path,
+                Some(entry),
+                None,
+                |revision| OperationOutcome::Accepted {
+                    revision,
+                    canonical_entry: None,
+                },
+            )?;
+            self.broadcast(HostMessage::RevisionBroadcast {
+                revision: Box::new(revision),
+            });
+        }
+        Ok(ignored)
+    }
+
     fn control_snapshot(&self) -> Result<ControlSnapshot> {
         Ok(ControlSnapshot {
+            excluded_paths: crate::db::get_json(self.store.conn(), "excluded_paths")?
+                .unwrap_or_default(),
             control_version: self.store.control_version()?,
             tasks: self.store.tasks()?,
             conflicts: self.store.conflicts()?,
