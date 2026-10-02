@@ -202,7 +202,15 @@ fn excluded_offline_outbox_converges_with_scoped_recovery_archives() {
     host.wait_for_status("new shared ignore rule", WAIT, |v| {
         v["synchronized"] == true
     });
-    guest.start_daemon(&["resume"]);
+    // macOS/Windows can keep the old port reserved after shutdown. The host
+    // then advertises a new port, so reconnect using its current invitation
+    // while retaining this participant's saved outbox and session identity.
+    std::fs::write(
+        &invitation,
+        host.json(&["invite"])["invite"].as_str().unwrap(),
+    )
+    .unwrap();
+    guest.start_daemon(&["join", "--invite-file", invitation.to_str().unwrap()]);
     guest.wait_for_status("excluded outbox drained", WAIT, |v| {
         v["synchronized"] == true && v["outbox_pending"] == 0
     });
