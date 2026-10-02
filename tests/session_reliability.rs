@@ -211,7 +211,10 @@ fn excluded_offline_outbox_converges_with_scoped_recovery_archives() {
     )
     .unwrap();
     guest.start_daemon(&["join", "--invite-file", invitation.to_str().unwrap()]);
-    guest.wait_for_status("excluded outbox drained", WAIT, |v| {
+    // Each exclusion durably flushes an independent recovery database. Windows
+    // runners can still be making steady progress when the ordinary 25-second
+    // sync deadline expires; give this batch its own bounded recovery budget.
+    guest.wait_for_status("excluded outbox drained", Duration::from_secs(120), |v| {
         v["synchronized"] == true && v["outbox_pending"] == 0
     });
     write_file(
