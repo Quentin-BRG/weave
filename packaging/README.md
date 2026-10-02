@@ -173,5 +173,10 @@ builds all three packages on native runners. The release is created only after
 every package job succeeds. A tag containing a hyphen (`v1.0.0-rc.1`) is
 published as a GitHub prerelease.
 
-`workflow_dispatch` with a tag name builds everything and publishes nothing,
-which is the way to rehearse a release.
+`workflow_dispatch` accepts a branch, tag or commit in its `tag` input. It builds
+and installs every package without publishing, using the version in that checkout.
+This permits rehearsing a release branch before pushing the publication tag.
+Version-specific migration notes from `docs/releases/<version>.md` are prepended
+to the generated release notes. Run the separate Remote tunnel workflow on the
+same commit before publishing transport changes; it uses the packaged cloudflared
+version and verifies its checksum.

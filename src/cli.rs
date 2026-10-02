@@ -53,7 +53,7 @@ pub enum Command {
     /// List session participants.
     Peers(JsonArgs),
     /// Print the invite for this session (host only).
-    Invite(JsonArgs),
+    Invite(InviteArgs),
     /// Force a full repository rescan.
     Rescan(JsonArgs),
     /// Describe intent with Tasks and advisory soft locks.
@@ -92,6 +92,19 @@ pub struct JsonArgs {
     pub json: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct InviteArgs {
+    #[arg(long)]
+    pub json: bool,
+    #[command(subcommand)]
+    pub action: Option<InviteCommand>,
+}
+#[derive(Subcommand, Debug)]
+pub enum InviteCommand {
+    /// Refresh the LAN address, retaining the session identity and secret.
+    Refresh(JsonArgs),
+}
+
 /// `weave doctor` is a troubleshooting command, not a setup step: `weave host`
 /// and `weave join` run the checks they need on their own.
 #[derive(Args, Debug)]
@@ -120,6 +133,9 @@ pub struct HostArgs {
 
 #[derive(Args, Debug)]
 pub struct JoinArgs {
+    /// Policy for local work replaced by joining (default: cancel).
+    #[arg(long, value_enum)]
+    pub local_changes: Option<crate::daemon::LocalChanges>,
     /// Read the invite from a file instead of prompting.
     #[arg(long, value_name = "PATH")]
     pub invite_file: Option<PathBuf>,
@@ -266,6 +282,12 @@ pub enum AgentCommand {
 
 #[derive(Args, Debug)]
 pub struct RecoverArgs {
+    /// List preserved recovery archives.
+    #[arg(long)]
+    pub list: bool,
+    /// Export this backup with --export.
+    #[arg(long, requires = "export")]
+    pub backup: Option<String>,
     /// Rebuild the derived canonical manifest from durable revision history.
     #[arg(long)]
     pub rebuild: bool,
@@ -330,19 +352,20 @@ pub fn run(cli: Cli) -> Result<()> {
                 crate::daemon::JoinOptions {
                     invite,
                     preflighted: true,
+                    local_changes: args.local_changes,
                 },
             )
         }
         Command::Resume => crate::daemon::run_resume(&start_dir),
         Command::Stop(args) => {
             let paths = Paths::discover(&start_dir)?;
-            let value = ipc::call(&paths, IpcCommand::Stop)?;
-            emit(args.json, value, |_| println!("Weave daemon stopping."));
+            let value = ipc::stop_and_wait(&paths, false)?;
+            emit(args.json, value, |_| println!("Weave daemon stopped."));
             Ok(())
         }
         Command::Leave(args) => {
             let paths = Paths::discover(&start_dir)?;
-            let value = ipc::call(&paths, IpcCommand::Leave)?;
+            let value = ipc::stop_and_wait(&paths, true)?;
             emit(args.json, value, |_| {
                 println!("Left the Weave session. The working tree is unchanged.")
             });
@@ -357,8 +380,12 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Command::Invite(args) => {
             let paths = Paths::discover(&start_dir)?;
-            let value = ipc::call(&paths, IpcCommand::Invite)?;
-            emit(args.json, value, render::invite);
+            let (command, json) = match args.action {
+                Some(InviteCommand::Refresh(a)) => (IpcCommand::InviteRefresh, args.json || a.json),
+                None => (IpcCommand::Invite, args.json),
+            };
+            let value = ipc::call(&paths, command)?;
+            emit(json, value, render::invite);
             Ok(())
         }
         Command::Rescan(args) => {
@@ -443,6 +470,19 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Recover(args) => {
+            let paths = Paths::discover(&start_dir)?;
+            if args.list {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::backup::list(&paths)?)?
+                );
+                return Ok(());
+            }
+            if let Some(id) = &args.backup {
+                crate::backup::export(&paths, id, args.export.as_ref().unwrap())?;
+                println!("{}", serde_json::json!({"exported": id}));
+                return Ok(());
+            }
             let report = crate::recover::run(
                 &start_dir,
                 crate::recover::RecoverOptions {
@@ -463,9 +503,12 @@ pub fn run(cli: Cli) -> Result<()> {
 
 fn status(start_dir: &std::path::Path, json: bool) -> Result<()> {
     let paths = Paths::discover(start_dir)?;
-    if !ipc::daemon_is_running(&paths) {
+    if ipc::daemon_state(&paths)? == ipc::DaemonState::Stopped {
         let value = serde_json::json!({
             "active": false,
+            "daemon_state": "stopped",
+            "session_saved": crate::session::load_session_record(&paths)?.is_some(),
+            "connection": "offline",
             "repository": paths.repo_name(),
             "branch": crate::gitx::current_branch(&paths.repo_root)?,
         });
@@ -786,9 +829,17 @@ mod render {
         println!();
         println!("Branch: {}", str_of(v, "branch"));
         println!();
+        if let Some(state) = v.get("git_state").filter(|s| s.is_object()) {
+            println!(
+                "Current Git commit: {} ({})",
+                str_of(state, "commit"),
+                str_of(state, "origin")
+            );
+            println!();
+        }
         match v.get("git_publication") {
             Some(Value::Object(publication)) => {
-                println!("Git publication:");
+                println!("Last Weave Git publication:");
                 println!(
                     "{}",
                     publication
@@ -814,12 +865,23 @@ mod render {
                     }
                 }
             }
-            _ => println!("Git publication:\n(none yet)"),
+            _ => println!("Last Weave Git publication:\n(none yet)"),
         }
         println!();
         println!("Live:");
         println!("r{}", u64_of(v, "live_revision"));
-        println!("{} ahead", plural(u64_of(v, "revisions_ahead"), "revision"));
+        println!(
+            "{} since the last Weave publication",
+            plural(u64_of(v, "revisions_ahead"), "revision")
+        );
+        println!(
+            "Collaborative changes outside the current Git commit: {}",
+            match v.get("unpublished_changes").and_then(Value::as_bool) {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "awaiting Git state",
+            }
+        );
         println!();
         println!("State:");
         println!(
@@ -829,6 +891,26 @@ mod render {
         println!();
         println!("Connection:");
         println!("{}", str_of(v, "connection"));
+        if str_of(v, "connection") != "online" {
+            println!("{}", str_of(v, "connection_note"));
+            let last = u64_of(v, "last_host_response_ms");
+            if last == 0 {
+                println!("No authenticated heartbeat response received yet.");
+            } else {
+                println!(
+                    "Last host response: {} s ago",
+                    (crate::util::now_ms().max(0) as u64).saturating_sub(last) / 1000
+                );
+            }
+        }
+        println!(
+            "Synchronization: {}",
+            if v.get("synchronized").and_then(Value::as_bool) == Some(true) {
+                "up to date"
+            } else {
+                "pending or blocked"
+            }
+        );
         if let Some(sync) = v.get("sync_state") {
             let label = sync.get("state").and_then(|x| x.as_str()).unwrap_or("live");
             if label != "live" {

@@ -12,16 +12,20 @@ fn main() {
     init_logging(cli.verbose);
 
     let json_mode = uses_json(&cli.command);
+    let status_mode = matches!(&cli.command, Command::Status(_));
     match weave::cli::run(cli) {
         Ok(()) => {}
         Err(error) => {
             if json_mode {
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "ok": false,
                     "class": error.class,
                     "message": error.message,
                     "detail": error.detail,
                 });
+                if status_mode {
+                    payload["daemon_state"] = serde_json::json!("unknown");
+                }
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
@@ -56,7 +60,6 @@ fn uses_json(command: &Command) -> bool {
     match command {
         Command::Status(a)
         | Command::Peers(a)
-        | Command::Invite(a)
         | Command::Rescan(a)
         | Command::Leave(a)
         | Command::Stop(a)
@@ -65,6 +68,9 @@ fn uses_json(command: &Command) -> bool {
         // own `ready: false` is the machine-readable failure. Adding an error
         // object would put two JSON documents on stdout and break every parser.
         Command::Doctor(_) => false,
+        Command::Invite(a) => {
+            a.json || matches!(&a.action, Some(InviteCommand::Refresh(j)) if j.json)
+        }
         Command::Tunnel(TunnelCommand::Restart(a)) => a.json,
         Command::Agent(AgentCommand::Bootstrap(a)) => a.json,
         Command::Recover(a) => a.json,

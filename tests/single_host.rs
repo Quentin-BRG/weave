@@ -383,16 +383,20 @@ fn doctor_and_bootstrap_work_without_a_session() {
 }
 
 #[test]
-fn a_dirty_repository_cannot_start_a_session() {
+fn a_dirty_repository_starts_with_preserved_collaborative_changes() {
     let sandbox = Sandbox::new("dirty");
-    let participant = Participant::new(&sandbox, "alpha");
+    let mut participant = Participant::new(&sandbox, "alpha");
     init_repo(&participant.repo, "Quentin", "quentin@example.com");
     write_file(&participant.repo, "README.md", "# Deck\n\nuncommitted\n");
 
-    let result = participant.run(&["host", "--local"]);
-    let message = result.expect_err("a dirty working tree must be refused");
-    assert!(
-        message.contains("working tree is not clean"),
-        "unexpected error: {message}"
+    participant.start_daemon(&["host", "--local"]);
+    participant.wait_online(LONG);
+    participant.wait_for_status("initial local changes", LONG, |v| {
+        v["live_revision"].as_u64().unwrap_or(0) > 0
+    });
+    assert_eq!(
+        read_file(&participant.repo, "README.md"),
+        "# Deck\n\nuncommitted\n"
     );
+    participant.stop_daemon();
 }

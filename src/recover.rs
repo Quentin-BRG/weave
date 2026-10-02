@@ -34,6 +34,13 @@ pub struct RecoverOptions {
 pub fn run(start_dir: &Path, opts: RecoverOptions) -> Result<RecoverReport> {
     let paths = Paths::discover(start_dir)?;
     paths.ensure()?;
+    let migration = crate::db::needs_migration(&paths.client_db())?
+        || crate::db::needs_migration(&paths.host_db())?;
+    let _lock = if opts.rebuild || migration {
+        Some(crate::session::DaemonLock::acquire(&paths)?)
+    } else {
+        None
+    };
     let record = load_session_record(&paths)?;
     let mut findings = Vec::new();
     let mut repairs = Vec::new();

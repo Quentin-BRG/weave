@@ -161,7 +161,7 @@ checks they need on their own.
 
 ### Host a session
 
-From a clean repository with a checked-out branch:
+From a repository with a checked-out branch (local changes are preserved):
 
 ```bash
 weave host
@@ -186,8 +186,10 @@ run the same encrypted handshake as remote ones.
 
 ### Join a session
 
-You must already have a checkout of the same repository, clean, on the same branch,
-at the session base commit. Weave does not clone.
+You must already have a checkout on the same branch. Weave negotiates the current
+commit with the authenticated host and transfers missing objects; it does not clone.
+For local work, choose `--local-changes=backup|discard|cancel` or answer the terminal
+prompt. Backup preserves the work separately before joining.
 
 ```bash
 weave join
@@ -253,8 +255,9 @@ the host and for participants alike.
 
 Do not run `git add`, `commit`, `pull`, `push`, `merge`, `rebase`, `cherry-pick`,
 `reset`, `checkout`, `switch` or `stash`. Weave detects Git state changed outside
-itself and pauses synchronization until the expected state is restored; it will
-never pull, merge or rebase on your behalf.
+itself and pauses synchronization. After `weave stop` confirms shutdown, use Git
+on the same branch and `weave resume` to adopt the new commit and reconcile preserved
+work. A failed status does not establish that the daemon stopped.
 
 Read-only Git stays available and useful: `git status`, `git diff`, `git log`,
 `git show`.
@@ -297,11 +300,14 @@ It never overwrites unrelated instructions.
 | `weave host [--lan \| --local]` | Host a session (long-lived daemon) |
 | `weave join [--invite-file \| --invite-stdin]` | Join a session (long-lived daemon) |
 | `weave resume` | Resume this repository's session after a crash or restart |
-| `weave leave` | Leave the session and forget its local record |
+| `weave leave` | Archive and detach the session, including without a daemon |
 | `weave stop` | Stop the daemon, keeping the session record |
 | `weave status [--json]` | Live session state |
 | `weave peers [--json]` | Participants and presence |
 | `weave invite [--json]` | Reprint the invite (host) |
+| `weave invite refresh [--json]` | Update the LAN address and print a new invitation |
+| `weave recover --list [--json]` | List recovery archives |
+| `weave recover --backup <id> --export <dir>` | Export one archive to a new directory |
 | `weave rescan [--json]` | Force a full repository rescan |
 | `weave task start \| list \| show \| update \| complete \| cancel` | Tasks and soft locks |
 | `weave conflict list \| show \| resolve \| dismiss` | Conflict inspection and resolution |
@@ -360,6 +366,8 @@ cargo test --test remote_tunnel -- --ignored --test-threads=1 --nocapture
 ---
 
 ## Documentation
+
+- [Session lifecycle and Git adoption](docs/SESSION-RELIABILITY.md) — protocol 4, migration, LAN refresh and recovery
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the pieces fit together
 - [docs/PROTOCOL.md](docs/PROTOCOL.md) — the wire protocol and reconciliation rules

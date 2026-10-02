@@ -14,6 +14,7 @@
 //! acknowledgement semantics; explicit rather than silent conflict; no
 //! corruption of the ordinary Git repository.
 
+pub mod backup;
 pub mod blobs;
 pub mod blobwire;
 pub mod bootstrap;
@@ -23,6 +24,7 @@ pub mod daemon;
 pub mod db;
 pub mod doctor;
 pub mod error;
+pub mod git_state;
 pub mod gitx;
 pub mod host;
 pub mod install;

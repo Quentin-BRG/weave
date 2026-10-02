@@ -41,6 +41,10 @@ pub enum IpcCommand {
     Status,
     Peers,
     Invite,
+    InviteRefresh,
+    JoinEndpoint {
+        invite: String,
+    },
     Rescan,
     TaskList,
     TaskStart {
@@ -202,15 +206,69 @@ pub fn call_with_timeout(
     response.into_result()
 }
 
-/// Is a daemon reachable for this repository?
-pub fn daemon_is_running(paths: &Paths) -> bool {
-    match read_runtime(paths) {
-        Ok(Some(runtime)) => TcpStream::connect_timeout(
-            &format!("127.0.0.1:{}", runtime.port).parse().unwrap(),
-            Duration::from_millis(400),
-        )
-        .is_ok(),
-        _ => false,
+/// A stopped daemon is established by acquiring its OS lock, never by a failed socket.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DaemonState {
+    Active,
+    Stopped,
+}
+
+pub fn daemon_state(paths: &Paths) -> Result<DaemonState> {
+    // A malformed record is an explicit diagnostic even when the lock is free.
+    let runtime = read_runtime(paths)?;
+    if crate::session::DaemonLock::try_acquire(paths)?.is_some() {
+        return Ok(DaemonState::Stopped);
+    }
+    if runtime.is_none() {
+        return Err(session_err(
+            "Daemon state is unknown: repository locked but no runtime is available.",
+        ));
+    }
+    call_with_timeout(paths, IpcCommand::Status, Duration::from_secs(2)).map_err(|e| {
+        session_err("Daemon state is unknown: local control is unreachable.")
+            .with_detail(e.to_string())
+    })?;
+    Ok(DaemonState::Active)
+}
+
+/// Wait for shutdown, then detach while holding the exclusive repository lock.
+/// The daemon's reply only acknowledges the request, not its completion.
+pub fn stop_and_wait(paths: &Paths, leave: bool) -> Result<serde_json::Value> {
+    let expected_session =
+        crate::session::load_session_record(paths)?.map(|r| r.session.session_id);
+    let mut lock = crate::session::DaemonLock::try_acquire(paths)?;
+    if lock.is_none() {
+        call(paths, IpcCommand::Stop)?;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(_lock) = lock.take() {
+            if leave
+                && crate::session::load_session_record(paths)?.map(|r| r.session.session_id)
+                    != expected_session
+            {
+                return Err(session_err(
+                    "The saved session changed during shutdown; departure was not confirmed.",
+                ));
+            }
+            let backup = if leave && crate::session::load_session_record(paths)?.is_some() {
+                let backup = crate::backup::archive_session(paths, "leave")?;
+                crate::backup::capture_worktree(paths, &backup)?;
+                crate::session::clear_session_record(paths)?;
+                Some(backup)
+            } else {
+                None
+            };
+            crate::session::clear_runtime(paths)?;
+            return Ok(serde_json::json!({"stopped": true, "left": leave, "backup": backup}));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(session_err(
+                "Weave has not finished stopping; departure was not confirmed.",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        lock = crate::session::DaemonLock::try_acquire(paths)?;
     }
 }
 

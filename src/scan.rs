@@ -32,7 +32,7 @@ const RACY_WINDOW_MS: i64 = 2_000;
 #[derive(Debug, Clone)]
 struct Stat {
     size: u64,
-    mtime_ms: i64,
+    modified: std::time::SystemTime,
     entry: FileEntry,
 }
 
@@ -84,7 +84,7 @@ impl ScanCache {
 
     fn hit(&self, path: &RepoPath, meta: &Metadata, blobs: &BlobStore) -> Option<FileEntry> {
         let stat = self.entries.get(path)?;
-        if stat.size != meta.len() || Some(stat.mtime_ms) != mtime_ms(meta) {
+        if stat.size != meta.len() || Some(stat.modified) != meta.modified().ok() {
             return None;
         }
         if !blobs.has(&stat.entry.blob_hash) {
@@ -106,7 +106,7 @@ impl ScanCache {
             path.clone(),
             Stat {
                 size: meta.len(),
-                mtime_ms,
+                modified: meta.modified().expect("mtime was read above"),
                 entry: entry.clone(),
             },
         );

@@ -551,11 +551,11 @@ fn check_working_tree(paths: &Paths) -> Check {
         Ok(entries) => warn(
             "Working tree clean",
             format!(
-                "{} uncommitted change(s). A new Weave session requires a clean tree.",
+                "{} uncommitted change(s). Hosting preserves these as initial collaborative changes; joining requires a local-work policy.",
                 entries.len()
             ),
         )
-        .with_hint("Commit, stash or discard them before starting a session."),
+        .with_hint("Use `weave join --local-changes=backup` to preserve local work separately before joining."),
         Err(e) => warn("Working tree clean", e.message),
     }
 }
@@ -779,7 +779,9 @@ pub fn preflight(start_dir: &Path, intent: Intent) -> Preflight {
     checks.extend(check_supported(&paths.repo_root));
     checks.push(check_storage(&paths));
     checks.push(check_working_tree_writable(&paths));
-    checks.push(check_no_other_daemon(&paths));
+    if intent != Intent::Join {
+        checks.push(check_no_other_daemon(&paths));
+    }
     checks.push(check_portable_paths(&paths.repo_root));
     if intent == Intent::HostRemote {
         checks.push(check_cloudflared_for_host());
@@ -871,6 +873,19 @@ pub fn not_ready_error(report: &Report) -> WeaveError {
         None => "See the checklist above.".to_string(),
     };
     crate::error::repository(summary).with_detail(detail)
+}
+
+/// Shared diagnostic used by watcher initialization and available to doctor callers.
+pub fn watcher_error(root: &Path, detail: &str) -> crate::error::WeaveError {
+    let mut error =
+        crate::error::persistence(format!("Could not watch {}: {detail}", root.display()));
+    if detail.contains("Too many open files")
+        || detail.contains("No space left")
+        || detail.contains("watch limit")
+    {
+        error = error.with_detail("The operating system exhausted file watcher resources. Close unused watchers and inspect the open-file and inotify watch limits before retrying. Your saved session is preserved.");
+    }
+    error
 }
 
 #[cfg(test)]

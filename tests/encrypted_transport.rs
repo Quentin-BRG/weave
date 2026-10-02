@@ -61,6 +61,7 @@ struct WireTap {
     port: u16,
     capture: Arc<Mutex<Capture>>,
     stop: Arc<AtomicBool>,
+    blackhole: Arc<AtomicBool>,
 }
 
 impl WireTap {
@@ -71,12 +72,14 @@ impl WireTap {
 
         let capture = Arc::new(Mutex::new(Capture::default()));
         let stop = Arc::new(AtomicBool::new(false));
+        let blackhole = Arc::new(AtomicBool::new(false));
         let frame_counter = Arc::new(AtomicUsize::new(0));
 
         let tap = WireTap {
             port,
             capture: capture.clone(),
             stop: stop.clone(),
+            blackhole: blackhole.clone(),
         };
 
         std::thread::spawn(move || {
@@ -100,6 +103,7 @@ impl WireTap {
                         );
                         let to_client = (upstream, downstream);
                         let (cap, counter) = (capture.clone(), frame_counter.clone());
+                        let blocked = blackhole.clone();
                         std::thread::spawn(move || {
                             pump(
                                 to_host.0,
@@ -108,9 +112,11 @@ impl WireTap {
                                 Direction::ToHost,
                                 counter,
                                 sabotage,
+                                blocked,
                             )
                         });
                         let cap = capture.clone();
+                        let blocked = blackhole.clone();
                         std::thread::spawn(move || {
                             pump(
                                 to_client.0,
@@ -119,6 +125,7 @@ impl WireTap {
                                 Direction::ToClient,
                                 Arc::new(AtomicUsize::new(0)),
                                 Sabotage::None,
+                                blocked,
                             )
                         });
                     }
@@ -157,6 +164,7 @@ fn pump(
     direction: Direction,
     counter: Arc<AtomicUsize>,
     sabotage: Sabotage,
+    blackhole: Arc<AtomicBool>,
 ) {
     // The HTTP upgrade first, verbatim.
     let mut head = Vec::new();
@@ -207,6 +215,9 @@ fn pump(
             }
         } else if frame.opcode == 0x1 {
             capture.lock().unwrap().text_frames += 1;
+        }
+        if direction == Direction::ToClient && blackhole.load(Ordering::Relaxed) {
+            continue;
         }
         record(&capture, direction, &raw);
         if to.write_all(&raw).is_err() {
@@ -845,4 +856,37 @@ fn clone_participant(
     git(&guest.repo, &["config", "user.email", email]);
     git(&guest.repo, &["config", "commit.gpgsign", "false"]);
     guest
+}
+
+#[test]
+fn a_silent_connection_expires_and_recovers_without_losing_queued_work() {
+    let sandbox = Sandbox::new("heartbeat-blackhole");
+    let mut host = Participant::new(&sandbox, "host");
+    init_repo(&host.repo, "Host", "host@example.com");
+    let mut guest = clone_participant(&sandbox, &host, "guest", "Guest", "guest@example.com");
+    host.start_daemon(&["host", "--lan"]);
+    host.wait_online(SHORT);
+    let invite = host.wait_for_invite(SHORT);
+    let tap = WireTap::start(
+        upstream_port(invite["endpoint"].as_str().unwrap()),
+        Sabotage::None,
+    );
+    let rewritten = invite_via(invite["invite"].as_str().unwrap(), tap.url(), None);
+    let path = write_invite(&sandbox, "invite.txt", &rewritten);
+    guest.start_daemon(&["join", "--invite-file", &path]);
+    guest.wait_online(SHORT);
+    tap.blackhole.store(true, Ordering::Relaxed);
+    write_file(&guest.repo, "offline.md", "queued through silence\n");
+    guest.wait_for_status("heartbeat expiration", Duration::from_secs(22), |v| {
+        v["connection"] == "offline"
+    });
+    assert!(guest.status()["outbox_pending"].as_u64().unwrap_or(0) > 0);
+    tap.blackhole.store(false, Ordering::Relaxed);
+    guest.wait_online(Duration::from_secs(35));
+    host.wait_for_file("offline.md", "queued through silence\n", SHORT);
+    guest.wait_for_status("durable acknowledgement after reconnect", SHORT, |v| {
+        v["outbox_pending"] == 0
+    });
+    guest.stop_daemon();
+    host.stop_daemon();
 }

@@ -218,13 +218,14 @@ pub fn load_session_record(paths: &Paths) -> Result<Option<SessionRecord>> {
 pub fn save_session_record(paths: &Paths, record: &SessionRecord) -> Result<()> {
     let p = paths.session_json();
     write_atomic(&p, serde_json::to_string_pretty(record)?.as_bytes())?;
-    let _ = restrict_permissions(&p);
+    restrict_permissions(&p)?;
+    crate::backup::sync_directory(&paths.weave_dir)?;
     Ok(())
 }
 
 pub fn clear_session_record(paths: &Paths) -> Result<()> {
     match std::fs::remove_file(paths.session_json()) {
-        Ok(()) => Ok(()),
+        Ok(()) => crate::backup::sync_directory(&paths.weave_dir),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
@@ -253,7 +254,7 @@ pub fn write_runtime(paths: &Paths, runtime: &Runtime) -> Result<()> {
 
 pub fn read_runtime(paths: &Paths) -> Result<Option<Runtime>> {
     match std::fs::read_to_string(paths.runtime_json()) {
-        Ok(text) => Ok(serde_json::from_str(&text).ok()),
+        Ok(text) => Ok(Some(serde_json::from_str(&text)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -281,6 +282,11 @@ pub struct DaemonLock {
 
 impl DaemonLock {
     pub fn acquire(paths: &Paths) -> Result<DaemonLock> {
+        Self::try_acquire(paths)?.ok_or_else(|| session_err(
+            "A Weave daemon is already running for this repository. Use `weave status` or `weave stop`."))
+    }
+
+    pub fn try_acquire(paths: &Paths) -> Result<Option<DaemonLock>> {
         std::fs::create_dir_all(&paths.weave_dir)?;
         let path = paths.lock_file();
         let file = std::fs::OpenOptions::new()
@@ -289,26 +295,11 @@ impl DaemonLock {
             .write(true)
             .truncate(false)
             .open(&path)?;
-        // An OS-level exclusive lock is released when the process exits for any
-        // reason, so a stale lock file cannot outlive a dead daemon.
         match file.try_lock() {
-            Ok(()) => {}
-            Err(_) => {
-                let detail = match read_runtime(paths)? {
-                    Some(rt) => format!(
-                        "Another Weave daemon (pid {}) already controls this working tree.\n\
-                         Run `weave status` to inspect it, or `weave stop` to shut it down.",
-                        rt.pid
-                    ),
-                    None => "Another Weave daemon already controls this working tree.".to_string(),
-                };
-                return Err(
-                    session_err("A Weave daemon is already running for this repository.")
-                        .with_detail(detail),
-                );
-            }
+            Ok(()) => Ok(Some(DaemonLock { _file: file, path })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
         }
-        Ok(DaemonLock { _file: file, path })
     }
 }
 
@@ -400,7 +391,7 @@ pub struct InvitePayload {
     pub session_id: Uuid,
     #[serde(rename = "k")]
     pub secret: SessionSecret,
-    #[serde(rename = "b")]
+    #[serde(rename = "b", default, skip_serializing)]
     pub base_commit: String,
     #[serde(rename = "r")]
     pub branch: String,
@@ -441,7 +432,9 @@ pub fn decode_invite(text: &str) -> Result<InvitePayload> {
         .map_err(|_| usage("The Weave invite is malformed or truncated."))?;
     let payload: InvitePayload = serde_json::from_slice(&bytes)
         .map_err(|_| usage("The Weave invite is malformed or truncated."))?;
-    if payload.protocol_version != crate::model::PROTOCOL_VERSION {
+    if !matches!(payload.protocol_version, 2 | 3)
+        && payload.protocol_version != crate::model::PROTOCOL_VERSION
+    {
         return Err(crate::error::protocol(format!(
             "This invite uses Weave protocol version {}, but this build speaks version {}.",
             payload.protocol_version,

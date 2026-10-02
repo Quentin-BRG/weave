@@ -39,25 +39,27 @@ jobs:
           git config --global user.email "ci@example.invalid"
           git config --global init.defaultBranch main
 
-      - name: Install cloudflared (Linux)
+      - name: Install the packaged cloudflared version (Linux)
         if: runner.os == 'Linux'
         run: |
-          curl -fsSL -o cloudflared \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
-          sudo mv cloudflared /usr/local/bin/cloudflared
-          cloudflared --version
+          destination="$RUNNER_TEMP/weave-cloudflared"
+          bash packaging/cloudflared/fetch.sh cloudflared-linux-amd64 "$destination/cloudflared"
+          echo "$destination" >>"$GITHUB_PATH"
+          echo "WEAVE_CLOUDFLARED=$destination/cloudflared" >>"$GITHUB_ENV"
+          "$destination/cloudflared" --version
 
-      - name: Install cloudflared (Windows)
+      - name: Install the packaged cloudflared version (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $dir = "$env:RUNNER_TEMP\cloudflared"
+          $ErrorActionPreference = 'Stop'
+          $dir = "$env:RUNNER_TEMP\weave-cloudflared"
           New-Item -ItemType Directory -Force $dir | Out-Null
-          Invoke-WebRequest -UseBasicParsing `
-            -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
-            -OutFile "$dir\cloudflared.exe"
+          $destination = "$dir/cloudflared.exe".Replace('\', '/')
+          bash packaging/cloudflared/fetch.sh cloudflared-windows-amd64.exe $destination
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned cloudflared download failed' }
           "$dir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "WEAVE_CLOUDFLARED=$dir\cloudflared.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           & "$dir\cloudflared.exe" --version
 
       - name: Remote end-to-end test

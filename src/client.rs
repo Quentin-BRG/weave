@@ -43,7 +43,7 @@ use blob_traffic::{BlobTraffic, Emitted};
 const TICK_MS: u64 = 400;
 const SAFETY_RESCAN_MS: i64 = 15_000;
 const PRESENCE_INTERVAL_MS: i64 = 8_000;
-const HEARTBEAT_INTERVAL_MS: i64 = 15_000;
+const HEARTBEAT_INTERVAL_MS: i64 = 5_000;
 const GIT_GUARD_INTERVAL_MS: i64 = 3_000;
 const RETRY_INTERVAL_MS: i64 = 2_000;
 /// An in-flight operation with no durable result after this long is resent.
@@ -194,6 +194,16 @@ pub struct ClientEngine {
     last_retry_ms: i64,
     last_gc_ms: i64,
     heartbeat_nonce: u64,
+    git_ready: bool,
+    excluded_paths: std::collections::HashSet<String>,
+    detached_files: BTreeMap<RepoPath, FileEntry>,
+    initial_join: bool,
+    pub(crate) join_policy: Option<crate::daemon::LocalChanges>,
+    pending_git: Option<(crate::git_state::GitState, String)>,
+    deferred_host: std::collections::VecDeque<HostMessage>,
+    last_pong_ms: i64,
+    last_host_response_ms: i64,
+    last_pong_nonce: u64,
 
     /// A Git-guard problem seen once and awaiting confirmation.
     git_problem_pending: bool,
@@ -217,6 +227,7 @@ impl ClientEngine {
         branch: String,
         expected_head: String,
     ) -> ClientEngine {
+        let initial_join = !store.has_manifest().unwrap_or(false);
         ClientEngine {
             paths,
             store,
@@ -261,6 +272,16 @@ impl ClientEngine {
             // this replica has its manifest and knows what it is keeping.
             last_gc_ms: crate::util::now_ms(),
             heartbeat_nonce: 0,
+            git_ready: false,
+            excluded_paths: Default::default(),
+            detached_files: Default::default(),
+            initial_join,
+            join_policy: None,
+            pending_git: None,
+            deferred_host: std::collections::VecDeque::new(),
+            last_pong_ms: 0,
+            last_host_response_ms: 0,
+            last_pong_nonce: 0,
             git_problem_pending: false,
             materialization_blocked: false,
             shutdown: false,
@@ -281,7 +302,10 @@ impl ClientEngine {
     /// compiled default is not a substitute for one: it stays unknown until
     /// `Welcome` says otherwise, and nothing is judged by size in the meantime.
     pub fn load_cached_limit(&mut self) -> Result<()> {
+        self.detached_files =
+            crate::db::get_json(self.store.conn(), "detached_files")?.unwrap_or_default();
         if let Some(control) = self.store.control_cache()? {
+            self.excluded_paths = control.excluded_paths.iter().cloned().collect();
             self.max_file_size = control.max_file_size;
             self.limit_known = true;
         }
@@ -332,6 +356,12 @@ impl ClientEngine {
             }
             if let Err(e) = self.handle(input) {
                 tracing::error!(class = %e.class, "client: {}", e.message);
+                if self.initial_join {
+                    if let Some(fatal) = &self.fatal {
+                        let _ = fatal.try_send(e.clone());
+                        self.shutdown = true;
+                    }
+                }
                 if matches!(
                     e.class,
                     ErrorClass::PersistenceError | ErrorClass::IntegrityError
@@ -365,8 +395,12 @@ impl ClientEngine {
             }
             ClientInput::Connected { out, pump } => self.on_connected(out, pump),
             ClientInput::Disconnected(reason) => {
+                let was_connected = self.connected;
                 self.connected = false;
-                self.connection_note = reason;
+                self.connection_note = format!("host unreachable — reconnecting: {reason}");
+                if was_connected {
+                    self.note(self.connection_note.clone());
+                }
                 self.out = None;
                 self.pump = None;
                 // Unsent work stays in the outbox; nothing is discarded
@@ -394,10 +428,9 @@ impl ClientEngine {
         Ok(())
     }
 
-    /// Record the current working tree as "materialized" without treating it as
-    /// local work. Used once, before the first canonical manifest arrives, when
-    /// the working tree is known clean at the session base commit
-    /// (specification section 11).
+    /// Snapshot the checkout before first admission. Work approved for backup
+    /// stays separate from the incoming canonical manifest, including when an
+    /// interrupted first join is retried; durable pending operations stay intact.
     pub fn seed_materialized_from_disk(&mut self) -> Result<()> {
         let previous = BTreeMap::new();
         let result = scan::scan_repository(
@@ -405,25 +438,40 @@ impl ClientEngine {
             &previous,
             &self.blobs,
             &mut self.scan_cache,
-            self.max_file_size,
+            if self.limit_known {
+                self.max_file_size
+            } else {
+                u64::MAX
+            },
         )?;
         self.rejected_paths = result.rejected;
+        let tracked =
+            gitx::committed_manifest(&self.paths.repo_root, &self.expected_head, &self.blobs)?;
         for (path, entry) in result.entries {
+            if self.role == Role::Participant && !tracked.contains_key(&path) {
+                self.detached_files.insert(path, entry);
+                continue;
+            }
             let mut state = self.store.path_state(&path)?;
-            if state.materialized.is_some() || state.has_local_work() {
+            if state.has_local_work() {
                 continue;
             }
             state.materialized = Some(entry);
             self.store.put_path_state(&path, &state)?;
         }
+        crate::db::set_json(self.store.conn(), "detached_files", &self.detached_files)?;
         Ok(())
     }
 
     fn on_connected(&mut self, out: Outbound, pump: BlobPump) -> Result<()> {
+        self.git_ready = false;
+        self.pending_git = None;
+        self.deferred_host.clear();
         self.out = Some(out);
         self.pump = Some(pump);
-        self.connected = true;
-        self.connection_note = "online".into();
+        self.connected = false;
+        self.last_pong_ms = crate::util::now_ms();
+        self.connection_note = "transport connected; awaiting admission".into();
         // Hello must be the first frame on the socket, so the handshake is sent
         // before the reconnect rescan can produce any operation.
         let resume = self.resume_state()?;
@@ -544,7 +592,16 @@ impl ClientEngine {
                 });
             }
         }
-        if self.connected && now - self.last_heartbeat_ms >= HEARTBEAT_INTERVAL_MS {
+        if self.out.is_some() && now - self.last_pong_ms >= 15_000 {
+            if let Some(out) = self.out.take() {
+                out.close();
+            }
+            self.connected = false;
+            self.connection_note = "host unreachable — reconnecting".into();
+            self.note(self.connection_note.clone());
+            self.mark_all_unsent()?;
+        }
+        if self.out.is_some() && now - self.last_heartbeat_ms >= HEARTBEAT_INTERVAL_MS {
             self.last_heartbeat_ms = now;
             self.heartbeat_nonce += 1;
             let nonce = self.heartbeat_nonce;
@@ -575,6 +632,10 @@ impl ClientEngine {
     /// participant reconnecting after being away.
     fn collect_garbage(&mut self) -> Result<()> {
         let mut live = self.store.referenced_blobs()?;
+        live.extend(self.detached_files.values().map(|e| e.blob_hash.clone()));
+        if let Some((_, hash)) = &self.pending_git {
+            live.insert(hash.clone());
+        }
         live.extend(crate::store_host::referenced_blobs_at(
             &self.paths.host_db(),
         )?);
@@ -615,6 +676,9 @@ impl ClientEngine {
 
     /// Detect Git state mutated outside Weave (specification section 14).
     fn check_git_state(&mut self) -> Result<()> {
+        if !self.git_ready {
+            return Ok(());
+        }
         let root = self.paths.repo_root.clone();
         let branch = gitx::current_branch(&root)?;
         let head = gitx::head_oid(&root)?.unwrap_or_default();
@@ -624,7 +688,7 @@ impl ClientEngine {
             Some((
                 "Weave paused: Git state changed outside Weave.".to_string(),
                 format!(
-                    "Expected branch:\n{}\n\nCurrent branch:\n{}\n\nRestore the expected state or leave the session.",
+                    "Expected branch:\n{}\n\nCurrent branch:\n{}\n\nStop Weave, then resume to reconcile Git on the same branch. A different branch requires a new session.",
                     self.branch,
                     branch.clone().unwrap_or_else(|| "(detached HEAD)".into())
                 ),
@@ -633,7 +697,7 @@ impl ClientEngine {
             Some((
                 "Weave paused: Git state changed outside Weave.".to_string(),
                 format!(
-                    "Expected Git commit:\n{}\n\nCurrent Git commit:\n{}\n\nRestore the expected state or leave the session.",
+                    "Expected Git commit:\n{}\n\nCurrent Git commit:\n{}\n\nStop Weave, then resume to reconcile Git on the same branch. A different branch requires a new session.",
                     crate::util::short_oid(&self.expected_head),
                     crate::util::short_oid(&head)
                 ),
@@ -641,8 +705,8 @@ impl ClientEngine {
         } else if staged {
             Some((
                 "Weave paused: the Git index changed outside Weave.".to_string(),
-                "Weave owns all Git-writing operations during a session. Run `git reset` to \
-                 unstage, or leave the session."
+                "Stop Weave before changing Git; resume preserves the index in a recovery \
+                 archive and reconciles local work on the host."
                     .to_string(),
             ))
         } else {
@@ -678,6 +742,8 @@ impl ClientEngine {
 
     fn paused(&self) -> bool {
         !self.local_state.is_live()
+            || self.pending_git.is_some()
+            || (self.initial_join && !self.git_ready)
     }
 
     // ---------------------------------------------------------------- capture
@@ -756,7 +822,13 @@ impl ClientEngine {
             }
             if path.to_fs_path(&root).exists() {
                 // Present on disk but not reported by Git: it became ignored.
-                vanished.push(path.to_string());
+                if state.confirmed.is_some() && !self.excluded_paths.contains(path.as_str()) {
+                    if let Err(e) = self.capture_path(&path) {
+                        self.note_rejected(path.as_str(), &e.message);
+                    }
+                } else {
+                    vanished.push(path.to_string());
+                }
                 continue;
             }
             if let Err(e) = self.capture_path(&path) {
@@ -859,6 +931,9 @@ impl ClientEngine {
     /// what makes a Weave-written file not echo back as a local edit, and it
     /// does so by content rather than by timer.
     fn capture_path(&mut self, path: &RepoPath) -> Result<bool> {
+        if self.excluded_paths.contains(path.as_str()) {
+            return Ok(false);
+        }
         // Read before `has_settled`, which clears the entry once it settles.
         let frozen = self
             .unstable
@@ -888,6 +963,13 @@ impl ClientEngine {
             &mut self.scan_cache,
         )?;
 
+        if let Some(detached) = self.detached_files.get(path) {
+            if FileEntry::same_as(entry.as_ref(), Some(detached)) {
+                return Ok(false);
+            }
+            self.detached_files.remove(path);
+            crate::db::set_json(self.store.conn(), "detached_files", &self.detached_files)?;
+        }
         if FileEntry::same_as(entry.as_ref(), state.materialized.as_ref()) {
             return Ok(false);
         }
@@ -1229,7 +1311,46 @@ impl ClientEngine {
     // --------------------------------------------------------- host messages
 
     fn on_host_message(&mut self, message: HostMessage) -> Result<()> {
+        if self.pending_git.is_some()
+            && !matches!(
+                &message,
+                HostMessage::Blob { .. }
+                    | HostMessage::Ping { .. }
+                    | HostMessage::Pong { .. }
+                    | HostMessage::GitState { .. }
+                    | HostMessage::Error { .. }
+            )
+        {
+            if self.deferred_host.len() >= crate::model::MAX_QUEUED_MESSAGES {
+                if let Some(out) = &self.out {
+                    out.close();
+                }
+                return Err(crate::error::network(
+                    "Git alignment is waiting for objects; reconnecting to bound queued state.",
+                ));
+            }
+            let welcome = matches!(&message, HostMessage::Welcome { .. });
+            self.deferred_host.push_back(message);
+            if welcome
+                && self
+                    .pending_git
+                    .as_ref()
+                    .is_some_and(|(_, hash)| self.blobs.has(hash))
+            {
+                return self.finish_git_alignment();
+            }
+            return Ok(());
+        }
         match message {
+            HostMessage::GitState { state, pack_hash } => {
+                self.pending_git = Some((state, pack_hash.clone()));
+                if !self.blobs.has(&pack_hash) {
+                    self.want_blobs([pack_hash])?;
+                    Ok(())
+                } else {
+                    self.finish_git_alignment()
+                }
+            }
             HostMessage::Welcome {
                 session,
                 snapshot_revision,
@@ -1240,12 +1361,19 @@ impl ClientEngine {
             } => {
                 // Read before the manifest is installed, which is what makes a
                 // replica stop being new.
+                self.connected = true;
+                self.connection_note = "online".into();
                 let first_join = !self.store.has_manifest()?;
                 self.session = session.clone();
                 self.store.set_session(&session)?;
+                self.apply_exclusions(&control.excluded_paths)?;
                 if let Some(manifest) = manifest {
+                    if self.initial_join {
+                        self.prepare_first_manifest(&manifest)?;
+                    }
                     self.apply_manifest(snapshot_revision, manifest, &host_state_hash)?;
                 }
+                self.initial_join = false;
                 self.apply_control(*control)?;
                 if first_join {
                     self.verify_join_against_limit()?;
@@ -1390,7 +1518,14 @@ impl ClientEngine {
                 self.send(ClientMessage::Pong { nonce });
                 Ok(())
             }
-            HostMessage::Pong { .. } => Ok(()),
+            HostMessage::Pong { nonce } => {
+                if nonce > self.last_pong_nonce && nonce <= self.heartbeat_nonce {
+                    self.last_pong_nonce = nonce;
+                    self.last_pong_ms = crate::util::now_ms();
+                    self.last_host_response_ms = self.last_pong_ms;
+                }
+                Ok(())
+            }
             HostMessage::Goodbye { reason } => {
                 self.connected = false;
                 self.connection_note = reason;
@@ -1467,6 +1602,9 @@ impl ClientEngine {
         }
         if !emitted.installed.is_empty() {
             for hash in emitted.installed {
+                if self.pending_git.as_ref().is_some_and(|(_, h)| h == &hash) {
+                    self.finish_git_alignment()?;
+                }
                 self.install_awaited_publications(&hash)?;
             }
             for path in std::mem::take(&mut self.awaiting_restore) {
@@ -1487,12 +1625,45 @@ impl ClientEngine {
     /// replica cannot currently reproduce the state it has been told about.
     fn waiting_for_content(&self) -> bool {
         self.materialization_blocked
+            || self.pending_git.is_some()
+            || !self.pending_revisions.is_empty()
             || self.traffic.waiting_for_content()
             || !self.awaiting_pack.is_empty()
             || !self.awaiting_restore.is_empty()
     }
 
+    fn apply_exclusions(&mut self, paths: &[String]) -> Result<()> {
+        let added: Vec<_> = paths
+            .iter()
+            .filter(|p| !self.excluded_paths.contains(*p))
+            .cloned()
+            .collect();
+        if !added.is_empty() {
+            let has_candidates = self.store.all_states()?.iter().any(|(p, s)| {
+                added.contains(&p.to_string()) && (s.has_local_work() || s.conflict_draft.is_some())
+            });
+            if has_candidates {
+                crate::backup::archive_session(&self.paths, "excluded-candidates")?;
+            }
+            for path in &added {
+                self.store
+                    .conn()
+                    .execute("DELETE FROM replica WHERE path = ?1", [path])?;
+                self.op_index.retain(|_, p| p.as_str() != path);
+                self.rejected_paths.retain(|p| &p.path != path);
+                self.store.clear_oversize(&RepoPath::new(path)?)?;
+            }
+            self.note(format!(
+                "Excluded by shared Git ignore rules; local files preserved: {}",
+                added.join(", ")
+            ));
+        }
+        self.excluded_paths = paths.iter().cloned().collect();
+        Ok(())
+    }
+
     fn apply_control(&mut self, control: ControlSnapshot) -> Result<()> {
+        self.apply_exclusions(&control.excluded_paths)?;
         self.store.set_control_cache(&control)?;
         // Learning the limit for the first time counts as a change even when
         // the number happens to equal the default: it is the first time this
@@ -1612,6 +1783,9 @@ impl ClientEngine {
     /// Bring the working tree to canonical state for one path, but only when
     /// doing so cannot lose local bytes (specification sections 36, 39).
     fn materialize_if_safe(&mut self, path: &RepoPath) -> Result<()> {
+        if self.excluded_paths.contains(path.as_str()) {
+            return Ok(());
+        }
         let state = self.store.path_state(path)?;
         if state.conflict_draft.is_some() {
             // The user is resolving a conflict here; canonical updates are
@@ -1677,10 +1851,19 @@ impl ClientEngine {
     }
 
     fn sync_working_tree(&mut self) -> Result<()> {
+        if self.pending_git.is_some() {
+            return Ok(());
+        }
         self.materialization_blocked = false;
         let paths: Vec<RepoPath> = self.store.all_paths()?;
         for path in paths {
-            self.materialize_if_safe(&path)?;
+            match self.materialize_if_safe(&path) {
+                Ok(()) => self.rejected_paths.retain(|r| r.path != path.as_str()),
+                Err(e) => {
+                    self.materialization_blocked = true;
+                    self.note_rejected(path.as_str(), &e.message);
+                }
+            }
         }
         Ok(())
     }
@@ -2116,34 +2299,36 @@ impl ClientEngine {
         publication: GitPublication,
         pack_hash: Option<String>,
     ) -> Result<()> {
-        match &pack_hash {
-            Some(hash) if !self.blobs.has(hash) => {
-                if !self
-                    .awaiting_pack
-                    .iter()
-                    .any(|(h, p)| h == hash && p.sequence == publication.sequence)
-                {
-                    self.awaiting_pack.push((hash.clone(), publication));
-                }
-                self.want_blobs([hash.clone()])
-            }
-            _ => self.apply_publication(publication, pack_hash),
+        if publication.sequence <= self.store.last_publication_sequence()? {
+            return Ok(());
         }
+        let hash = pack_hash.unwrap_or_default();
+        if !self
+            .awaiting_pack
+            .iter()
+            .any(|(_, p)| p.sequence == publication.sequence)
+        {
+            self.awaiting_pack.push((hash.clone(), publication));
+        }
+        if !hash.is_empty() && !self.blobs.has(&hash) {
+            self.want_blobs([hash.clone()])?;
+        }
+        self.install_awaited_publications(&hash)
     }
 
-    fn install_awaited_publications(&mut self, hash: &str) -> Result<()> {
-        let mut ready = Vec::new();
-        self.awaiting_pack.retain(|(want, publication)| {
-            if want == hash {
-                ready.push(publication.clone());
-                false
-            } else {
-                true
+    fn install_awaited_publications(&mut self, _hash: &str) -> Result<()> {
+        self.awaiting_pack.sort_by_key(|(_, p)| p.sequence);
+        while let Some((hash, publication)) = self.awaiting_pack.first().cloned() {
+            let last = self.store.last_publication_sequence()?;
+            if publication.sequence <= last {
+                self.awaiting_pack.remove(0);
+                continue;
             }
-        });
-        ready.sort_by_key(|p| p.sequence);
-        for publication in ready {
-            self.apply_publication(publication, Some(hash.to_string()))?;
+            if publication.sequence != last + 1 || (!hash.is_empty() && !self.blobs.has(&hash)) {
+                break;
+            }
+            self.apply_publication(publication, if hash.is_empty() { None } else { Some(hash) })?;
+            self.awaiting_pack.remove(0);
         }
         Ok(())
     }
@@ -2214,6 +2399,14 @@ impl ClientEngine {
         self.store
             .set_last_publication_sequence(publication.sequence)?;
 
+        self.record_git_state(&crate::git_state::GitState {
+            sequence: publication.sequence,
+            branch: descriptor.branch.clone(),
+            commit: descriptor.commit_oid.clone(),
+            tree: descriptor.tree_oid.clone(),
+            origin: "weave".into(),
+            revision: descriptor.target_revision,
+        })?;
         self.note(format!(
             "Git publication installed: {} ({})",
             crate::util::short_oid(&descriptor.commit_oid),
@@ -2222,11 +2415,239 @@ impl ClientEngine {
         Ok(())
     }
 
+    fn prepare_first_manifest(&mut self, manifest: &[ManifestEntry]) -> Result<()> {
+        for row in manifest {
+            for raw in row
+                .path
+                .parent_dirs()
+                .into_iter()
+                .chain(std::iter::once(row.path.to_string()))
+            {
+                let path = RepoPath::new(&raw)?;
+                let fs_path = path.to_fs_path(&self.paths.repo_root);
+                let Ok(meta) = std::fs::symlink_metadata(&fs_path) else {
+                    continue;
+                };
+                let obstruction = meta.file_type().is_symlink()
+                    || (path == row.path && meta.is_dir())
+                    || (path != row.path && !meta.is_dir());
+                if obstruction {
+                    if !matches!(
+                        self.join_policy,
+                        Some(
+                            crate::daemon::LocalChanges::Backup
+                                | crate::daemon::LocalChanges::Discard
+                        )
+                    ) {
+                        return Err(crate::error::repository(format!("Local obstruction {path} must be backed up before joining. Retry with --local-changes=backup.")));
+                    }
+                    let id = crate::backup::archive_session(&self.paths, "join-obstruction")?;
+                    crate::backup::move_obstruction(&self.paths, &id, &path)?;
+                    self.note(format!(
+                        "Preserved local obstruction {path} in recovery archive {id}."
+                    ));
+                }
+            }
+            let mut local = self.store.path_state(&row.path)?;
+            if local.materialized.is_none() {
+                let entry = scan::read_path(
+                    &self.paths.repo_root,
+                    &row.path,
+                    None,
+                    &self.blobs,
+                    &mut self.scan_cache,
+                )?;
+                if entry.is_some() && !FileEntry::same_as(entry.as_ref(), Some(&row.entry)) {
+                    if !matches!(
+                        self.join_policy,
+                        Some(
+                            crate::daemon::LocalChanges::Backup
+                                | crate::daemon::LocalChanges::Discard
+                        )
+                    ) {
+                        return Err(crate::error::repository(format!("Joining would replace local file {}. Retry with --local-changes=backup|discard.", row.path)));
+                    }
+                    let id = crate::backup::archive_session(&self.paths, "join-obstruction")?;
+                    crate::backup::capture_worktree(&self.paths, &id)?;
+                    crate::backup::capture_file(&self.paths, &id, &row.path)?;
+                }
+                self.detached_files.remove(&row.path);
+                crate::db::set_json(self.store.conn(), "detached_files", &self.detached_files)?;
+                local.materialized = entry;
+                self.store.put_path_state(&row.path, &local)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_git_state(&self, state: &crate::git_state::GitState) -> Result<()> {
+        let conn = self.store.conn();
+        let cached_tree = crate::db::get_meta(conn, "git_tree_oid")?;
+        let cached_hash = crate::db::get_meta(conn, "git_tree_state_hash")?;
+        let hash = match cached_hash.filter(|_| cached_tree.as_deref() == Some(&state.tree)) {
+            Some(hash) => hash,
+            None => {
+                let manifest =
+                    gitx::committed_manifest(&self.paths.repo_root, &state.commit, &self.blobs)?;
+                state_hash(manifest.iter())
+            }
+        };
+        let tx = conn.unchecked_transaction()?;
+        crate::db::set_meta(&tx, "git_tree_oid", &state.tree)?;
+        crate::db::set_meta(&tx, "git_tree_state_hash", &hash)?;
+        crate::db::set_json(&tx, "git_state", state)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn finish_git_alignment(&mut self) -> Result<()> {
+        let Some((state, hash)) = self.pending_git.clone() else {
+            return Ok(());
+        };
+        if self.initial_join {
+            let manifest = self.deferred_host.iter().find_map(|m| match m {
+                HostMessage::Welcome {
+                    manifest: Some(manifest),
+                    ..
+                } => Some(manifest.clone()),
+                _ => None,
+            });
+            if let Some(manifest) = manifest {
+                self.prepare_first_manifest(&manifest)?;
+            } else {
+                return Ok(());
+            }
+        }
+        if state.branch != self.branch {
+            return Err(crate::error::repository("The host changed branch."));
+        }
+        let root = &self.paths.repo_root;
+        let key = "git_alignment";
+        let previous: Option<serde_json::Value> = crate::db::get_json(self.store.conn(), key)?;
+        let observed = gitx::head_oid(root)?.unwrap_or_default();
+        let expected = previous
+            .as_ref()
+            .filter(|p| p["commit"] == state.commit)
+            .and_then(|p| p["expected"].as_str())
+            .unwrap_or(&observed)
+            .to_string();
+        if previous.is_none()
+            && observed == state.commit
+            && !(self.initial_join && gitx::has_staged_changes(root)?)
+        {
+            if gitx::current_branch(root)?.as_deref() != Some(&state.branch)
+                || gitx::rev_parse(root, &format!("{}^{{tree}}", state.commit))?.as_deref()
+                    != Some(&state.tree)
+            {
+                return Err(crate::error::integrity(
+                    "The current Git branch/tree does not match the authenticated host state.",
+                ));
+            }
+            self.record_git_state(&state)?;
+            self.store.set_last_publication_sequence(state.sequence)?;
+            self.expected_head = state.commit;
+            self.git_ready = true;
+            self.pending_git = None;
+            while let Some(message) = self.deferred_host.pop_front() {
+                self.on_host_message(message)?;
+            }
+            return Ok(());
+        }
+        if previous
+            .as_ref()
+            .is_none_or(|journal| journal["commit"] != state.commit)
+        {
+            let backup = crate::backup::archive_session(&self.paths, "git-alignment")?;
+            crate::backup::capture_worktree(&self.paths, &backup)?;
+            gitx::protect_commit(root, &observed, &backup)?;
+            crate::db::set_json(
+                self.store.conn(),
+                key,
+                &serde_json::json!({"expected": observed, "commit": state.commit, "state": state, "hash": hash, "backup": backup}),
+            )?;
+        }
+        if !gitx::object_exists(root, &state.commit)? {
+            gitx::unpack_objects(root, &self.blobs.path_of(&hash)?)?;
+        }
+        if gitx::rev_parse(root, &format!("{}^{{tree}}", state.commit))?.as_deref()
+            != Some(&state.tree)
+        {
+            return Err(crate::error::integrity(
+                "Host Git objects do not match the announced tree.",
+            ));
+        }
+        if gitx::current_branch(root)?.as_deref() != Some(&state.branch) {
+            return Err(crate::error::repository(
+                "The local branch changed during Git alignment.",
+            ));
+        }
+        if observed != state.commit {
+            gitx::update_ref_cas(
+                root,
+                &format!("refs/heads/{}", state.branch),
+                &state.commit,
+                Some(&expected),
+            )?;
+        }
+        gitx::read_tree_into_index(root, &state.tree)?;
+        self.record_git_state(&state)?;
+        self.store.set_last_publication_sequence(state.sequence)?;
+        self.expected_head = state.commit;
+        self.git_ready = true;
+        self.pending_git = None;
+        self.store
+            .conn()
+            .execute("DELETE FROM meta_v4 WHERE key = 'git_alignment'", [])?;
+        while let Some(message) = self.deferred_host.pop_front() {
+            self.on_host_message(message)?;
+        }
+        Ok(())
+    }
+
     /// Finish or repair a publication interrupted by a crash
     /// (specification sections 135, 195).
     pub fn repair_publications(&mut self) -> Result<Vec<String>> {
         let mut repaired = Vec::new();
+        // The user may have edited or staged more work after the crash. The
+        // original journal's backup predates those changes.
+        if crate::db::get_meta(self.store.conn(), "git_alignment")?.is_some()
+            || !self.store.incomplete_publications()?.is_empty()
+        {
+            let backup = crate::backup::archive_session(&self.paths, "git-journal-recovery")?;
+            crate::backup::capture_worktree(&self.paths, &backup)?;
+            if let Some(head) = gitx::head_oid(&self.paths.repo_root)? {
+                gitx::protect_commit(&self.paths.repo_root, &head, &backup)?;
+            }
+        }
+        if let Some(journal) =
+            crate::db::get_json::<serde_json::Value>(self.store.conn(), "git_alignment")?
+        {
+            let state: crate::git_state::GitState =
+                serde_json::from_value(journal["state"].clone())?;
+            let hash = journal["hash"]
+                .as_str()
+                .ok_or_else(|| crate::error::integrity("Invalid Git alignment journal."))?
+                .to_string();
+            if self.blobs.has(&hash) || gitx::object_exists(&self.paths.repo_root, &state.commit)? {
+                self.pending_git = Some((state, hash));
+                let initial_join = self.initial_join;
+                self.initial_join = false;
+                self.finish_git_alignment()?;
+                self.initial_join = initial_join;
+                repaired.push("finished interrupted Git alignment".into());
+            } else {
+                // No objects were installed, so no ref or index write occurred.
+                self.store
+                    .conn()
+                    .execute("DELETE FROM meta_v4 WHERE key='git_alignment'", [])?;
+            }
+        }
         for (publication, stage) in self.store.incomplete_publications()? {
+            if publication.sequence <= self.store.last_publication_sequence()? {
+                self.store
+                    .put_publication_journal(&publication, PublicationStage::Complete)?;
+                continue;
+            }
             let oid = publication.descriptor.commit_oid.clone();
             self.apply_publication(publication, None)?;
             repaired.push(format!(

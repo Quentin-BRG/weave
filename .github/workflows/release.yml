@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build (dry run; nothing is published)"
+        description: "Git ref to build: branch, tag or commit (dry run; nothing is published)"
         required: true
 
 permissions:
@@ -47,19 +47,20 @@ jobs:
 
       - name: Resolve and check the version
         id: version
+        env:
+          RELEASE_REF: ${{ github.event.inputs.tag || github.ref_name }}
+          RELEASE_EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          ref="${{ github.event.inputs.tag || github.ref_name }}"
-          tag_version="${ref#v}"
           cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          echo "tag $ref -> $tag_version, Cargo.toml -> $cargo_version"
-          if [ "$tag_version" != "$cargo_version" ]; then
-            echo "::error::tag $ref does not match the Cargo package version $cargo_version"
+          echo "ref $RELEASE_REF, Cargo.toml -> $cargo_version"
+          if [ "$RELEASE_EVENT" = push ] && [ "$RELEASE_REF" != "v$cargo_version" ]; then
+            echo "::error::tag $RELEASE_REF does not match the Cargo package version $cargo_version"
             exit 1
           fi
-          echo "version=$tag_version" >>"$GITHUB_OUTPUT"
+          echo "version=$cargo_version" >>"$GITHUB_OUTPUT"
           # A hyphen in the version is a pre-release under semver: v1.0.0-rc.1.
-          case "$tag_version" in
+          case "$cargo_version" in
             *-*) echo "prerelease=true" >>"$GITHUB_OUTPUT" ;;
             *)   echo "prerelease=false" >>"$GITHUB_OUTPUT" ;;
           esac
@@ -355,11 +356,17 @@ jobs:
       - name: Compose the release notes
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
+          : >notes.md
+          if [ -f "docs/releases/$RELEASE_VERSION.md" ]; then
+            cat "docs/releases/$RELEASE_VERSION.md" >>notes.md
+            printf '\n\n' >>notes.md
+          fi
           gh api "repos/${{ github.repository }}/releases/generate-notes" \
             -f tag_name="${{ github.ref_name }}" \
-            --jq .body >notes.md
+            --jq .body >>notes.md
           printf '\n' >>notes.md
           cat packaging/release-notes-footer.md >>notes.md
           cat notes.md

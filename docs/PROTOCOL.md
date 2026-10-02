@@ -1,12 +1,16 @@
 # Weave wire protocol
 
-`protocol_version` is **2**. A peer that announces a different version is rejected.
-Version 2 encrypts every application message; there is no compatibility mode with
-the unencrypted version 1 protocol and no downgrade path. The break is visible in
-three places, so a mismatch in either direction produces a specific error rather
-than a silent fallback: the version number itself, the WebSocket route
-(`/weave/v2`, previously `/weave`) and the invite prefix (`weave2_`, previously
-`weave1_`).
+`protocol_version` is **4**. Actual peers must use the same application version.
+Noise framing, `/weave/v2` and the `weave2_` invite prefix remain unchanged.
+Encrypted invitations from versions 2 and 3 are readable as address/secret
+containers; their historical commit is ignored. New invitations omit the commit.
+There is no plaintext fallback or application protocol downgrade.
+
+Protocol 4 adds `GitState` before admission, with an exact current commit/tree and
+an encrypted full-pack transfer; `UpdateIdentity` refreshes the authenticated
+participant's Git identity. Control snapshots include `excluded_paths`, which
+makes exclusion distinct from physical deletion. See
+[session reliability](SESSION-RELIABILITY.md) for ordering and migration.
 
 ## Transport
 
@@ -126,7 +130,7 @@ Every application message is an object carrying `protocol_version` and
 `message_type`, serialized and then encrypted:
 
 ```json
-{ "protocol_version": 2, "message_type": "submit_operation", "operation": { … } }
+{ "protocol_version": 4, "message_type": "submit_operation", "operation": { … } }
 ```
 
 ### Client → host
@@ -261,14 +265,15 @@ therefore cannot miss it.
 Join:
 
 1. complete the Noise handshake
-2. validate branch and base commit compatibility
-3. capture a consistent snapshot `rS` (manifest and revision from the same point)
-4. transfer the manifest
-5. transfer the blobs the client lacks
-6. materialize the canonical working tree
-7. replay revisions after `rS`
-8. refresh the control snapshot
-9. enter live mode
+2. validate the branch and announce the current Git state
+3. transfer and verify missing Git objects, journal the client alignment
+4. capture a consistent snapshot `rS` (manifest and revision from the same point)
+5. transfer the manifest
+6. transfer the blobs the client lacks
+7. materialize the canonical working tree
+8. replay revisions after `rS`
+9. refresh the control snapshot
+10. enter live mode
 
 Reconnect reports the latest **contiguous** applied revision, the control version,
 the last installed publication and any pending operation IDs. The host replays the
@@ -310,7 +315,8 @@ weave2_<base64url(json)>
 ```
 
 carrying the protocol version, the WebSocket URL, the session ID, the session
-secret, the base commit, the branch and the repository name. The internal encoding
+secret, the branch and the repository name. The commit comes from the host after
+authentication, not from the invitation. The internal encoding
 is not a user-facing API. Because it contains the secret, `weave join` reads it from
 a hidden prompt by default, with `--invite-file` and `--invite-stdin` for controlled
 automation.

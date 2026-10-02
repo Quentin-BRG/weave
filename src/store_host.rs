@@ -20,12 +20,12 @@ use std::path::Path;
 use uuid::Uuid;
 
 const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS meta (
+CREATE TABLE IF NOT EXISTS meta_v4 (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 
--- Baseline manifest at r0, the host working tree at session creation.
+-- Baseline manifest at r0, the committed Git tree at session creation.
 CREATE TABLE IF NOT EXISTS base_manifest (
     path  TEXT PRIMARY KEY,
     entry TEXT NOT NULL
@@ -123,7 +123,7 @@ impl HostStore {
         let conn = db::open(path)?;
         conn.execute_batch(SCHEMA)?;
         if db::get_meta(&conn, K_SCHEMA)?.is_none() {
-            db::set_meta(&conn, K_SCHEMA, "1")?;
+            db::set_meta(&conn, K_SCHEMA, "2")?;
             db::set_u64(&conn, K_CURRENT_REVISION, 0)?;
             db::set_u64(&conn, K_CONTROL_VERSION, 1)?;
             db::set_u64(&conn, K_PUB_SEQ, 0)?;
@@ -194,6 +194,7 @@ impl HostStore {
     /// this store holds; a resumed session never touches it.
     pub fn reset(&mut self) -> Result<()> {
         let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM meta_v4 WHERE key IN ('git_state','pending_adoption','git_alignment','excluded_paths')", [])?;
         for table in [
             "base_manifest",
             "manifest",
@@ -568,7 +569,7 @@ impl HostStore {
             ],
         )?;
         tx.execute(
-            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+            "INSERT INTO meta_v4(key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![K_CURRENT_REVISION, next.to_string()],
         )?;
