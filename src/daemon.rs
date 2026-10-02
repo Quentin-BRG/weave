@@ -272,7 +272,14 @@ pub fn run_host(start_dir: &Path, opts: HostOptions) -> Result<()> {
             "The branch changed. Leave this session before hosting on another branch.",
         ));
     }
-    let include_local = !resuming || gitx::has_staged_changes(&paths.repo_root)?;
+    // A fresh clean checkout already is the installed Git base. Running an
+    // adoption would archive and hash its entire content several more times,
+    // even though there is no local work to reconcile or index to normalize.
+    let include_local = if resuming {
+        gitx::has_staged_changes(&paths.repo_root)?
+    } else {
+        !gitx::dirty_entries(&paths.repo_root)?.is_empty()
+    };
     crate::git_state::adopt(&paths, &mut host_store, &blobs, &head, include_local)?;
     let expected_head = crate::git_state::current(&host_store, &paths)?.commit;
 

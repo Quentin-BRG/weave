@@ -116,19 +116,20 @@ fn every_packaging_entry_point_exists() {
 }
 
 /// The primary asset names are a public contract: the README's download buttons
-/// link to `releases/latest/download/<name>` and must not go stale.
+/// link to this version's assets. GitHub's `latest` excludes prereleases.
 #[test]
 fn the_release_asset_names_are_the_ones_the_readme_links_to() {
     let readme = read(&repo_root().join("README.md"));
     let workflow = read(&repo_root().join(".github/workflows/release.yml"));
+    let version = env!("CARGO_PKG_VERSION");
     for asset in [
         "WeaveSetup-x64.exe",
         "Weave-macos-universal.pkg",
         "weave-linux-x64.deb",
     ] {
         assert!(
-            readme.contains(&format!("releases/latest/download/{asset}")),
-            "the README no longer links to {asset}"
+            readme.contains(&format!("releases/download/v{version}/{asset}")),
+            "the README no longer links to {asset} for version {version}"
         );
         assert!(
             workflow.contains(asset),

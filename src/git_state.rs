@@ -125,7 +125,11 @@ pub fn adopt(
         crate::backup::capture_worktree(paths, &backup)?;
         gitx::protect_commit(&paths.repo_root, &old.commit, &backup)?;
         let base = gitx::committed_manifest(&paths.repo_root, &old.commit, blobs)?;
-        let next = gitx::committed_manifest(&paths.repo_root, head, blobs)?;
+        let next = if old.commit == head {
+            base.clone()
+        } else {
+            gitx::committed_manifest(&paths.repo_root, head, blobs)?
+        };
         let canonical = store.manifest_all()?;
         let max_file_size = store.max_file_size()?;
         let scan = crate::scan::scan_repository(

@@ -581,6 +581,13 @@ fn a_join_is_decided_by_the_session_limit_and_not_by_the_default() {
 
     host.start_daemon(&["host", "--lan", "--max-file-size", "256MiB"]);
     host.wait_online(LONG);
+    assert!(
+        host.json(&["recover", "--list"])
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a fresh clean Git base needs no adoption archive or index realignment"
+    );
     assert_eq!(
         host.json(&["status"])["max_file_size"].as_u64(),
         Some(256 * 1024 * 1024)

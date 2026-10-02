@@ -445,8 +445,11 @@ impl ClientEngine {
             },
         )?;
         self.rejected_paths = result.rejected;
-        let tracked =
-            gitx::committed_manifest(&self.paths.repo_root, &self.expected_head, &self.blobs)?;
+        let tracked = if self.role == Role::Participant {
+            gitx::committed_manifest(&self.paths.repo_root, &self.expected_head, &self.blobs)?
+        } else {
+            BTreeMap::new()
+        };
         for (path, entry) in result.entries {
             if self.role == Role::Participant && !tracked.contains_key(&path) {
                 self.detached_files.insert(path, entry);
