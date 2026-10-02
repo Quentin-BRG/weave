@@ -65,6 +65,13 @@ independent staged blobs under `index-objects/` (with their NUL-delimited Git st
 listing in `stages.z`), and `working-tree/` files. They are recovery material, not an automatic merge into
 a live session. Commit recovery references also protect local Git history.
 
+Archives with reason `excluded-candidates` contain only the affected replica
+paths and their referenced blobs, including in-flight operations, newer pending
+edits, and conflict drafts. Their `backup.json` lists the saved paths and any
+remote blobs not yet received. They do not duplicate the entire session for each
+excluded dependency. A missing local candidate blocks detachment. Existing full
+archives remain readable and are never deleted automatically by this change.
+
 ## LAN and connection health
 
 Hosts try the previous LAN port on resume and choose a new one if it is occupied.

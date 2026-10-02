@@ -196,7 +196,26 @@ pub fn call_with_timeout(
 
     let mut reader = BufReader::new(stream);
     let mut response = String::new();
-    let read = reader.read_line(&mut response)?;
+    let read = reader.read_line(&mut response).map_err(|e| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            network(format!(
+                "The local Weave daemon did not respond within {} ms.",
+                timeout.as_millis()
+            ))
+            .with_detail(
+                "Its control connection opened, but the daemon may be busy or blocked. \
+                 This does not confirm that it has stopped. Check the terminal running \
+                 weave host, join or resume before retrying.",
+            )
+        } else {
+            network(format!(
+                "Could not read the local Weave daemon's reply: {e}"
+            ))
+        }
+    })?;
     if read == 0 {
         return Err(network(
             "The Weave daemon closed the connection without replying.",

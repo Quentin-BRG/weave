@@ -31,28 +31,29 @@ into ordinary Git commits when the team decides to publish.
 
 ## Install
 
-Current build: **0.1.0-rc.3**, a release candidate using protocol 4. Upgrade the host
+Current build: **0.1.0-rc.4**, a release candidate using protocol 4. Upgrade the host
 and every participant together, along with [weave-plugin 1.1.0-rc.1](https://github.com/Quentin-BRG/weave-plugin/releases/tag/v1.1.0-rc.1).
 Read the [migration and recovery notes](docs/releases/0.1.0-rc.3.md) before resuming an existing session.
+The [rc.4 fixes](docs/releases/0.1.0-rc.4.md) address stalled synchronization and excessive recovery backups after exclusions.
 
 <table>
 <tr>
 <td align="center" width="33%">
 <img src="docs/assets/windows.svg" width="72" height="72" alt=""><br>
 <b>Windows</b><br><br>
-<a href="https://github.com/Quentin-BRG/weave/releases/download/v0.1.0-rc.3/WeaveSetup-x64.exe"><img src="docs/assets/download-windows.svg" width="220" alt="Download Weave for Windows"></a><br>
+<a href="https://github.com/Quentin-BRG/weave/releases/download/v0.1.0-rc.4/WeaveSetup-x64.exe"><img src="docs/assets/download-windows.svg" width="220" alt="Download Weave for Windows"></a><br>
 <sub>Windows 10 / 11 · x64 · <code>.exe</code></sub>
 </td>
 <td align="center" width="33%">
 <img src="docs/assets/macos.svg" width="72" height="72" alt=""><br>
 <b>macOS</b><br><br>
-<a href="https://github.com/Quentin-BRG/weave/releases/download/v0.1.0-rc.3/Weave-macos-universal.pkg"><img src="docs/assets/download-macos.svg" width="220" alt="Download Weave for macOS"></a><br>
+<a href="https://github.com/Quentin-BRG/weave/releases/download/v0.1.0-rc.4/Weave-macos-universal.pkg"><img src="docs/assets/download-macos.svg" width="220" alt="Download Weave for macOS"></a><br>
 <sub>Universal · Apple silicon &amp; Intel · <code>.pkg</code></sub>
 </td>
 <td align="center" width="33%">
 <img src="docs/assets/linux.svg" width="72" height="72" alt=""><br>
 <b>Linux</b><br><br>
-<a href="https://github.com/Quentin-BRG/weave/releases/download/v0.1.0-rc.3/weave-linux-x64.deb"><img src="docs/assets/download-linux.svg" width="220" alt="Download Weave for Linux"></a><br>
+<a href="https://github.com/Quentin-BRG/weave/releases/download/v0.1.0-rc.4/weave-linux-x64.deb"><img src="docs/assets/download-linux.svg" width="220" alt="Download Weave for Linux"></a><br>
 <sub>Debian / Ubuntu · x64 · <code>.deb</code></sub>
 </td>
 </tr>

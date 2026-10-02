@@ -171,15 +171,9 @@ pub fn support_dirs() -> Vec<PathBuf> {
             push_unique(&mut dirs, dir);
         }
     }
-    // Absolute fallbacks, for the case where `weave` was copied elsewhere but
-    // the package is still installed.
-    if cfg!(target_os = "macos") {
-        push_unique(&mut dirs, PathBuf::from("/usr/local/libexec/weave"));
-    }
-    if cfg!(target_os = "linux") {
-        push_unique(&mut dirs, PathBuf::from("/usr/lib/weave"));
-        push_unique(&mut dirs, PathBuf::from("/usr/local/lib/weave"));
-    }
+    // Do not borrow another installation's manifest/runtime. In particular,
+    // an installed package must not disguise an incomplete portable package
+    // or make a source build report that it belongs to that installed version.
     dirs
 }
 
@@ -200,9 +194,6 @@ pub fn licenses_dirs() -> Vec<PathBuf> {
                     .join("third-party"),
             );
         }
-    }
-    if cfg!(target_os = "linux") {
-        push_unique(&mut dirs, PathBuf::from("/usr/share/doc/weave/third-party"));
     }
     dirs
 }
@@ -329,6 +320,14 @@ mod tests {
     #[test]
     fn support_dirs_are_anchored_on_the_executable() {
         let dirs = support_dirs();
+        let expected: Vec<_> = exe_dirs()
+            .iter()
+            .flat_map(|p| support_dirs_for(p))
+            .collect();
+        assert!(
+            dirs.iter().all(|dir| expected.contains(dir)),
+            "support files must belong to this executable's installation"
+        );
         assert!(!dirs.is_empty());
         let exe_dir = exe().and_then(|e| e.parent().map(|p| p.to_path_buf()));
         if let Some(exe_dir) = exe_dir {

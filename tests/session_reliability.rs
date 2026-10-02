@@ -5,6 +5,128 @@ use std::time::Duration;
 const WAIT: Duration = Duration::from_secs(25);
 
 #[test]
+fn unresponsive_local_daemon_reports_a_timeout_not_a_filesystem_error() {
+    use std::io::{BufRead, BufReader};
+    use weave::session::{DaemonLock, Paths, Runtime};
+
+    let sandbox = Sandbox::new("ipc-timeout");
+    let host = Participant::new(&sandbox, "host");
+    init_repo(&host.repo, "Host", "host@example.com");
+    let paths = Paths::discover(&host.repo).unwrap();
+    paths.ensure().unwrap();
+    let _lock = DaemonLock::acquire(&paths).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    weave::session::write_runtime(
+        &paths,
+        &Runtime {
+            pid: std::process::id(),
+            port: listener.local_addr().unwrap().port(),
+            token: "test-token".into(),
+            role: "host".into(),
+            session_id: uuid::Uuid::new_v4(),
+            started_at_ms: 0,
+        },
+    )
+    .unwrap();
+    // The socket accepts the request, but the engine never replies. Keep the
+    // listener alive until the CLI exits so this exercises the read deadline.
+    let output = weave_command(&host.repo, &host.home)
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    let mut request = String::new();
+    BufReader::new(stream).read_line(&mut request).unwrap();
+    assert!(request.contains("status"));
+    assert!(!output.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["daemon_state"], "unknown");
+    assert!(status.get("active").is_none());
+    let detail = status["detail"].as_str().unwrap();
+    assert!(detail.contains("did not respond within"), "{detail}");
+    assert!(detail.contains("busy or blocked"), "{detail}");
+    assert!(!detail.contains("Filesystem error"), "{detail}");
+}
+
+#[test]
+fn npm_watcher_burst_does_not_block_participant_sync() {
+    let sandbox = Sandbox::new("ignored-watcher-burst");
+    let mut host = Participant::new(&sandbox, "host");
+    let mut guest = Participant::new(&sandbox, "guest");
+    init_repo(&host.repo, "Host", "host@example.com");
+    git(
+        &host.repo,
+        &[
+            "clone",
+            "-q",
+            host.repo.to_str().unwrap(),
+            guest.repo.to_str().unwrap(),
+        ],
+    );
+    git(&guest.repo, &["config", "user.name", "Guest"]);
+    git(&guest.repo, &["config", "user.email", "guest@example.com"]);
+    let dependencies = guest.repo.join("node_modules/dependency/dist");
+    std::fs::create_dir_all(&dependencies).unwrap();
+    let files: Vec<_> = (0..4_000)
+        .map(|i| dependencies.join(format!("generated-{}-{i:04}.js", "x".repeat(80))))
+        .collect();
+    for file in &files {
+        std::fs::write(file, "before npm\n").unwrap();
+    }
+    host.start_daemon(&["host", "--lan"]);
+    host.wait_online(WAIT);
+    let invitation = sandbox.root.join("invite.txt");
+    std::fs::write(
+        &invitation,
+        host.json(&["invite"])["invite"].as_str().unwrap(),
+    )
+    .unwrap();
+    guest.start_daemon(&["join", "--invite-file", invitation.to_str().unwrap()]);
+    guest.wait_for_status("initial sync", WAIT, |v| v["synchronized"] == true);
+    for file in &files {
+        std::fs::write(file, "after npm\n").unwrap();
+    }
+    // Let the watcher deliver the npm batch before the real collaborative edits.
+    std::thread::sleep(Duration::from_secs(1));
+    write_file(&host.repo, "from-host.md", "host edit\n");
+    write_file(&guest.repo, "from-guest.md", "guest edit\n");
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let h = host.json_allow_failure(&["status"]).unwrap_or_default();
+        let g = guest.json_allow_failure(&["status"]).unwrap_or_default();
+        if h["synchronized"] == true
+            && g["synchronized"] == true
+            && h["state"] == g["state"]
+            && read_file(&host.repo, "from-host.md") == "host edit\n"
+            && std::fs::read_to_string(host.repo.join("from-guest.md"))
+                .ok()
+                .as_deref()
+                == Some("guest edit\n")
+            && std::fs::read_to_string(guest.repo.join("from-host.md"))
+                .ok()
+                .as_deref()
+                == Some("host edit\n")
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            // A deadlocked engine cannot process stop, so terminate only this
+            // disposable test daemon before failing (never stall the suite).
+            guest.kill_daemon();
+            host.kill_daemon();
+            panic!("sync stalled after ignored watcher events: host={h}, guest={g}");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    assert!(!host.repo.join("node_modules").exists());
+    for file in &files {
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "after npm\n");
+    }
+    guest.stop_daemon();
+    host.stop_daemon();
+}
+
+#[test]
 fn leave_without_daemon_is_durable_idempotent_and_recoverable() {
     let sandbox = Sandbox::new("offline-leave");
     let mut host = Participant::new(&sandbox, "host");
@@ -27,6 +149,120 @@ fn leave_without_daemon_is_durable_idempotent_and_recoverable() {
         .unwrap()
         .iter()
         .any(|b| b["reason"] == "leave"));
+}
+
+#[test]
+fn excluded_offline_outbox_converges_with_scoped_recovery_archives() {
+    let sandbox = Sandbox::new("excluded-offline-outbox");
+    let mut host = Participant::new(&sandbox, "host");
+    let mut guest = Participant::new(&sandbox, "guest");
+    init_repo(&host.repo, "Host", "host@example.com");
+    // A session blob unrelated to the excluded files: the old implementation
+    // copied it into every archive and could generate gigabytes during resume.
+    let unrelated = blob_bytes(51, 2 * 1024 * 1024);
+    write_bytes(&host.repo, "asset.bin", &unrelated);
+    git(&host.repo, &["add", "asset.bin"]);
+    git(&host.repo, &["commit", "-qm", "Asset"]);
+    git(
+        &host.repo,
+        &[
+            "clone",
+            "-q",
+            host.repo.to_str().unwrap(),
+            guest.repo.to_str().unwrap(),
+        ],
+    );
+    git(&guest.repo, &["config", "user.name", "Guest"]);
+    git(&guest.repo, &["config", "user.email", "guest@example.com"]);
+    host.start_daemon(&["host", "--lan"]);
+    host.wait_online(WAIT);
+    let invitation = sandbox.root.join("invite.txt");
+    std::fs::write(
+        &invitation,
+        host.json(&["invite"])["invite"].as_str().unwrap(),
+    )
+    .unwrap();
+    guest.start_daemon(&["join", "--invite-file", invitation.to_str().unwrap()]);
+    guest.wait_for_status("initial sync", WAIT, |v| v["synchronized"] == true);
+    host.stop_daemon();
+    const COUNT: u64 = 24;
+    for i in 0..COUNT {
+        write_file(
+            &guest.repo,
+            &format!("generated/{i}.txt"),
+            &format!("offline candidate {i}\n"),
+        );
+    }
+    guest.wait_for_status("offline files captured", WAIT, |v| {
+        v["outbox_pending"] == COUNT
+    });
+    guest.stop_daemon();
+    write_file(&host.repo, ".gitignore", "node_modules/\ngenerated/\n");
+    host.start_daemon(&["resume"]);
+    host.wait_for_status("new shared ignore rule", WAIT, |v| {
+        v["synchronized"] == true
+    });
+    // macOS/Windows can keep the old port reserved after shutdown. The host
+    // then advertises a new port, so reconnect using its current invitation
+    // while retaining this participant's saved outbox and session identity.
+    std::fs::write(
+        &invitation,
+        host.json(&["invite"])["invite"].as_str().unwrap(),
+    )
+    .unwrap();
+    guest.start_daemon(&["join", "--invite-file", invitation.to_str().unwrap()]);
+    // Each exclusion durably flushes an independent recovery database. Windows
+    // runners can still be making steady progress when the ordinary 25-second
+    // sync deadline expires; give this batch its own bounded recovery budget.
+    guest.wait_for_status("excluded outbox drained", Duration::from_secs(120), |v| {
+        v["synchronized"] == true && v["outbox_pending"] == 0
+    });
+    write_file(
+        &guest.repo,
+        "after-resume.md",
+        "collaboration still works\n",
+    );
+    host.wait_for_file("after-resume.md", "collaboration still works\n", WAIT);
+    guest.stop_daemon();
+    host.stop_daemon();
+
+    let backups = guest.json(&["recover", "--list"]);
+    let mut archived_paths = std::collections::BTreeSet::new();
+    let mut bytes = 0;
+    for backup in backups
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|b| b["reason"] == "excluded-candidates")
+    {
+        let root = guest
+            .repo
+            .join(".git/weave/backups")
+            .join(backup["id"].as_str().unwrap());
+        let saved = weave::store_client::ClientStore::open(&root.join("state.sqlite")).unwrap();
+        let blobs = weave::blobs::BlobStore::open(root.join("blobs")).unwrap();
+        bytes += blobs.stats().unwrap().1;
+        for (path, state) in saved.all_states().unwrap() {
+            let entry = state.in_flight.unwrap().desired.unwrap();
+            assert_eq!(
+                std::fs::read(blobs.path_of(&entry.blob_hash).unwrap()).unwrap(),
+                std::fs::read(path.to_fs_path(&guest.repo)).unwrap()
+            );
+            archived_paths.insert(path.to_string());
+        }
+    }
+    assert_eq!(archived_paths.len() as u64, COUNT);
+    assert!(
+        bytes < unrelated.len() as u64,
+        "excluded recovery copied {bytes} bytes of unrelated content"
+    );
+    assert!(!host.repo.join("generated").exists());
+    for i in 0..COUNT {
+        assert_eq!(
+            read_file(&guest.repo, &format!("generated/{i}.txt")),
+            format!("offline candidate {i}\n")
+        );
+    }
 }
 
 #[test]
